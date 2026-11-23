@@ -8,6 +8,10 @@
   <a href="#evaluation">Evaluation</a> · <a href="docs/experiment.md">Protocol</a> · <a href="docs/reproduce.md">Reproduce</a>
 </p>
 
+<p align="center">
+  <img src="assets/jev-harness-teaser.png" width="960" alt="The shared harness builds a menu from the task and live state. One 27B model selects a fragment or generates Python. Offline, Sol uses Train traces to revise the harness, including when Jev should select the first ranked track.">
+</p>
+
 An AppWorld agent may write the same few lines of Python every time it reads a playlist or looks up a note. Jev Harness RSI gives it reusable operations called **fragments**. A program builds a menu from the current state. A single 27B model selects actions through its Jev decision head and can switch to Python generation for work the menu cannot express. Between runs, GPT-6.2 Sol uses execution traces to revise the shared harness. The 27B weights stay fixed.
 
 ## A Spotify task
@@ -22,17 +26,6 @@ An AppWorld agent may write the same few lines of Python every time it reads a p
 H0 already had a `take_first` fragment. Sol edited its guidance to tell Jev to take one song from the ranking before extracting its title. In the second trace, Jev chose `take_first` before `titles`. Both traces come from Train task `82e2fac_1`, on the same GPU with the same seed. Each Jev call used one separately counted readout token. [Recorded actions, counts and exact edit](docs/spotify-example.json)
 
 ## How it works
-
-```mermaid
-flowchart LR
-    M["Program builds menu<br/>from task and state"] --> J{"Jev chooses"}
-    J -->|Fragment| F["Bind inputs and run"]
-    F -->|New state| M
-    J -->|Need code| G["27B writes Python"]
-    G -->|yield_read| M
-    F -->|Submit| E["AppWorld score"]
-    G -->|Submit| E
-```
 
 - **Build the menu.** Each fragment declares what it needs and what it returns. Templates and live values supply the question and every option. Jev can choose a menu, select a fragment and bind its parameters. Each result can make another fragment available.
 - **Decide or reason.** For the next-fragment choice, the official decision API first scores the options. If the top probability is below **0.60**, the same model can think for up to **256 tokens**. The final choice uses the average of the two probability distributions. A “none” choice in a narrow menu first opens the wider menu.
