@@ -60,7 +60,9 @@ jev-appworld run --connections configs/connections.local.example.json \
   --root runs/main --gpus local:0,local:1,local:2,local:3
 ```
 
-The four workers process different tasks concurrently. For one GPU, pass `--gpus local:0`. To resume an interrupted run, use the same command and output directory. The controller reads the completed tasks, patches and batch selections before continuing. Use one controller per output directory.
+Batch 1 runs one task per GPU, including the H0 and candidate Dev panels. From Batch 2, each GPU serves two independent AppWorld sessions from one BF16 replica with vLLM's `--max-num-seqs 2`. Four GPUs can process up to eight tasks at once. Train candidates return to the parent's GPU when it is available. Independent Sol probes share the same pool. Each Test-N task keeps both arms on one GPU, with a fresh simulator state for each arm.
+
+For one GPU, pass `--gpus local:0`. Resume with the same command and output directory. The runner reuses completed task records, including the retained parent's Dev panel. A Dev comparison across the concurrency switch records the session count for each side in `checkpoints.json`. Generated tokens can vary with concurrent inference even with greedy decoding. Use one controller per output directory.
 
 ### Use separate machines
 

@@ -174,12 +174,39 @@ class HistoryWorkbench(FragmentTrialWorkbench):
             return [], 'unavailable: '+str(exc)[:160]
 
     def wording_feedback(self,checks,candidate,trial,anchors):
+        if not checks and not anchors:
+            return []
+        if getattr(self.study, 'lanes_per_gpu', 1) != 2:
+            return self.wording_on_worker(checks, candidate, trial, anchors, self.study.workers[0])
+        # Keep all rewrites of one recorded trace together so repeated original
+        # ballots are reused and the parent and candidate share a physical GPU.
+        groups = {}
+        for position, case in enumerate(checks):
+            doc = case.get('trace')
+            if isinstance(doc, str) and doc.startswith('trial/'):
+                doc = trial.get(doc.split('/', 1)[1], '')
+            group = groups.setdefault(doc if isinstance(doc, str) else None, ([], []))
+            group[0].append((position, case))
+        for anchor in anchors:
+            groups.setdefault(anchor[0], ([], []))[1].append(anchor)
+
+        def compare(group, worker):
+            items, sites = group
+            rows = self.wording_on_worker([case for _, case in items], candidate, trial, sites, worker)
+            return list(zip((i for i, _ in items), rows[:len(items)])), rows[len(items):]
+
+        reports = self.study.execute_jobs(list(groups.values()), compare)
+        primary = sorted((item for items, _ in reports for item in items), key=lambda item: item[0])
+        order = {(doc, index): i for i, (doc, index, _) in enumerate(anchors)}
+        extra = sorted((row for _, rows in reports for row in rows), key=lambda row: order[row['trace'], row['event']])
+        return [row for _, row in primary] + extra
+
+    def wording_on_worker(self,checks,candidate,trial,anchors,worker):
         rows,cache = [],{}
         def evaluate(doc,idx,arm,request,state,missing=None):
             key = (doc,idx,arm,request,missing)
             if key not in cache:
                 lib = self.lib if arm=='parent' else candidate
-                worker = self.study.workers[0]
                 names = menu(lib,state)[0]
                 try:
                     model = worker.worker('model') if names else None

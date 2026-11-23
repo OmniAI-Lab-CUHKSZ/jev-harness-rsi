@@ -126,21 +126,34 @@ def summary(rows):
 
 def paired_holdout(study, ids, version, library):
     """An arm pair shares a worker, not simulator state. Alternate order across the panel."""
+    stages = {"A": "test_generation", "B": "test_" + version}
+    cached = {}
+    if hasattr(study, "root"):
+        for task in ids:
+            cached[task] = {}
+            for arm, stage in stages.items():
+                path = study.root / "runs" / stage / task / "record.json"
+                if path.is_file():
+                    cached[task][arm] = read(path).get("gpu")
+
     def pair(job, worker):
         i,task=job
         out={}
+        previous = cached.get(task, {})
+        complete_pair = len(previous) == 2 and previous["A"] == previous["B"]
+        device = getattr(worker, "gpu", None)
         for arm in (("A","B") if i%2==0 else ("B","A")):
-            stage="test_generation" if arm=="A" else "test_"+version
+            stage = stages[arm]
+            if device and arm in previous and previous[arm] != device and not complete_pair:
+                stage += "_paired_" + device.replace(":", "_")
             out[arm]=study.run_task(task,stage,arm,None if arm=="A" else library,workers=worker)
-        # A resumed partial pair may bring back a cached record from another device.
-        device=getattr(worker,"gpu",None)
-        if device and out["A"].get("gpu")!=out["B"].get("gpu"):
-            for arm,row in list(out.items()):
-                if row.get("gpu")!=device:
-                    stage=("test_generation" if arm=="A" else "test_"+version)+"_paired_"+device.replace(":","_")
-                    out[arm]=study.run_task(task,stage,arm,None if arm=="A" else library,workers=worker)
         return out["A"],out["B"]
-    pairs=study.execute_jobs(list(enumerate(ids)),pair)
+    jobs = list(enumerate(ids))
+    if hasattr(study, "execute_preferred"):
+        preferred = [next(iter(cached.get(task, {}).values()), None) for task in ids]
+        pairs = study.execute_preferred(jobs, pair, preferred if any(preferred) else None)
+    else:
+        pairs = study.execute_jobs(jobs, pair)
     return [a for a,b in pairs],[b for a,b in pairs]
 
 
@@ -203,6 +216,8 @@ def run(study, count, rounds, formal, *, revisit_after_six=(), evaluate_test=Tru
         sources.update(ids)
         if position < len(completed):
             continue
+        if hasattr(study, "begin_inference_phase"):
+            study.begin_inference_phase("train", batch)
         entry_ver, entry_lib = version, lib
         entry_stage = label+"_"+version+"_entry"
         continuation = study.settings.get("execution_from_next_batch", {})
@@ -277,6 +292,9 @@ def run(study, count, rounds, formal, *, revisit_after_six=(), evaluate_test=Tru
             carry=evaluated_score >= reference_score
             dev_choice={"compared_to":entry_ver,"candidate":version,"reference":reference_score,
                         "evaluated":evaluated_score,"carry":carry,"tied":evaluated_score == reference_score}
+            if study.settings.get("inference_schedule"):
+                dev_choice["reference_lanes_per_gpu"] = sorted({r.get("lanes_per_gpu", 1) for r in reference_dev})
+                dev_choice["candidate_lanes_per_gpu"] = sorted({r.get("lanes_per_gpu", 1) for r in ev})
             if carry:
                 reference_dev = ev
             else:
@@ -291,6 +309,8 @@ def run(study, count, rounds, formal, *, revisit_after_six=(), evaluate_test=Tru
             reference_dev = reference_dev()
         study.close_account()
         study.test_started = True
+        if hasattr(study, "begin_inference_phase"):
+            study.begin_inference_phase("test")
         ids = manifest["normal_holdout_tasks"]
         a,b = paired_holdout(study,ids,version,lib)
         report=final_report(a,b,study.seed)

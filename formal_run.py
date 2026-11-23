@@ -151,6 +151,8 @@ class Study:
             raise RuntimeError("Cannot run a Sol demonstration on Test")
         workers = workers or self.workers[0]
         device = {"gpu": workers.gpu} if variant != "Sol" and workers.gpu is not None else {}
+        if device and hasattr(workers, "lanes_per_gpu"):
+            device.update(lanes_per_gpu=workers.lanes_per_gpu, lane=workers.lane)
         # Preserve partial receipts and use a fresh AppWorld run name on resume.
         prior_attempts = [int(p.name.split("_")[-1]) for p in folder.glob("attempt_*")
                           if p.name.split("_")[-1].isdigit()]
@@ -224,6 +226,9 @@ class Study:
                 future.result()
         return results
 
+    def execute_preferred(self, jobs, operation, preferred_gpus):
+        return self.execute_jobs(jobs, operation)
+
     def batch(self, tasks, stage, variant="B", library=None):
         if variant == "Sol":
             rows = [self.run_task(task, stage, variant, library) for task in tasks]
@@ -243,33 +248,34 @@ class Study:
         previous = {row["task_id"]: row for row in parent}
         reference_stage = stage+"_matched_parent"
 
-        def wrong_node(row):
-            original = previous[row["task_id"]]
-            old_node = (original.get("gpu") or "").rpartition(":")[0] or primary_node
-            device = row.get("gpu", "")
-            return device in devices and device.split(":", 1)[0] != old_node
+        def node(row):
+            return (row.get("gpu") or "").rpartition(":")[0] or primary_node
+
+        def cached(stage_name, task):
+            path = self.root / "runs" / stage_name / task / "record.json"
+            return read(path) if path.is_file() else {}
 
         def run_pair(task, workers):
             row = self.run_task(task, stage, "B", proposed, workers=workers)
-            if row.get("gpu") == workers.gpu and wrong_node(row):
-                previous[task] = self.run_task(task, reference_stage, "B", library, workers=workers)
-            return row
+            original = previous[task]
+            if node(original) == node(row):
+                return original, row
+            saved = cached(reference_stage, task)
+            if saved and node(saved) == node(row):
+                return self.run_task(task, reference_stage, "B", library, workers=workers), row
+            suffix = "_paired_" + workers.gpu.replace(":", "_")
+            if node(row) != workers.gpu.rpartition(":")[0]:
+                # An unmatched candidate survived on a node no longer in the pool.
+                row = self.run_task(task, stage + suffix, "B", proposed, workers=workers)
+                if node(row) == node(original):
+                    return original, row
+            replay = reference_stage + suffix if saved else reference_stage
+            return self.run_task(task, replay, "B", library, workers=workers), row
 
-        candidate = self.execute_jobs(tasks, run_pair)
-        # A completed candidate can be resumed on a different worker than its original card.
-        reruns = defaultdict(list)
-        for row in candidate:
-            if wrong_node(row):
-                reruns[row["gpu"]].append(row["task_id"])
-
-        def replay(item):
-            device, tasks = item
-            return [self.run_task(task, reference_stage, "B", library, workers=devices[device]) for task in tasks]
-
-        if reruns:
-            with ThreadPoolExecutor(max_workers=len(reruns)) as pool:
-                for rows in pool.map(replay, reruns.items()):
-                    previous.update((row["task_id"], row) for row in rows)
+        preferred = [cached(stage, task).get("gpu") or previous[task].get("gpu") for task in tasks]
+        pairs = self.execute_preferred(tasks, run_pair, preferred)
+        previous.update((candidate["task_id"], matched) for matched, candidate in pairs)
+        candidate = [row for _, row in pairs]
         save(self.root/"runs"/stage/"aggregate.json", aggregate(candidate))
         return [previous[row["task_id"]] for row in parent], candidate
 

@@ -89,6 +89,8 @@ Both arms allow 40 logical model calls, 8,192 total generated tokens, 1,024 toke
 
 The report gives task goal completion (TGC), the proportion of scenarios with all three variants solved (SGC), mean and total online output tokens, and tasks that changed from failure to success or vice versa. A paired bootstrap resamples scenarios 10,000 times to give 95% intervals for differences. Other recorded measures include native judgments, handoff selections and their scenario coverage, input tokens, model time, tasks using both fragments and generation, tasks completed entirely with fragments, and offline Sol and local judgment usage.
 
+Batch 1 uses one active task per GPU for Train and for both Dev panels. Batch 2 switches Train, independent Sol trials and Dev to two task sessions per GPU. Test-N uses the same two-session setting across different task pairs. A change in concurrent inference can change the generated code and token count. The runner reuses the retained parent's Dev score and records the parent and candidate session counts alongside their comparison.
+
 ## Worked Train scenario
 
 In Batch 4, task `22cc237_1` asks the agent to request outstanding dinner payments. The user recorded each person's share in Simple Note, and some people have already repaid the user in Venmo. H0 can list notes. Reading one selected note's body and reconciling payments are possible targets for later patches.

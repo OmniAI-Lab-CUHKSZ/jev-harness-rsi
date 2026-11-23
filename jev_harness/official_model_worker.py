@@ -15,16 +15,25 @@ from urllib.request import Request, urlopen
 
 
 class OfficialModel:
-    def __init__(self, model, gpu, service, max_context):
+    def __init__(self, model, gpu, service, max_context, max_num_seqs=1, attach_port=None):
         self.model = model
         self.max_context = max_context
         self.served = "autotrust/JEV-27B"
         self.tokenizer = None
+        self.max_num_seqs = max_num_seqs
+        self.proc = None
+        if attach_port is not None:
+            self.port = attach_port
+            self.url = f"http://127.0.0.1:{attach_port}"
+            self.profile = self.http("/v1/decide/info", timeout=8)
+            self.validate_profile()
+            return
         service = Path(service)
         with socket.socket() as listener:
             listener.bind(("127.0.0.1", 0))
             port = listener.getsockname()[1]
         self.url = f"http://127.0.0.1:{port}"
+        self.port = port
         memory = subprocess.check_output(["nvidia-smi", "-i", gpu, "--query-gpu=memory.free,memory.total",
                                           "--format=csv,noheader,nounits"], text=True)
         free, total = map(int, memory.strip().split(","))
@@ -33,7 +42,7 @@ class OfficialModel:
                "--model", model, "--served-model-name", self.served, "--dtype", "bfloat16",
                "--enable-lora", "--max-lora-rank", "32", "--lora-modules", "jev-decision="+str(service / "adapter_vllm"),
                "--trust-request-chat-template", "--logprobs-mode", "processed_logprobs", "--max-logprobs", "32",
-               "--max-model-len", str(max_context), "--max-num-seqs", "1", "--enforce-eager",
+               "--max-model-len", str(max_context), "--max-num-seqs", str(max_num_seqs), "--enforce-eager",
                "--gpu-memory-utilization", f"{utilization:.4f}", "--kv-cache-memory-bytes", str(3 * 1024**3)]
         cache = Path(tempfile.gettempdir()) / f"jev_official_engine_{os.getuid()}"
         cache.mkdir(parents=True, exist_ok=True)
@@ -59,11 +68,14 @@ class OfficialModel:
                     time.sleep(2)
             else:
                 raise RuntimeError(f"Published decision server did not start (exit {self.proc.poll()})")
-            if self.profile["defaults"]["mix"] != 0.5 or self.profile["model"] != self.served:
-                raise RuntimeError("Unexpected official decision service configuration")
+            self.validate_profile()
         except BaseException:
             self.close()
             raise
+
+    def validate_profile(self):
+        if self.profile["defaults"]["mix"] != 0.5 or self.profile["model"] != self.served:
+            raise RuntimeError("Unexpected official decision service configuration")
 
     def http(self, path, values=None, timeout=620):
         data = None if values is None else json.dumps(values, ensure_ascii=False).encode("utf8")
@@ -75,6 +87,8 @@ class OfficialModel:
             raise RuntimeError(f"Official server {path} {exc.code}: {exc.read().decode(errors='replace')[:1600]}") from exc
 
     def close(self):
+        if self.proc is None:
+            return
         if self.proc.poll() is None:
             os.killpg(self.proc.pid, signal.SIGTERM)
             try:
@@ -85,8 +99,16 @@ class OfficialModel:
         self.rpc_dir.cleanup()
 
     def info(self):
+        if self.proc is not None and self.proc.poll() is not None:
+            raise RuntimeError(f"The official service exited with {self.proc.returncode}")
         return {"model": self.model, "precision": "bf16", "merged": False, "backend": "official_vllm",
-                "service_pid": self.proc.pid, "profile": self.profile}
+                "service_pid": self.proc.pid if self.proc is not None else None, "profile": self.profile,
+                "port": self.port, "max_num_seqs": self.max_num_seqs}
+
+    def health(self):
+        self.info()
+        with urlopen(self.url + "/health", timeout=8) as response:
+            return {"status": response.status}
 
     def decide(self, state, question, options, skill="", thinking="off", threshold=None, think_budget=None, **_):
         prompt = (skill.strip() + "\n\n" + question).strip()
@@ -147,6 +169,8 @@ def main():
     parser.add_argument("--gpu", required=True)
     parser.add_argument("--service", type=Path, required=True)
     parser.add_argument("--max-context", default=16384, type=int)
+    parser.add_argument("--max-num-seqs", type=int, choices=(1, 2), default=1)
+    parser.add_argument("--attach-port", type=int, help="Use an existing official service on this host")
     args = parser.parse_args()
     model = None
     try:
@@ -159,8 +183,9 @@ def main():
                     print(json.dumps({"id": request_id, "result": {"closed": True}}), flush=True)
                     break
                 if model is None:
-                    model = OfficialModel(args.model, args.gpu, args.service, args.max_context)
-                if op not in ("info", "decide", "generate"):
+                    model = OfficialModel(args.model, args.gpu, args.service, args.max_context,
+                                          args.max_num_seqs, args.attach_port)
+                if op not in ("info", "health", "decide", "generate"):
                     raise ValueError("Unknown model operation: "+op)
                 result = getattr(model, op)(**req)
                 print(json.dumps({"id": request_id, "result": result}, ensure_ascii=False), flush=True)

@@ -1,4 +1,4 @@
-"""Run one model and one AppWorld simulator per GPU, with stable Train/Test pairs."""
+"""Schedule independent task sessions on shared GPUs with matched Train and Test pairs."""
 import csv
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime, timezone
@@ -6,8 +6,9 @@ import os
 import subprocess
 import time
 
-from formal_run import ExecutionWorkers, read, save
+from formal_run import read, save
 from phase1_run import PhaseOneStudy
+from .inference_workers import DeviceWorkers
 
 
 SCAN_SECONDS = 60
@@ -40,43 +41,58 @@ def inspect_node(entry):
 
 
 class SharedStudy(PhaseOneStudy):
-    def __init__(self, root, settings, connections, *, devices=(), max_gpus=4, gpu_name="A800"):
+    def __init__(self, root, settings, connections, *, devices=(), max_gpus=4, gpu_name="A800", lanes_per_gpu=None):
         super().__init__(root, settings, connections)
         self.workers = []
         self.connections = connections
         self.devices = tuple(devices)
         self.max_gpus = len(self.devices) or max_gpus
         self.gpu_name = gpu_name
+        self.groups = {}
         self.last_scan = float("-inf")
-        self.pairing = False
         self.started_utc = utcnow()
+        self.fixed_width = lanes_per_gpu
+        checkpoints = self.root / "checkpoints.json"
+        finished = len(read(checkpoints)) if checkpoints.is_file() else 0
+        self.lanes_per_gpu = self.width_for("train", finished + 1)
+
+    def width_for(self, phase, batch):
+        schedule = self.settings.get("inference_schedule", {})
+        key = "test" if phase == "test" else "first_batch" if batch == 1 else "later_batches"
+        width = self.fixed_width if self.fixed_width is not None else schedule.get(key, 1)
+        if width not in (1, 2):
+            raise ValueError(f"Expected one or two inference sessions per GPU, got {width}")
+        return width
+
+    def begin_inference_phase(self, phase, batch=None):
+        width = self.width_for(phase, batch)
+        if width != self.lanes_per_gpu:
+            self.status("switching_inference_concurrency", phase=phase, batch=batch, lanes_per_gpu=width)
+            self.close_devices()
+            self.lanes_per_gpu = width
+            self.last_scan = float("-inf")
+            self.start_workers()
 
     def metadata(self):
         save(self.root / "controller.json", {"pid": os.getpid(), "started_utc": self.started_utc,
-             "devices": ",".join(w.gpu for w in self.workers), "max_devices": self.max_gpus})
+             "devices": ",".join(self.groups), "max_devices": self.max_gpus,
+             "lanes_per_gpu": self.lanes_per_gpu, "task_slots": len(self.workers)})
 
     def load_worker(self, row):
-        worker = ExecutionWorkers(self.root, self.connections, row["gpu"])
+        device = DeviceWorkers(self.root, self.connections, row, self.lanes_per_gpu)
         try:
-            model = worker.connections["model"]["args"]
-            model_path = model[model.index("--model") + 1]
-            info = worker.worker("model").request("info")
-            if (info.get("backend") != "official_vllm" or info["model"] != model_path
-                    or info["precision"] != "bf16" or info["merged"]):
-                raise ValueError(f"Expected the official BF16 AutoTrust service on {worker.gpu}")
-            save(self.root / "workers" / (worker.gpu.replace(":", "_") + ".json"),
-                 {**info, "loaded_utc": utcnow(), "allocation": row})
-            return worker, None
+            device.start()
+            return device, None
         except Exception as exc:
-            worker.close()
+            device.close()
             return None, str(exc)
 
     def maybe_expand(self):
-        if len(self.workers) >= self.max_gpus or time.monotonic() - self.last_scan < SCAN_SECONDS:
+        if len(self.groups) >= self.max_gpus or time.monotonic() - self.last_scan < SCAN_SECONDS:
             return
         self.last_scan = time.monotonic()
-        active = {worker.gpu for worker in self.workers}
-        inspection = {"observed_utc": utcnow(), "active": sorted(active)}
+        active = set(self.groups)
+        inspection = {"observed_utc": utcnow(), "active": sorted(active), "lanes_per_gpu": self.lanes_per_gpu}
         if self.devices:
             candidates = [{"gpu": name} for name in self.devices if name not in active]
         else:
@@ -93,18 +109,20 @@ class SharedStudy(PhaseOneStudy):
         path = self.root / "gpu_allocation.json"
         save(path, inspection)
         if not take:
-            if not self.workers:
+            if not self.groups:
                 self.status("waiting_for_gpus", max_devices=self.max_gpus)
             return
-        if not self.workers:
-            self.status("loading_27b", gpus=[row["gpu"] for row in take])
+        if not self.groups:
+            self.status("loading_27b", gpus=[row["gpu"] for row in take], lanes_per_gpu=self.lanes_per_gpu)
         with ThreadPoolExecutor(len(take)) as pool:
-            for row, (worker, error) in zip(take, pool.map(self.load_worker, take)):
-                if worker is None:
+            for row, (device, error) in zip(take, pool.map(self.load_worker, take)):
+                if device is None:
                     inspection.setdefault("load_errors", {})[row["gpu"]] = error
                 else:
-                    self.workers.append(worker)
-        inspection["active"] = [w.gpu for w in self.workers]
+                    self.groups[device.gpu] = device
+        # Use distinct GPUs first when fewer tasks than sessions are ready.
+        self.workers = [device.sessions[lane] for lane in range(self.lanes_per_gpu) for device in self.groups.values()]
+        inspection["active"] = list(self.groups)
         save(path, inspection)
         self.metadata()
         if self.devices and inspection.get("load_errors"):
@@ -112,50 +130,63 @@ class SharedStudy(PhaseOneStudy):
 
     def start_workers(self):
         self.metadata()
-        while not self.workers:
+        while not self.groups:
             self.maybe_expand()
-            if not self.workers:
+            if not self.groups:
                 time.sleep(SCAN_SECONDS)
 
     def candidate_batch(self, *args, **kwargs):
         self.maybe_expand()
-        self.pairing = True
-        try:
-            return super().candidate_batch(*args, **kwargs)
-        finally:
-            self.pairing = False
+        return super().candidate_batch(*args, **kwargs)
 
     def execute_jobs(self, jobs, operation):
-        if self.pairing or len(self.workers) >= self.max_gpus or len(jobs) <= 1:
-            return super().execute_jobs(jobs, operation)
+        return self.execute_preferred(jobs, operation, None)
+
+    def execute_preferred(self, jobs, operation, preferred_gpus):
+        if not jobs:
+            return []
         self.maybe_expand()
-        iterator = iter(enumerate(jobs))
+        pending = list(range(len(jobs)))
         results = [None] * len(jobs)
-        remaining = len(jobs)
-        with ThreadPoolExecutor(self.max_gpus) as pool:
+        active = set(self.groups)
+        affinity = []
+        if preferred_gpus:
+            for gpu in preferred_gpus:
+                if gpu in active:
+                    affinity.append({gpu})
+                else:
+                    node = (gpu or "").rpartition(":")[0]
+                    affinity.append({key for key in active if key.rpartition(":")[0] == node})
+
+        def next_job(worker):
+            if affinity:
+                for index in pending:
+                    if worker.gpu in affinity[index]:
+                        return index
+                return next((index for index in pending if not affinity[index]), None)
+            return pending[0] if pending else None
+
+        with ThreadPoolExecutor(self.max_gpus * self.lanes_per_gpu) as pool:
             running = {}
-
-            def assign(worker):
-                nonlocal remaining
-                item = next(iterator, None)
-                if item is not None:
-                    index, job = item
-                    running[pool.submit(operation, job, worker)] = (index, worker)
-                    remaining -= 1
-
-            for worker in self.workers:
-                assign(worker)
-            while running:
+            busy = set()
+            while pending or running:
+                if pending and not affinity and len(self.groups) < self.max_gpus:
+                    self.maybe_expand()
+                for worker in self.workers:
+                    if not pending or worker in busy:
+                        continue
+                    index = next_job(worker)
+                    if index is not None:
+                        pending.remove(index)
+                        busy.add(worker)
+                        running[pool.submit(operation, jobs[index], worker)] = (index, worker)
+                if not running:
+                    raise RuntimeError("No active GPU session for the pending tasks")
                 finished, _ = wait(running, timeout=SCAN_SECONDS, return_when=FIRST_COMPLETED)
                 for future in finished:
                     index, worker = running.pop(future)
+                    busy.remove(worker)
                     results[index] = future.result()
-                    assign(worker)
-                if remaining and len(self.workers) < self.max_gpus:
-                    before = len(self.workers)
-                    self.maybe_expand()
-                    for worker in self.workers[before:]:
-                        assign(worker)
         return results
 
     def batch(self, tasks, stage, variant="B", library=None):
@@ -168,3 +199,19 @@ class SharedStudy(PhaseOneStudy):
                              output_tokens=sum(row["output_tokens"] for row in rows))
             save(path, reference)
         return rows
+
+    def close_devices(self):
+        devices = list(self.groups.values())
+        try:
+            if devices:
+                with ThreadPoolExecutor(len(devices)) as pool:
+                    list(pool.map(lambda device: device.close(), devices))
+        finally:
+            self.groups.clear()
+            self.workers = []
+
+    def close(self):
+        try:
+            self.close_account()
+        finally:
+            self.close_devices()

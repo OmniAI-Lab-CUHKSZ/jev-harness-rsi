@@ -31,7 +31,11 @@ class PublicRunTests(unittest.TestCase):
             study = Mock(root=Path(folder), settings=read(RESOURCES / "experiment.json"), functions=[])
             def batch(tasks, stage, library):
                 successes = 10 if stage.startswith("dev_") else 1
-                return scored(tasks, stage, successes, 50)
+                rows = scored(tasks, stage, successes, 50)
+                if stage == "dev_b02r01":
+                    for row in rows:
+                        row["lanes_per_gpu"] = 2
+                return rows
             study.batch.side_effect = batch
             study.candidate_batch.side_effect = lambda tasks, stage, candidate, parent, library: (
                 parent, scored(tasks, stage, 2, 55))
@@ -41,6 +45,8 @@ class PublicRunTests(unittest.TestCase):
                 snapshots = read(study.root / "checkpoints.json")
                 self.assertEqual([r["next_version"] for r in snapshots], ["b01r01", "b02r01"])
                 self.assertTrue(all(r["dev_selection"]["tied"] for r in snapshots))
+                self.assertEqual(snapshots[1]["dev_selection"]["reference_lanes_per_gpu"], [1])
+                self.assertEqual(snapshots[1]["dev_selection"]["candidate_lanes_per_gpu"], [2])
                 dev_stages = [c.args[1] for c in study.batch.call_args_list if c.args[1].startswith("dev_")]
                 self.assertEqual(dev_stages, ["dev_h00", "dev_b01r01", "dev_b02r01"])
                 study.batch.reset_mock()

@@ -87,6 +87,9 @@ def main(argv=None):
     model_args = first_node["args"]
     settings["model_path"] = model_args[model_args.index("--model") + 1]
     root = args.root.resolve()
+    if (root / "configuration.json").is_file() and "inference_schedule" not in read(root / "configuration.json"):
+        # Runs created before multi-session inference used one session throughout.
+        settings.pop("inference_schedule", None)
     initialize(root, settings)
     study = SharedStudy(root, settings, connections, devices=devices, max_gpus=getattr(args, "max_gpus", 1),
                         gpu_name=getattr(args, "gpu_name", "A800"))

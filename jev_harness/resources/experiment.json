@@ -92,6 +92,11 @@
     "handoff"
   ],
   "semantic_handoffs": true,
+  "inference_schedule": {
+    "first_batch": 1,
+    "later_batches": 2,
+    "test": 2
+  },
   "adaptive_decision": {
     "upstream": "autotrust/AutoTrust-Decider-Pro-27B",
     "release": "14b425269ed24452e0a5ad5a8f3e51d139647a88",
