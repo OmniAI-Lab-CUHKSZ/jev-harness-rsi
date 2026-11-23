@@ -1,0 +1,106 @@
+{
+  "executor": "autotrust/AutoTrust-Decider-Pro-27B",
+  "model_path": "autotrust/AutoTrust-Decider-Pro-27B",
+  "seed": 20261119,
+  "execution": {
+    "max_calls": 40,
+    "output_budget": 8192,
+    "generation_tokens": 1024,
+    "api_budget": 300,
+    "timeout_seconds": 900,
+    "thinking_budget": 256,
+    "generation_thinking": true,
+    "history_chars": 18000,
+    "step_review_threshold": 0.6,
+    "step_review_mode": "official_adaptive",
+    "step_review_thinking_budget": 256
+  },
+  "protocol": "phase1_semantic_menus_v2",
+  "optimizer": {
+    "model": "gpt-6.2-sol",
+    "reasoning_effort": "max",
+    "rounds": 2,
+    "max_objects": 3,
+    "candidates": 1,
+    "history_preview": true,
+    "fragment_trials": true,
+    "same_batch_feedback_from": 1
+  },
+  "post_task_generation_budget": 0,
+  "initial_learning": "Original H0 business cards and general handoff selector; specialist handoffs learned within this run.",
+  "train_selection": "Compare successes then fewer generated tokens; Train and Dev keep ties.",
+  "holdout": "30 disjoint Normal scenarios / 90 independent tasks, two paired arms",
+  "batches": [
+    [
+      "6ea6792",
+      "82e2fac",
+      "ccb4494"
+    ],
+    [
+      "cf6abd2",
+      "afc0fce",
+      "287e338"
+    ],
+    [
+      "302c169",
+      "3c13f5a",
+      "c901732"
+    ],
+    [
+      "e85d92a",
+      "771d8fc",
+      "22cc237"
+    ],
+    [
+      "34d9492",
+      "aa8502b",
+      "b0a8eae"
+    ],
+    [
+      "29caf6f",
+      "692c77d",
+      "2a163ab"
+    ],
+    [
+      "d0b1f43",
+      "229360a",
+      "e3d6c94"
+    ],
+    [
+      "27e1026",
+      "60d0b5b",
+      "6104387"
+    ],
+    [
+      "76f2c72",
+      "b7a9ee9",
+      "ce359b5"
+    ],
+    [
+      "07b42fd",
+      "7d7fbf6",
+      "e7a10f8"
+    ]
+  ],
+  "formal": true,
+  "editable_components": [
+    "adapter",
+    "card",
+    "state",
+    "assembly",
+    "decision",
+    "handoff"
+  ],
+  "semantic_handoffs": true,
+  "adaptive_decision": {
+    "upstream": "autotrust/AutoTrust-Decider-Pro-27B",
+    "release": "14b425269ed24452e0a5ad5a8f3e51d139647a88",
+    "entry": "/v1/decide",
+    "thinking": "auto",
+    "threshold": 0.6,
+    "think_budget": 256,
+    "mix": 0.5,
+    "scope": "fragment/step; preserve existing menu expansion before final review",
+    "generation": "same 27B backbone"
+  }
+}

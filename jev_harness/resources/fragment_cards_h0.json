@@ -1,0 +1,32 @@
+{
+  "questions": {
+    "step": "Which available operation should run immediately to advance the request from the current data? A useful intermediate result is sufficient. Choose NONE only when every offered operation is inapplicable to the remaining work.",
+    "quantity": "How many leading records does the user request from the ranked result?"
+  },
+  "skills": {
+    "step": "Work on the first unmet prerequisite. Read or filter the required population before ranking it. A card can fetch the fields listed under reads. Submit only a completed answer or confirmed effect.",
+    "residual": "Use the scoped intermediate values and completed effects already carried into this Python session. Finish the unresolved part of the user request. You can yield one supported public read to the fragment loop."
+  },
+  "collections": {
+    "songs": "songs saved directly in the Spotify song library",
+    "albums": "songs in all saved albums",
+    "playlists": "songs in all playlists in the user's playlist library"
+  },
+  "cards": {
+    "library": {"builtin":"library","description":"Read the member songs of the requested personal libraries.","skill":"Use for one or several entire song, album or playlist libraries. Named collections have their own source."},
+    "playlist": {"builtin":"playlist","description":"Locate one named personal playlist and read its song IDs.","skill":"Use when the named playlist defines the scope."},
+    "album": {"builtin":"album","description":"Locate one named catalog album and read its song IDs.","skill":"Use for a named album even if it was never saved to the account."},
+    "directory": {"builtin":"directory","description":"Read the recursive live listing of a source directory.","skill":"Use the requested source path. A later operation can transform, move or archive entries."},
+    "filter_genre": {"builtin":"filter_genre","description":"Fetch the genre of these songs and keep the songs in the requested genre.","skill":"Choose this intermediate step when the requested population is limited by music genre. It prepares the eligible songs for ranking, counting, or another action."},
+    "sort_songs": {"builtin":"sort_songs","description":"Order all current songs by the requested song attribute.","skill":"Establish the eligible population first. Sorting preserves all members and their IDs."},
+    "take_first": {"builtin":"take_first","description":"Keep the requested number of songs from the front of the current ranking.","skill":"Use for an extremum or a top-K request after sorting. The remaining song IDs can be played or displayed."},
+    "count_songs": {"app":"spotify","inputs":["song_ids"],"output":"answer","compute":{"op":"length","args":[{"ref":"state.song_ids"}]},"description":"Count distinct songs in the current selection and prepare a number.","skill":"Choose when the user asks how many songs are in this scope."},
+    "titles": {"builtin":"titles","description":"Read the current songs' titles in order and prepare a text answer.","skill":"Apply any requested eligibility, order and quantity before preparing titles."},
+    "play": {"builtin":"play","description":"Start playback of the single selected song.","skill":"Use only when the user requests playback and the current selection is that song."},
+    "submit_answer": {"builtin":"submit_answer","description":"Submit the prepared answer to the user.","skill":"Choose when the prepared result answers the user's request."},
+    "submit_effect": {"builtin":"submit_effect","description":"Confirm completion of the requested action.","skill":"Choose when the recorded effect completes the requested change."},
+    "read_alarms": {"app":"phone","inputs":[],"output":"alarms","api":"phone__show_alarms","arguments":{},"paginate":true,"public_read":true,"description":"Read the user's current alarm records.","skill":"Use before inspecting or modifying a requested alarm."},
+    "read_pending_requests": {"app":"venmo","inputs":[],"output":"received_pending_requests","api":"venmo__show_received_payment_requests","arguments":{"status":"pending"},"paginate":true,"description":"Read pending incoming payment requests.","skill":"Use for requests received by this account that still await action."},
+    "read_notes": {"app":"simple_note","inputs":[],"output":"note_summaries","api":"simple_note__search_notes","arguments":{},"paginate":true,"public_read":true,"description":"Read the current list of note summaries.","skill":"Use to identify a note that will later be read or edited."}
+  }
+}

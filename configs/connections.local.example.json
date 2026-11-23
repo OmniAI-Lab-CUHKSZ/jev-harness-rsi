@@ -1,0 +1,16 @@
+{
+  "environment": {
+    "python": "${APPWORLD_PYTHON}",
+    "script": "${PACKAGE_DIR}/env_worker.py",
+    "args": ["--root", "${APPWORLD_ROOT}", "--compatibility-source", "${PACKAGE_DIR}"],
+    "read_timeout": 165
+  },
+  "model_nodes": {
+    "local": {
+      "python": "${JEV_MODEL_PYTHON}",
+      "script": "${PACKAGE_DIR}/official_model_worker.py",
+      "args": ["--model", "${JEV_MODEL_DIR}", "--service", "${JEV_MODEL_DIR}"],
+      "read_timeout": 940
+    }
+  }
+}

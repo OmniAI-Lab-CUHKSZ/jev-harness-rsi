@@ -1,0 +1,25 @@
+{
+  "environment": {
+    "host": "${APPWORLD_HOST}",
+    "user": "${SSH_USER}",
+    "port": 22,
+    "identity": "${SSH_IDENTITY}",
+    "python": "${APPWORLD_PYTHON}",
+    "script": "${APPWORLD_REPO}/jev_harness/env_worker.py",
+    "args": ["--root", "${APPWORLD_ROOT}", "--compatibility-source", "${APPWORLD_REPO}/jev_harness"],
+    "compression": true,
+    "read_timeout": 165
+  },
+  "model_nodes": {
+    "gpu-a": {
+      "host": "${GPU_HOST}",
+      "user": "${SSH_USER}",
+      "port": 22,
+      "identity": "${SSH_IDENTITY}",
+      "python": "${JEV_MODEL_PYTHON}",
+      "script": "${MODEL_REPO}/jev_harness/official_model_worker.py",
+      "args": ["--model", "${JEV_MODEL_DIR}", "--service", "${JEV_MODEL_DIR}"],
+      "read_timeout": 940
+    }
+  }
+}
