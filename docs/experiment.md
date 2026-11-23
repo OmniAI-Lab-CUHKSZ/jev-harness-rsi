@@ -1,96 +1,96 @@
-# AppWorld 主实验设计 · Sol 演化公共 harness，Jev 选择片段与交接指导
+# AppWorld experiment design
 
-**正式运行版，2026 年 11 月 23 日。** 从 H0 和第一批九道 Train 题开始，片段选择使用 AutoTrust 官方自适应决策。正式阈值为 0.60，单次低置信推理上限为 256 个 token。从第一轮起启用语义交接、同批反馈和旧 Train 影响预览。运行记录保存在启动时由 `--root` 指定的目录。
+**Phase 1 protocol, November 23, 2026.** Starting from H0, a fixed 27B agent runs the first nine Train tasks. GPT-6.2 Sol studies the execution traces and edits the harness shared by all tasks. Semantic handoffs, feedback from the rest of the current batch, and previews on earlier Train states are available from the first round. The controller writes records under the directory given to `--root`. [Run configuration](../jev_harness/resources/experiment.json) · [Reproduction guide](reproduce.md)
 
-## 1. 研究问题
+## Research question
 
-固定同一个 27B，考察 Sol 能否通过 Train 执行轨迹改进整套公共 harness，使执行模型在新场景中完成更多任务，并降低达到相同正确率所需的在线生成 token。Sol 可以修改数据如何进入系统、状态如何表示、程序如何组菜单、Jev 如何选、片段如何执行，以及切到生成时给什么指导。片段积累是其中一种改进途径。
+Can Sol improve the shared harness so that the same 27B agent solves more tasks in new scenarios, or uses fewer online generated tokens at the same success rate? The harness governs what data enters the system, how it is represented, which choices reach Jev, what a fragment executes, and what the generator sees when it takes over.
 
-实验单位是一道独立的 AppWorld 题。每道题有自己的模拟器初始状态。单题执行期间，程序只读取当前公共库，将现有片段临时组合为本题接下来可走的步骤。跨题更新由离线 Sol 完成。执行模型的权重固定，27B 自行写入或编译新片段留给第二阶段。
+The unit of evaluation is one AppWorld task with its own initial simulator state. Within a task, the program assembles the next steps from the current shared library. Between tasks, offline Sol edits that library and its policies. Model weights are fixed. Executor-authored fragments are a separate, later phase.
 
-## 2. 在线执行器与 H0
+## The executor and H0
 
-模型为 `autotrust/AutoTrust-Decider-Pro-27B`，BF16。启用发布的适配器和原生判断头时，从程序给定的选项中选择，一个前向计算返回选项及概率。开放生成时，关闭适配器，由同一底模生成 AppWorld Python。两种模式使用同一套公开 API、会话和实际观测。
+The model is `autotrust/AutoTrust-Decider-Pro-27B`, served in BF16. Its released adapter and native decision head score the options supplied by the program. In open generation, the same backbone runs with the adapter disabled and writes Python against the public AppWorld APIs. Both modes share one session and its actual observations.
 
-| H0 的组成 | 正式起点 |
+| Part of H0 | Starting state |
 |---|---|
-| 15 个初始片段 | `library`、`playlist`、`album`、`directory`、`filter_genre`、`sort_songs`、`take_first`、`count_songs`、`titles`、`play`、`submit_answer`、`submit_effect`、`read_alarms`、`read_pending_requests`、`read_notes` |
-| 组装程序 | 检查已安装操作、需要的输入和已经产生的结果，按应用或子目标形成候选菜单，并找出当前可用的数据提供者。初始描述涵盖 Spotify、Phone、Venmo、File System 和 Simple Note。菜单可随安装的片段扩展 |
-| 决策及状态 | 通用组装问题、下一步问题、参数问题和 skill。单题状态保存真实结果、来源、选择过的参数和已执行的效果。初始没有额外的自定义状态视图 |
-| 执行及交接 | 通用 API 执行，Phone 的初始登录字段，通用生成指导，以及一个可编辑的 Jev 交接问题和选择 skill。业务专项指导数为 **0** |
+| Fifteen fragments | `library`, `playlist`, `album`, `directory`, `filter_genre`, `sort_songs`, `take_first`, `count_songs`, `titles`, `play`, `submit_answer`, `submit_effect`, `read_alarms`, `read_pending_requests`, `read_notes` |
+| Assembly | The program checks installed operations, required inputs and values already obtained. It can group candidates by app or subgoal and find available data providers. H0 describes Spotify, Phone, Venmo, File System and Simple Note. New fragments can extend these menus. |
+| Decision and state | Shared questions and guidance cover menu selection, next steps and parameter choices. Per-task state contains actual results, their sources, selected parameters and effects already executed. H0 starts with zero custom state views. |
+| Execution and handoff | Generic API execution, initial Phone login fields, default generation guidance, and an editable Jev handoff question and selection skill. H0 starts with zero task-specific handoff guides. |
 
-H0 的原始卡片和参数提示沿用此前 Train 工作；清单注明了 30 个历史来源题。完整 H0 和逐题划分随源码提供。
+The initial fragments and parameter guidance come from earlier Train work. The split manifest identifies the 30 historical source tasks. [Full H0](../jev_harness/resources/h00.json) · [Task manifest](../jev_harness/resources/task_split.json)
 
-### 一道题怎样运行
+### One task, step by step
 
-1. **程序列出可执行步骤。** 输入是公开题面、片段声明及当前真实值。有两个以上不同菜单时，Jev 先判断哪个菜单更有助于下一步。聚焦菜单里的 NONE 可以展开到完整可执行菜单，应用名称只影响提示和菜单顺序。
-2. **Jev 选片段、绑定参数。** 例如先选“读取笔记列表”，再从真实返回的笔记标题或 ID 里选择对象。题面、问题和候选由程序和已安装模板组成。在线出题、编选项所用的生成调用数为零。
-3. **程序执行并重新组装。** 把工具返回的实际值写到片段声明的输出位置。下游片段的输入满足后，下一个菜单就可以选它。对于选择下一步片段的菜单，官方决策头先给每个选项打分，得到分布 `p1`。最高概率达到 **0.60** 就直接采用。低于 0.60 时，同一 27B 对当前状态和同组选项推理，最多使用 **256 个思考 token**，然后读取各选项的概率 `p2`，逐项计算 `(p1 + p2) / 2`，选择得分最高的一项。达到上限时也读取一次选项概率，并记录思考是否自然结束。窄菜单初选 NONE 时优先展开。组装、参数和交接指导使用原生判断。阈值和预算从 H0 到测试固定。
-4. **确实要转入开放生成时，Jev 可以选择指导。** 程序先检查每条专项指导所声明的必需数据，如已读出的笔记。没有合格指导时直接普通交接。有合格指导时，程序把题面、所需数据的摘要、候选动作说明和 NONE 交给原生判断头。Sol 还可以为易混淆的目标命名，例如“只报告金额”。选中这类选项或 NONE 时走普通交接。选中某条专项后，只有该条的 skill 加入生成输入。此处只做原生判断，不做低置信生成复选。每页最多 15 个实选项加 NONE，大菜单按页选并归并，为后续生成保留调用预算。
-5. **生成模式继续任务。** 生成模型取得原会话里的真实变量、可用工具和交接信息。在后续调用里，它可以继续生成，也可以用 `yield_read` 将一个已登记的公开读取交回执行器。执行器完成读取后再次组装动作菜单，下次交接根据新状态重新选择指导。选择指导本身不执行付款、播放等操作。
+1. **Build the menu.** The program reads the public instruction, fragment declarations and live values. If there are multiple distinct menus, Jev can choose the most promising one. Selecting `NONE` in a focused menu can open the full eligible menu. App names influence hints and ordering.
+2. **Select and bind.** Jev chooses a fragment and, where needed, its arguments. For example, after listing notes, the next choice may use a real title or ID returned by the app. Installed templates and live values supply both the question and its options. Generative calls to author online questions or options total zero.
+3. **Execute and reassess.** The program writes the actual tool result to the fragment's declared output. This can satisfy an input for a downstream fragment. For the next-fragment choice, the official service scores the options to obtain `p1`. At a top probability of **0.60** or above, the initial choice stands. Below 0.60, the same 27B can reason for up to **256 tokens** over the same state and choices, then score them again to obtain `p2`. The final choice maximizes `(p1 + p2) / 2`. The service reads option scores even when thinking reaches its cap and records whether thinking ended naturally. An initial `NONE` on a narrow menu first triggers expansion. Menu selection, argument binding and handoff guidance use native judgment. The threshold and reasoning budget apply from H0 through Test-N.
+4. **Choose guidance for generation.** Each specialist guide declares which real data it requires. With eligible guides, Jev sees the task, a summary of those data, descriptions of the possible next actions, and `NONE`. Sol may also name an easily confused alternative such as “only report the amount.” Selecting that alternative or `NONE` gives the generator the ordinary handoff. Selecting a specialist adds that guide's skill. With zero eligible guides, the ordinary handoff is immediate. Menus hold up to 15 substantive choices plus `NONE` per page. The program combines page selections while reserving a call for generation.
+5. **Continue in the same session.** The generator receives the live variables, available tools and handoff. It can continue writing Python or use `yield_read` to return a registered public read to the executor. After the read, the program builds a fresh menu. The next handoff selects guidance using the updated state. Selecting guidance only determines what the generator sees. App actions such as paying or playing music take place separately.
 
-落到普通交接时，单纯注册一条新专项不会把它的文本或系统提示带给 G。两道题都持有同一类数据时，它们仍可能一起触发一次 Jev 判断。如果 Jev 误选，错误指导仍会传给 G，旧题影响预览专门检查这种情况。
+A newly registered guide reaches the generation prompt only when selected. Two unrelated tasks with the same kind of available data may both trigger a handoff decision. Historical previews can reveal when Jev sends the wrong guide to one of them.
 
-交接判断每个角色最多展示约 1,200 个字符，合计约 12,000 个字符。生成端保留完整的会话变量。专项 skill 另放在生成输入的独立字段，常规和压缩上下文分别最多展示约 3,200 和 1,600 个字符。预算不足以完成判断并保留生成机会时，直接普通交接。
+The handoff judge receives about 1,200 characters per data role and up to about 12,000 characters in total. Full session variables remain available to the generator. The chosen skill has its own prompt field of up to about 3,200 characters in regular context or 1,600 in compact context. With too little call budget for both a judgment and a generation opportunity, the executor uses the ordinary handoff.
 
-## 3. Sol 可以改哪六部分
+## What Sol can edit
 
-一次补丁修改 **1 至 3 个命名对象**。例如改一条公共交接问题和两条不同指导，恰好是三个对象。每批最多两轮，跨批沿用经 Dev 选择的版本。
+One patch changes **one to three named objects**. Editing a shared handoff question and two distinct guides uses all three. Each Train batch has at most two rounds. Dev selects the harness that starts the next batch.
 
-| 组件 | Sol 可修改的内容 | 适合处理的实际问题 |
+| Component | Editable content | Example diagnosis |
 |---|---|---|
-| 执行适配 `adapter` | 应用登录字段、会话结果路径、公开 API 的参数映射、结果路径和分页大小 | 模型选对联系人读取，但登录传了错误字段 |
-| 执行片段 `card` | 局部读取、计算或执行动作，输入与输出、参数候选、说明、执行 skill、交接时如何读取结果 | 多道题的生成代码都先定位一条笔记，适合提炼为可复用读取 |
-| 状态视图 `state` | 从已有公共数据计算展示给决策及生成的视图 | 已取到了候选对象，下一步却看不出这些对象属于哪个范围 |
-| 菜单组装 `assembly` | 菜单描述、包含的应用与片段、根据状态补充候选的受限程序 | 已有合适片段，却没有出现在 Jev 实际看到的合适菜单 |
-| 判断 `decision` | 菜单、下一步和参数判断的问题或 skill，部分节点可对候选排序；交接节点可改问题和选择 skill | 同一条已读笔记，Jev 混淆“替我收款”和“告诉我欠款金额” |
-| 生成交接 `handoff` | 专项所需真实数据、语义标签、易混淆的普通选项、命中后给 G 的 skill，以及普通交接、工具提示和公开读取回接规则 | 专项指导适用于“立即播放”，改写后也应选中；仅要求推荐时应回到普通指导 |
+| Execution adapter (`adapter`) | Login fields, paths to session values, public API argument mappings, response paths and page size | Jev chooses the correct contacts read, but the login sends the wrong field. |
+| Fragment (`card`) | Local reads, computations or actions, inputs and outputs, candidate arguments, descriptions and skills for execution or handoff | Several tasks generate code to find one note and read its contents. |
+| State view (`state`) | A view computed from existing public data for Jev or the generator | The objects were retrieved, but the next step cannot tell which collection they belong to. |
+| Menu assembly (`assembly`) | Menu descriptions, included apps and fragments, and restricted programs that add candidates based on state | A suitable fragment exists but is missing from the menu Jev sees. |
+| Decision (`decision`) | Menu, step and parameter questions and skills, candidate ordering at supported nodes, and the handoff question and selection skill | Jev confuses “collect the money” with “tell me how much is owed” after reading the same note. |
+| Generation handoff (`handoff`) | Required live data, semantic labels, ordinary alternatives, specialist and default guidance, tool hints and public-read reentry rules | Wording that requests immediate playback should select a playback guide. A recommendation request should receive ordinary guidance. |
 
-旧版的 `handoff` 入口只会运行 Sol 编写的 `requires/when` 条件。Sol 能修改这些条件，也能读宿主源码，但补丁只能安装六类对象，受限程序里没有“在交接处请求一次原生 Jev 判断”的操作。新版把这次判断接入执行器，并将问题、选项和指导暴露给 Sol。模型调用时机、计费、评测和公共工具的实际执行仍由宿主负责。Sol 可以随补丁写下 `capability_gap`，指出哪条轨迹显示缺少哪种宿主能力，供后续查阅。
+An earlier handoff implementation evaluated Sol-authored `requires` and `when` conditions. The current executor also supplies a native Jev call at handoff. The question, options and skill are editable. Call scheduling, accounting, evaluation and the public tool calls themselves belong to the host. Sol can read the host source and include a `capability_gap` in a proposal identifying the trace and the missing host capability.
 
-## 4. 一批内 Sol 如何得到反馈
+## How Sol revises a batch
 
-**采样。** 先让本批入口版本在 9 道 Train 题上正常运行。Sol 收到逐题成功与否、在线输出 token、失败位置、执行过的片段、第一次开放生成的位置，以及轨迹索引。它能展开题面、Jev 候选、低置信推理的实际用量、初选概率、推理后概率、融合结果及最终选择。它也可以查看公开 API 调用和返回值、生成的程序、错误、交接选择与下一次生成的真实输入。可以按事件或文本查找和分页读取。
+**Collect the traces.** The incoming harness runs all nine Train tasks. Sol receives per-task success, online token counts, failure locations, executed fragments, the first open-generation step and a searchable trace index. It can open the full instruction, Jev's menu, the adaptive call's actual reasoning usage, initial and post-reasoning probabilities, the fused result and final selection. It can inspect public API calls and returns, generated code, errors, handoffs and the generator's next actual input. Events support text search and paginated reads.
 
-**定位。** 工作台从本批生成代码中抽取重复的 API 和数据处理操作，列出来源任务、行号和变量。Sol 判断问题落在编译、选择、执行还是交接，并提交一个可安装的补丁及预期效果。当前批次构成正式优化目标。同一新实验中以往批次的 Train 轨迹也能按需打开。Dev 和 Test 的题面、轨迹及逐题评测反馈均不进入这个工作台。
+**Locate a change.** The workbench identifies repeated API calls and data operations in the batch's generated code, with source tasks, line numbers and variables. Sol uses that evidence to localize the issue to assembly, selection, execution or handoff and proposes an installable patch with a predicted effect. The current batch supplies the optimization target. Sol may open earlier Train traces from the same experiment. Dev and Test-N are reserved for selection and evaluation outside the optimizer.
 
-**试补丁。** 工作台返回三种证据。
+**Try the patch.** The workbench can return three kinds of evidence.
 
-| 证据 | 如何获得 | 能回答什么 |
+| Evidence | What runs | What Sol can learn |
 |---|---|---|
-| 本批的自然执行 | 在本批各题上，用候选重新走到首次开放生成或完成，和父版记录比较。焦点题可指定更后的事件，并限制可用 G 次数 | 是否真的选了新片段、第一处分叉在哪里、给 G 的输入改了什么、同批其他题有无受影响 |
-| 局部片段执行 | 适用时，在本批记录过的公开状态定点试新片段，检查绑定、结果及下游使用 | 片段自身能否算对，与运行时能否自然选中分别记录 |
-| 旧 Train 影响预览 | 取历史轨迹的同一状态，让父版和候选比较可能受影响的卡片、候选及顺序、旧绑定是否仍在、交接菜单和可见指导。给摘要及可展开的逐位置文档 | 可以知道哪些旧题、哪个位置受影响。对没有记录完整输入的地方标为未知；同一 API 在旧生成代码中出现只表明有复用机会。旧题整题成绩保持未测 |
+| Natural execution on the current batch | Run each task under the candidate until completion or first open generation, and compare with the parent trace. A focus task can continue to a later event with a limited number of generation calls. | Was the new fragment selected in a normal run? Where did the paths first diverge? Did the generator's input or another task change? |
+| Local fragment execution | Try a relevant fragment at a recorded public state in the batch. Inspect bound arguments, returned values and downstream use. | Does the fragment compute the intended result when selected? Natural execution separately measures whether Jev chooses it. |
+| Historical Train preview | At the same old state, compare parent and candidate menus, ordering, availability of old bindings, handoff options and visible guidance. Each location has an inspectable record. | Which earlier tasks and steps might change? Missing inputs are marked unknown. An API appearing in old generated code identifies a possible reuse opportunity. The preview measures state-level effects. |
 
-若修改专项指导或交接判断，Sol 可以随补丁指定最多六条改写检查。工作台还会尽可能取一个本批位置和一个历史 Train 位置，优先选已实际命中相关指导的位置。缺少同义或异义对照时，离线 Sol 为该位置拟一对近似题面；异义对照尽量保留对象、数据和上下文，只改变用户要求的最终效果。两版 27B 在同一公开状态上做原生判断，也检验移除一项必需数据后的选择。局部预览记录选择、前列选项分数、输入与输出 token。对同义改写，若没有明确参考且原题只走普通交接，结果记为无法判断专项是否复用成功。自动改写是诊断材料，不能取代 AppWorld 的成功判定。
+For a specialist guide or handoff judgment, Sol may specify up to six wording checks in a patch. When possible, the workbench selects a state from this batch and one from earlier Train data, preferring actual guide hits. If comparison prompts are missing, offline Sol drafts a paraphrase and a closely matched request with a different intended effect. The latter keeps the objects, data and context as similar as possible.
 
-**确认与计分。** 每轮编辑对话最多 12 次交互。若在最后一回合之前给出补丁，Sol 可看到试补丁反馈后修订或确认。在最后一回合才交补丁，工作台仍做预览，结果随正式该轮记录留给后续轮次。每轮只给一个最终候选计正式分。候选在本批九题上完整重跑。离线 Sol、试片段、检查改写的费用与正式在线任务费用分开。
+The same 27B makes native decisions under both harnesses at the same recorded state. The workbench also tests removing one required input. It logs the choices, leading option scores and token counts. If the original used the ordinary handoff and there is no reference for the specialist guide, the paraphrase check is marked inconclusive. AppWorld's end-to-end score determines task success.
 
-## 5. 任务、选版与留出评测
+**Score one candidate.** Each editing round allows up to 12 interactions. A proposal submitted before the last turn can be revised or confirmed after the preview. A proposal submitted on the last turn is still previewed, and its feedback is recorded for later rounds. Only the final candidate is scored on the full nine tasks. Offline Sol usage, fragment trials and wording checks are accounted for separately from online task execution.
 
-固定任务种子 **20261119**。Train、Dev 和 Test-N 的场景互不重叠。Train 取官方 30 个场景、90 题；Dev 取官方 19 个场景、57 题；Test-N 取预先选定的 Normal 测试子集 30 个场景、90 题。每个场景含三个官方变体，不跨集合拆分。数据清单列出每道题的 ID。每道题独立初始化，优化不跨题传递模型对话或应用状态。
+## Task splits, selection and held-out evaluation
 
-| 批次 | 三个 Train 场景 | 批次 | 三个 Train 场景 |
+The task seed is **20261119**. Train uses 30 official scenarios (90 tasks), Dev uses 19 (57 tasks), and Test-N uses 30 preselected Test-Normal scenarios (90 tasks). The sets are scenario-disjoint, with all three official variants kept together. Each task starts with a fresh simulator and model conversation. [Every task ID](../jev_harness/resources/task_split.json)
+
+| Batch | Train scenario IDs | Batch | Train scenario IDs |
 |---:|---|---:|---|
-| 1 | 6ea6792，82e2fac，ccb4494 | 6 | 29caf6f，692c77d，2a163ab |
-| 2 | cf6abd2，afc0fce，287e338 | 7 | d0b1f43，229360a，e3d6c94 |
-| 3 | 302c169，3c13f5a，c901732 | 8 | 27e1026，60d0b5b，6104387 |
-| 4 | e85d92a，771d8fc，22cc237 | 9 | 76f2c72，b7a9ee9，ce359b5 |
-| 5 | 34d9492，aa8502b，b0a8eae | 10 | 07b42fd，7d7fbf6，e7a10f8 |
+| 1 | 6ea6792, 82e2fac, ccb4494 | 6 | 29caf6f, 692c77d, 2a163ab |
+| 2 | cf6abd2, afc0fce, 287e338 | 7 | d0b1f43, 229360a, e3d6c94 |
+| 3 | 302c169, 3c13f5a, c901732 | 8 | 27e1026, 60d0b5b, 6104387 |
+| 4 | e85d92a, 771d8fc, 22cc237 | 9 | 76f2c72, b7a9ee9, ce359b5 |
+| 5 | 34d9492, aa8502b, b0a8eae | 10 | 07b42fd, 7d7fbf6, e7a10f8 |
 
-1. H0 运行第 1 批九题。之后按表顺序，共 10 批，每批最多 2 轮，不回练第 3、4、5 批。若本批已做到 9/9 且在线输出为零，即可提前结束该批。
-2. 选版按字典序比较 **（成功题数，负的在线总输出 token）**。成功多一题优先；成功数相同则 token 少者优先；两项完全相同保留新版本。候选若输给父版，下一轮仍从父版出发。工作台保留被拒候选的轨迹供诊断。
-3. 本批结束，若 Train 选出了新版本，就在完整的 57 题 Dev 上计分，与本批入口版本的逐题结果比较。H0 在本次执行器上完整评测一次，与首批候选同样使用 0.60 低置信推理阈值、相同的任务清单与单题预算。两版都完成后，先比成功数，再比在线总输出 token，两项相同保留候选。之后直接复用父版在本次设置下的 57 条逐题记录，新候选才需要运行 Dev。最终泛化由同批 90 题 Test-N 的双臂实测评价。
-4. 十批完成并确定保留版本后，关闭 Sol 编辑，在同一批 90 道 Test-N 题上只做一个配对主比较。**A 臂**为普通 27B 生成 agent；**B 臂**为同一 27B 加最终公共 harness，可使用原生判断和必要生成。每对在同一张卡上使用各自初始的模拟器，按题交替 A/B 顺序。H0 是 B 臂的演化起点，保留已有的 Jev 能力。该比较测量整套演化系统相对普通生成 agent 的效果，单独交接模块的贡献不能从这两个成绩分解出来。
+1. **Train.** H0 starts Batch 1. Visit the ten batches once in the order shown, with at most two revisions each. A batch can finish early when it reaches 9/9 with zero online generated tokens.
+2. **Compare revisions.** Rank versions first by tasks solved, then by fewer total online output tokens. An exact tie retains the candidate. If the candidate loses, the next round starts from its parent. Rejected traces remain available for diagnosis.
+3. **Select on Dev.** When Train yields a new version, run it on all 57 Dev tasks and compare with the version that entered the batch. Evaluate H0 once under the same 0.60 threshold, task list and per-task limits. For later parents, reuse their 57 recorded outcomes under this setting. The Train ranking and tie rule also apply on Dev.
+4. **Test the whole system.** After Batch 10, freeze the retained harness and close Sol editing. For each of the 90 Test-N tasks, compare **A**, the ordinary 27B generation agent, with **B**, the same 27B using the final harness and its native decisions. Run each pair on the same GPU with separate initial simulator states. Alternate A/B order across tasks. H0 is the Jev-capable starting point for B. The paired comparison estimates the effect of the evolved system as a whole.
 
-两臂的正式单题预算均为 40 次逻辑模型调用、总生成输出 8,192 token、每次开放生成 1,024 token、300 次公开 API 请求和 900 秒。开放生成使用同一个 27B 底模，采用贪心解码并开启思考，单次思考预算 256。在线输出成本包含开放生成的全部 token、低置信判断实际生成的思考 token，以及已记录的失败重试输出。决策头和推理后读取候选分数所用的 token 单独记在 `decision_readout_tokens`。决策服务的底层请求数、输入量和耗时也逐题记录。
+Both arms allow 40 logical model calls, 8,192 total generated tokens, 1,024 tokens per open-generation call, 300 public API requests and 900 seconds per task. Open generation uses greedy decoding on the same backbone, with thinking enabled and a 256-token thinking budget. Online output includes all open-generation tokens, actual low-confidence reasoning tokens, and recorded output from failed retries. Native decision readouts, including post-reasoning scores, are tracked under `decision_readout_tokens`. Per-task records also include backend request counts, input tokens and timing.
 
-主结果报告逐题完成率 TGC、三题全部成功的场景比例 SGC、每题平均及总在线输出 token、由错变对和由对变错的题。按场景做配对 bootstrap（10,000 次）计算差值的 95% 区间。另列原生判断次数、交接命中次数及覆盖场景、输入 token、模型耗时、片段和 G 并用的题数、完全以片段完成的题，以及离线 Sol 和局部判断成本。准确率与开销分别展示，便于辨认成功率提升是否伴随更多生成。
+The report gives task goal completion (TGC), the proportion of scenarios with all three variants solved (SGC), mean and total online output tokens, and tasks that changed from failure to success or vice versa. A paired bootstrap resamples scenarios 10,000 times to give 95% intervals for differences. Other recorded measures include native judgments, handoff selections and their scenario coverage, input tokens, model time, tasks using both fragments and generation, tasks completed entirely with fragments, and offline Sol and local judgment usage.
 
-## 6. 一个 Train 例子
+## Worked Train scenario
 
-第 4 批 `22cc237_1` 中，用户垫付了晚餐，把每人的份额记在 Simple Note，部分人已在 Venmo 偿还，现在要向剩余的人发付款请求。H0 有“列笔记”片段，起点没有提供“读出指定笔记正文”的专用片段，也没有收款指导。在正式 Train 中，若 Sol 观察到生成代码重复执行“按题意找笔记、读正文”，可以先把这一步封装成片段。下游接收的 `selected_note` 必须是实际读到的结果。
+In Batch 4, task `22cc237_1` asks the agent to request outstanding dinner payments. The user recorded each person's share in Simple Note, and some people have already repaid the user in Venmo. H0 can list notes. Reading one selected note's body and reconciling payments are possible targets for later patches.
 
-程序下一次组装菜单时，Jev 可以从读取到的笔记中选出当前对象。若后面的计算和操作尚未覆盖，生成模式接收这次真正读取的内容、已绑定的对象和 Jev 选择的交接指导。整题完成后，AppWorld 根据独立模拟器的最终状态判分。Sol 可以在下一轮查看这次分叉、候选、生成输入和执行结果，决定应该改片段、状态、决策或交接中的哪几个对象。这里描述的是任务如何进入实验流程，实际分数由本次运行产生。
-
-运行命令与输出目录见[仓库首页](../README.md)。
+Suppose Sol sees several traces generate the same search and note-read code. It could propose a fragment that lets Jev select among the retrieved notes and places the actual body in `selected_note`. If the remaining calculations or payment requests need generation, the generator receives that live result, its bound object and the guidance Jev chose. AppWorld then scores the final simulator state. A subsequent editing round can inspect the first changed step, its candidates, the input the generator received, and the resulting actions. This example illustrates the design. The README also includes a measured Train case with two recorded paths. [Spotify trace comparison](spotify-example.json) · [Run commands and outputs](reproduce.md)
