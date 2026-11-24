@@ -75,6 +75,8 @@ def main(argv=None):
             allocation.add_argument("--gpus", help="Use fixed devices, e.g. local:0,local:1")
             allocation.add_argument("--max-gpus", type=int, choices=range(1, 5), default=4)
             sub.add_argument("--gpu-name", default="A800", help="GPU name substring for automatic allocation")
+            sub.add_argument("--paired-selection-from-batch", type=int, choices=range(1, 11),
+                             help="First Train batch and Dev selection to use conditional paired confirmation")
     args = parser.parse_args(argv)
     settings = read(RESOURCES / "experiment.json")
     manifest = design_manifest()
@@ -97,6 +99,12 @@ def main(argv=None):
     model_args = first_node["args"]
     settings["model_path"] = model_args[model_args.index("--model") + 1]
     root = args.root.resolve()
+    if args.command == "run":
+        first_review = args.paired_selection_from_batch
+        if first_review is None and (root / "configuration.json").is_file():
+            first_review = read(root / "configuration.json").get("paired_selection_from_batch")
+        if first_review is not None:
+            settings["paired_selection_from_batch"] = first_review
     initialize(root, settings)
     study = SharedStudy(root, settings, connections, devices=devices, max_gpus=getattr(args, "max_gpus", 1),
                         gpu_name=getattr(args, "gpu_name", "A800"))

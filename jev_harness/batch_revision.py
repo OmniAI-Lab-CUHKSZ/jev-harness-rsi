@@ -248,6 +248,8 @@ class BatchRevisionWorkbench(TrainEvidence):
                 detail = row["last_measured_round"]
                 self.docs["changes/"+row["task"]] = [serialized(detail)]
                 row["last_measured_round"] = {k:detail[k] for k in ("success_before_after","total_generated_tokens_before_after")}
+                if "confirmation" in detail:
+                    row["last_measured_round"]["confirmation_parent_candidate"] = detail["confirmation"]
         surfaces = {kind:{"controls":meaning,"check":check,"read":[d for d in docs if d in self.docs]}
                     for kind,(meaning,check,docs) in EDIT_SURFACES.items()}
         patterns = batch_patterns(tasks,self.incidents)

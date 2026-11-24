@@ -61,6 +61,8 @@ class TrainEvidence:
         self.docs["api_names"] = [f["name"] for f in fs]
         self.docs.update({"api/"+f["name"]:[serialized(f)] for f in fs})
         previous = sorted({p for rev in history for p in rev.get("train_traces",[])+rev.get("parent_traces",[])})
+        previous.extend(r["trace_path"] for rev in history
+                        for pair in rev.get("paired_selection", {}).get("repeats", {}).values() for r in pair)
         for p in previous:
             path = study.root/p
             self.paths[path.parts[-4]+"/"+path.parts[-3]] = path
@@ -169,6 +171,10 @@ class TrainEvidence:
                     "total_generated_tokens_before_after": [left["output_tokens"], right["output_tokens"]],
                     "parent_trace": before.parts[-4] + "/" + task, "candidate_trace": after.parts[-4] + "/" + task,
                     "prefix_changes": prefix_changes(prefix_view(read_events(before)), prefix_view(read_events(after)))}
+                pair = revision.get("paired_selection", {}).get("repeats", {}).get(task)
+                if pair:
+                    item["last_measured_round"]["confirmation"] = [
+                        {k:row[k] for k in ("success","output_tokens","trace_path")} for row in pair]
             break
 
     def paired_paths(self, traces):

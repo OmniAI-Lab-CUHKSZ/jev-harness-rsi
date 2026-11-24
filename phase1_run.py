@@ -4,6 +4,7 @@ from pathlib import Path
 from formal_run import Study, final_report, quality, read, save
 from jev_harness.formal_v2 import gain
 from jev_harness.metrics import aggregate
+from jev_harness.paired_selection import select_with_review
 from jev_harness.semantic_assembly import SemanticAssembly
 from jev_harness.semantic_library import PROTOCOL
 
@@ -153,36 +154,49 @@ def summary(rows):
 
 
 def paired_holdout(study, ids, version, library):
-    """An arm pair shares a worker, not simulator state. Alternate order across the panel."""
     stages = {"A": "test_generation", "B": "test_" + version}
+    return paired_rollouts(study, ids, stages, {"A":"A", "B":"B"}, {"A":None, "B":library})
+
+
+def paired_rollouts(study, ids, stages, variants, libraries):
+    """Alternate arm order and run each task twice on one GPU in freshly prepared worlds."""
     cached = {}
     if hasattr(study, "root"):
+        runs = study.root / "runs"
         for task in ids:
-            cached[task] = {}
+            cached[task] = {"A": {}, "B": {}}
             for arm, stage in stages.items():
-                path = study.root / "runs" / stage / task / "record.json"
-                if path.is_file():
-                    cached[task][arm] = read(path).get("gpu")
+                for folder in [runs / stage, *sorted(runs.glob(stage + "_paired_*"))]:
+                    record = folder / task / "record.json"
+                    if record.is_file():
+                        cached[task][arm][read(record).get("gpu")] = folder.name
 
     def pair(job, worker):
         i,task=job
         out={}
-        previous = cached.get(task, {})
-        complete_pair = len(previous) == 2 and previous["A"] == previous["B"]
+        previous = cached.get(task, {"A": {}, "B": {}})
         device = getattr(worker, "gpu", None)
+        completed = next((gpu for gpu in previous["A"] if gpu in previous["B"]), None)
         for arm in (("A","B") if i%2==0 else ("B","A")):
-            stage = stages[arm]
-            if device and arm in previous and previous[arm] != device and not complete_pair:
+            stage = previous[arm].get(completed or device, stages[arm])
+            if device and not completed and device not in previous[arm] and stages[arm] in previous[arm].values():
                 stage += "_paired_" + device.replace(":", "_")
-            out[arm]=study.run_task(task,stage,arm,None if arm=="A" else library,workers=worker)
+            out[arm]=study.run_task(task,stage,variants[arm],libraries[arm],workers=worker)
         return out["A"],out["B"]
     jobs = list(enumerate(ids))
     if hasattr(study, "execute_preferred"):
-        preferred = [next(iter(cached.get(task, {}).values()), None) for task in ids]
+        preferred = [next((gpu for arm in cached.get(task, {}).values() for gpu in arm), None) for task in ids]
         pairs = study.execute_preferred(jobs, pair, preferred if any(preferred) else None)
     else:
         pairs = study.execute_jobs(jobs, pair)
     return [a for a,b in pairs],[b for a,b in pairs]
+
+
+def review_versions(study, stage, path, parents, candidates, parent_lib, candidate_lib):
+    def rerun(tasks):
+        stages = {"A": stage+"_review_parent", "B": stage+"_review_candidate"}
+        return paired_rollouts(study, tasks, stages, {"A":"B","B":"B"}, {"A":parent_lib,"B":candidate_lib})
+    return select_with_review(study, stage, path, parents, candidates, rerun)
 
 
 def initial_harness(settings):
@@ -280,6 +294,8 @@ def run(study, count, rounds, formal, *, revisit_after_six=(), evaluate_test=Tru
         sources.update(ids)
         if position < len(completed):
             continue
+        review_from = study.settings.get("paired_selection_from_batch")
+        review_enabled = review_from is not None and batch >= review_from
         if hasattr(study, "begin_inference_phase"):
             study.begin_inference_phase("train", batch)
         entry_ver, entry_lib = version, lib
@@ -330,11 +346,18 @@ def run(study, count, rounds, formal, *, revisit_after_six=(), evaluate_test=Tru
             keep_tie = comparison["tied"] and (optimizer.get("batch_revision") is True or optimizer.get("fragment_trials") is True
                                                or bool(revisit_after_six) and position >= 6)
             accepted = quality(candidate_rows) > quality(parent_rows) or keep_tie
+            train_review = None
+            if review_enabled:
+                train_review = review_versions(study, candidate_version, folder/"paired_selection.json",
+                                              parent_rows, candidate_rows, lib, candidate)
+                accepted = train_review["accepted"]
             record = {"batch":batch, "visit":label, "round":rnd, "parent":prior_ver, "candidate":candidate_version,
                       "edits":edits, "prediction":proposal.get("prediction"), "diagnosis":proposal.get("reason"),
                       "accepted":accepted, "comparison":comparison,
                       "parent_metrics":summary(parent_rows), "candidate_metrics":summary(candidate_rows),
                       "train_traces":[r["trace_path"] for r in candidate_rows],"parent_traces":[r["trace_path"] for r in parent_rows]}
+            if train_review is not None:
+                record["paired_selection"] = train_review
             for key in ("diagnosis","initial_diagnosis"):
                 if isinstance(proposal.get(key),dict):
                     record["component_choice" if key=="diagnosis" else "initial_component_choice"] = proposal[key]
@@ -352,7 +375,9 @@ def run(study, count, rounds, formal, *, revisit_after_six=(), evaluate_test=Tru
             if accepted:
                 version, lib, rows = candidate_version, candidate, candidate_rows
             study.status("revision_scored", batch=batch, visit=label, round=rnd, accepted=accepted, version=version,
-                         successes=summary(rows)["successes"], tokens=summary(rows)["total_output_tokens"])
+                         successes=summary(rows)["successes"], tokens=summary(rows)["total_output_tokens"],
+                         **({"selection_score": train_review["candidate_score" if accepted else "parent_score"],
+                             "review_rollouts": train_review["repeat_rollouts"]} if train_review else {}))
         train_version = version
         dev_choice=None
         if formal and version != entry_ver:
@@ -360,9 +385,16 @@ def run(study, count, rounds, formal, *, revisit_after_six=(), evaluate_test=Tru
                 reference_dev = reference_dev()
             ev = score_dev(version, lib)
             reference_score, evaluated_score = quality(reference_dev), quality(ev)
+            dev_review = None
+            if review_enabled:
+                dev_review = review_versions(study, "dev_"+version, root/"batches"/label/"dev_paired_selection.json",
+                                            reference_dev, ev, entry_lib, lib)
+                reference_score, evaluated_score = dev_review["parent_score"], dev_review["candidate_score"]
             carry=evaluated_score >= reference_score
             dev_choice={"compared_to":entry_ver,"candidate":version,"reference":reference_score,
                         "evaluated":evaluated_score,"carry":carry,"tied":evaluated_score == reference_score}
+            if dev_review is not None:
+                dev_choice["paired_selection"] = dev_review
             if study.settings.get("inference_schedule"):
                 dev_choice["reference_lanes_per_gpu"] = sorted({r.get("lanes_per_gpu", 1) for r in reference_dev})
                 dev_choice["candidate_lanes_per_gpu"] = sorted({r.get("lanes_per_gpu", 1) for r in ev})
@@ -392,6 +424,14 @@ def run(study, count, rounds, formal, *, revisit_after_six=(), evaluate_test=Tru
                         ("Jev-assembled menus and six-component harness" if semantic else
                          "fragment-card harness" if is_cards else "staged harness")}
         report.update(offline_optimizer_costs(root,historical=bool(optimizer.get("history_preview"))))
+        selections = [r["paired_selection"] for r in history if "paired_selection" in r]
+        for checkpoint in checkpoints:
+            decision = checkpoint.get("dev_selection") or {}
+            if "paired_selection" in decision:
+                selections.append(decision["paired_selection"])
+        if selections:
+            report["selection_confirmations"] = {k:sum(r[k] for r in selections)
+                                                 for k in ("repeat_rollouts", "repeat_output_tokens")}
         report["paired_tasks"]=[{"task":x["task_id"],"A":{k:x.get(k) for k in ("success","output_tokens","gpu","trace_path")},
                                  "B":{k:y.get(k) for k in ("success","output_tokens","gpu","trace_path")}} for x,y in zip(a,b)]
         save(root/"test_report.json",report)
