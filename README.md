@@ -16,7 +16,7 @@ An AppWorld agent may write the same few lines of Python every time it reads a p
 
 ## A Spotify task
 
-*What is the title of the most-liked song in my Spotify playlists?* Both runs below found the songs and sorted them correctly. The difference came when the agent had to turn that ranking into a single title.
+*What is the title of the most-liked song in my Spotify playlists?* In an earlier Train run, both harness versions found the songs and sorted them correctly. The difference came when the agent had to turn that ranking into a single title.
 
 | Harness | Actions after sorting | Jev calls | Generated tokens | AppWorld outcome |
 |---|---|---:|---:|---|
@@ -53,7 +53,7 @@ Open `runs/spotify/smoke_result.json` for the score and token count. Its `trace_
 
 ## What Sol can change
 
-Sol can open full Train traces, see the menu Jev actually received and inspect the AppWorld result. It can try an edit on a recorded state, check where other tasks in the same batch diverge, and preview its effect on earlier Train states. A patch edits up to **three named objects** across six parts of the harness.
+Sol reads the nine Train traces and picks a specific event that could explain a failed task or costly generation. It compares two explanations at that same event. It can retrieve earlier Train tasks that performed the same operation and inspect how their results were used. Sol then edits up to **three named objects** across six parts of the harness.
 
 | Component | What an edit can change |
 |---|---|
@@ -64,6 +64,8 @@ Sol can open full Train traces, see the menu Jev actually received and inspect t
 | Decision | The question, guidance or ordering Jev uses to choose a menu, action or parameter |
 | Generation handoff | Which guidance Jev can select for the generator and which public reads can return to the fragment loop |
 
+The program replays the proposed edit on recorded Train paths. Sol sees the first changed request and can try the edit on the focal case and a previously solved case exposed to it. After the preview it can submit the draft, revise it once, or keep the parent. The draft and revision share a budget of 12 fresh judgments, three generations and 4,096 offline 27B output tokens. Whole-task scores come from running the candidate in AppWorld. [Optimizer and prompts](jev_harness/batch_revision.py) · [Preview implementation](jev_harness/batch_revision_trials.py)
+
 ## Evaluation
 
 | Split | Scenarios / tasks | How it is used |
@@ -72,7 +74,7 @@ Sol can open full Train traces, see the menu Jev actually received and inspect t
 | Dev | 19 / 57 | Select the harness carried into the next batch. H0 is measured once and the retained parent's scores are reused. |
 | Test-N | 30 / 90 | On a subset of AppWorld Test-Normal, compare the generation-only 27B agent with the same 27B using the final harness, paired by task and GPU. |
 
-All three variants of a scenario stay in one split. Train and Dev select first by tasks solved, then by fewer generated tokens. An exact tie keeps the candidate.
+All three variants of a scenario stay in one split. Train and Dev select first by tasks solved, then by fewer online output tokens. An exact tie keeps the candidate. Starting with H0, each GPU runs one model replica serving two independent AppWorld sessions. Four GPUs provide eight task slots.
 
 Both Test-N arms get 40 model calls and 8,192 generated tokens per task. The runner reports task success, the share of scenarios with all three tasks solved, and online output tokens. These include open generation, low-confidence reasoning and recorded retries. Decision readouts and offline Sol usage are reported separately. [Experiment design](docs/experiment.md) · [Exact configuration](jev_harness/resources/experiment.json)
 

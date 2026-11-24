@@ -4,10 +4,11 @@ import json
 import re
 
 from .card_library import ports
-from .expressions import build_candidates, resolve
+from .expressions import parameter_groups, resolve
 from .formal_runtime import FormalExecutor
 from .fragment_assembly import FIELDS, FragmentAssembly, option, put_ids
-from .runtime import Uncovered, is_open_generation
+from .runtime import Uncovered, abstained, is_open_generation
+from .scoped_menu import card_label, consumer_tips, is_scoped
 
 
 APP_WORDS = {"spotify":r"spotify|songs?|albums?|playlists?|music",
@@ -37,7 +38,7 @@ def reachable_cards(cards, apps):
 
 class CardAssembly(FragmentAssembly):
     def choose(self, name, choices, **facts):
-        if self.active_card:
+        if self.active_card and not (is_scoped(self.registry) and name == "card_parameter"):
             facts["operation_guidance"] = self.registry["cards"][self.active_card]["skill"]
         return super().choose(name, choices, **facts)
 
@@ -85,6 +86,8 @@ class CardAssembly(FragmentAssembly):
                 "applied_conditions":dict(self.criteria), "completed":list(self.completed_cards)}
 
     def card_option(self, name, card):
+        if is_scoped(self.registry):
+            return card_label(name, card)
         _, inputs, out, loads = ports(card)
         actual = [f"{k} ({len(self.public[k])} records)" if isinstance(self.public[k],list) else k for k in inputs]
         label = f"{card['description']} Inputs: {', '.join(actual) or 'request and account'}. "
@@ -151,9 +154,16 @@ class CardAssembly(FragmentAssembly):
         ctx = {"state":self.public, "task":{"instruction":self.request,"datetime":self.context["task"].get("datetime")},
                "params":{}}
         for key, slot in card.get("parameters",{}).items():
-            choices = build_candidates(slot["candidates"],ctx)
-            # Same paging, NONE and native-head behavior as builtin parameter questions.
-            ctx["params"][key] = self.choose_inline(slot["question"],choices,card["skill"]+" "+slot.get("skill",""),ctx["params"])
+            groups = parameter_groups(slot,ctx)
+            skill = card["skill"]+" "+slot.get("skill","")
+            for position, choices in enumerate(groups):
+                try:
+                    ctx["params"][key] = self.choose_inline(slot["question"],choices,skill,ctx["params"])
+                    break
+                except Uncovered as exc:
+                    if position+1 == len(groups) or not abstained(exc):
+                        raise
+                    self.trace.add("parameter_widen",card=self.active_card,slot=key,remaining=len(groups[position+1]))
         return ctx
 
     def declared_operation(self, name, card):
@@ -161,7 +171,12 @@ class CardAssembly(FragmentAssembly):
         if "compute" in card:
             return resolve(card["compute"],ctx)
         def run_one(local):
-            return self.call_endpoint(card["api"],resolve(card.get("arguments",{}),local),card.get("paginate",False))
+            arguments = resolve(card.get("arguments",{}),local)
+            result = self.call_endpoint(card["api"],arguments,card.get("paginate",False))
+            if (is_scoped(self.registry) and "each" not in card and
+                    card["api"].split("__",1)[1].startswith(("show_","search_","list_","get_"))):
+                self.active_read_scope = {"api":card["api"],"arguments":arguments}
+            return result
         if "each" not in card:
             return run_one(ctx)
         values = []
@@ -176,6 +191,8 @@ class CardAssembly(FragmentAssembly):
         key = "card_parameter"
         # Per-task prompt view; the installed shared library may be in use by other workers.
         original = self.registry
+        if shared_skill := original["skills"].get(key):
+            skill = skill + " " + shared_skill
         self.registry = {**original,"questions":{**original["questions"],key:question},
                          "skills":{**original["skills"],key:skill}}
         try:
@@ -288,15 +305,28 @@ class CardAssembly(FragmentAssembly):
     def handoff(self, reason):
         self.trace.add("fragment_handoff",reason=reason,available=list(self.public))
         current = {**self.public, **({"executed_items":self.receipts} if self.receipts else {})}
-        if current:
-            self.prime_generated_session(current)
         relevant = list(dict.fromkeys(self.completed_cards + ([self.failed_card] if self.failed_card else [])))
-        guidance = [self.registry["cards"][name]["handoff_skill"] for name in relevant
-                    if self.registry["cards"][name].get("handoff_skill")]
+        usage_role = None
+        if is_scoped(self.registry):
+            tips = consumer_tips(self.registry, self.public, self.provenance)
+            guidance = list(tips.values())[-1:]
+            if len(tips) > 1:
+                usage_role = "fragment_usage_by_role"
+                while usage_role in current:
+                    usage_role += "_notes"
+                current[usage_role] = tips
+            if current:
+                self.prime_generated_session(current)
+        else:
+            if current:
+                self.prime_generated_session(current)
+            guidance = [self.registry["cards"][name]["handoff_skill"] for name in relevant
+                        if self.registry["cards"][name].get("handoff_skill")]
         reads = self.read_offers()
         read_choices = list(reads.values()) if len(reads)==len(set(reads.values())) else reads
         return {"variables":list(current),"completed":list(self.completed_cards),"scope":self.public.get("scope"),
                 "unresolved":reason,"available_public_reads":read_choices,
+                **({"usage_lookup":usage_role} if usage_role else {}),
                 **({"fragment_guidance":guidance} if guidance else {}),
                 **({"read_scopes":self.read_scopes} if self.read_scopes else {})}
 
@@ -313,7 +343,10 @@ class CardAssembly(FragmentAssembly):
             self.delegate_read(endpoint,args)
             self.assemble_available()
         except (Uncovered,KeyError,ValueError,TypeError,IndexError,SyntaxError) as exc:
-            self.residual_progress.update(self.handoff(str(exc)))
+            refreshed = self.handoff(str(exc))
+            if is_scoped(self.registry):
+                self.residual_progress.clear()
+            self.residual_progress.update(refreshed)
             self.context["history"].append({"returned_read":str(exc)})
         return {"done":self.done,"output":"Public read processed","api_budget_hit":False}
 

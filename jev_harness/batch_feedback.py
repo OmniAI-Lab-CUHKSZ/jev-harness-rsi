@@ -135,33 +135,7 @@ choose between them. All six are alternatives, with no quota by component."""
                 self.previous_trial = (result["comparison_objects"], report)
                 self.register_prefix_traces(report)
                 break
-        # A revisit has the same task IDs as its first visit, whose results remain in history.
-        current_visit = folder.parent.parent.name
-        for revision in reversed(history):
-            if "batch" in revision:
-                visit = revision.get("visit", f"b{revision['batch']:02d}")
-                if visit != current_visit:
-                    continue
-            candidates = self.paired_paths(revision.get("train_traces", []))
-            parents = self.paired_paths(revision.get("parent_traces", []))
-            if not self.tasks or candidates.keys() != self.tasks or parents.keys() != self.tasks:
-                continue
-            for item in self.index:
-                task = item["task"]
-                before, after = parents[task], candidates[task]
-                left, right = (json.loads(p.parents[1].joinpath("record.json").read_text(encoding="utf-8"))
-                               for p in (before, after))
-                item["last_measured_round"] = {
-                    "parent": revision["parent"], "candidate": revision["candidate"], "accepted": revision["accepted"],
-                    "success_before_after": [left["success"], right["success"]],
-                    "total_generated_tokens_before_after": [left["output_tokens"], right["output_tokens"]],
-                    "parent_trace": before.parts[-4] + "/" + task, "candidate_trace": after.parts[-4] + "/" + task,
-                    "prefix_changes": prefix_changes(prefix_view(read_events(before)), prefix_view(read_events(after)))}
-            break
-
-    def paired_paths(self, traces):
-        paths = [self.study.root / Path(t.replace("\\", "/")) for t in traces]
-        return {p.parents[1].name: p for p in paths}
+        self.add_last_round(folder,history)
 
     def register_prefix_traces(self, report):
         for row in report:

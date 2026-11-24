@@ -32,6 +32,10 @@ class NativeNone(Uncovered):
         self.response = response
 
 
+def abstained(exc):
+    return "uncovered option" in str(exc) or str(exc).startswith(("No grounded choice","No grounded options"))
+
+
 def parse_json(text):
     text = text.split("</think>")[-1].strip()
     decoder = json.JSONDecoder()

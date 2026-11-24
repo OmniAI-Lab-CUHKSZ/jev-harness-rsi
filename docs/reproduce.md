@@ -57,20 +57,22 @@ jev-appworld smoke --connections configs/connections.local.example.json \
 
 ```bash
 jev-appworld run --connections configs/connections.local.example.json \
-  --root runs/main --gpus local:0,local:1,local:2,local:3
+  --root runs/scoped-main --gpus local:0,local:1,local:2,local:3
 ```
 
-Batch 1 runs one task per GPU, including the H0 and candidate Dev panels. From Batch 2, each GPU serves two independent AppWorld sessions from one BF16 replica with vLLM's `--max-num-seqs 2`. Four GPUs can process up to eight tasks at once. Train candidates return to the parent's GPU when it is available. Independent Sol probes share the same pool. Each Test-N task keeps both arms on one GPU, with a fresh simulator state for each arm.
+Use a new output directory to start from the original scoped H0. Each GPU serves two independent AppWorld sessions from one BF16 replica with vLLM's `--max-num-seqs 2`, starting with the first Train task and continuing through Dev and Test. Four GPUs can process up to eight independent tasks at once. Train candidates return to the parent's GPU when available. Sol uses the same workers for bounded previews. Each Test-N pair uses one worker with fresh simulator states for its two arms.
 
-For one GPU, pass `--gpus local:0`. Resume with the same command and output directory. The runner reuses completed task records, including the retained parent's Dev panel. A Dev comparison across the concurrency switch records the session count for each side in `checkpoints.json`. Generated tokens can vary with concurrent inference even with greedy decoding. Use one controller per output directory.
+For one GPU, pass `--gpus local:0`. Resume with the same command and output directory. The runner reuses completed task records and the retained parent's Dev panel within that run. Existing experiment directories keep their saved configuration. Each Dev comparison records the session count for both sides in `checkpoints.json`. Generated tokens can vary with concurrent inference even with greedy decoding. Use one controller per output directory.
 
 ### Use separate machines
 
 Place the repository on the AppWorld and model machines. Start from the SSH template and set the variables it references in the controller's shell. The Python, repository, model and data paths are paths on the respective worker machine. `SSH_IDENTITY` points to the key on the controller. Add entries under `model_nodes` for additional nodes and set the SSH port for each as needed. The local template resolves `PACKAGE_DIR` from the installed controller package automatically. [Local template](../configs/connections.local.example.json) · [SSH template](../configs/connections.ssh.example.json)
 
+A model worker can take an `env` mapping in its connection entry. For a Python installation with headers outside the usual include path, set `CPATH` there to the worker's Python and system include directories so Triton can compile its kernels.
+
 ```bash
 jev-appworld run --connections configs/connections.ssh.example.json \
-  --root runs/main --max-gpus 4
+  --root runs/scoped-main --max-gpus 4
 ```
 
 Automatic allocation checks at most once per minute while capacity remains. It selects A800 devices with at least 58,000 MiB free and utilization of 30% or less. Use `--gpu-name` for a different device name or `--gpus` for explicit devices.
@@ -84,7 +86,8 @@ All paths in this table are relative to the directory given to `--root`. A recor
 | `smoke_result.json` | Single-task success, generated tokens, and path to the trace |
 | `runs/<stage>/<task>/record.json` | Per-task score, token counts, decisions, fragment sequence and trace path |
 | `batches/<batch>/<revision>/proposal.json` and `result.json` | Sol's proposed edits and the scored parent/candidate comparison for the batch |
-| `batches/<batch>/<revision>/sol*/turn_*/` | Prompts Sol received, its responses and token usage |
+| `batches/<batch>/<revision>/sol_scoped/` | The Train index, Sol's `focus`, `review` and optional `final_review` conversations, per-trial path comparisons and measured 27B preview costs |
+| `controller.json`, `gpu_allocation.json` and `workers/` | Active GPUs, task slots, model sequence limits and per-session logs |
 | `versions/` and `checkpoints.json` | Installed harness versions and the version retained after each batch |
 | `test_report.json` and `test_mechanisms.json` | Paired Test-N outcomes and confidence intervals, offline usage and a breakdown of how the evolved harness executed the tasks |
 
@@ -97,7 +100,8 @@ Task traces can contain AppWorld session values. The repository ignores run dire
 | Batch selection, Dev scoring and paired Test-N | [phase1_run.py](../phase1_run.py) · [formal_run.py](../formal_run.py) |
 | Online menus, fragment execution and generation handoff | [semantic_assembly.py](../jev_harness/semantic_assembly.py) · [semantic_handoff.py](../jev_harness/semantic_handoff.py) · [formal_runtime.py](../jev_harness/formal_runtime.py) |
 | Editable objects, fragment definitions and policy programs | [semantic_library.py](../jev_harness/semantic_library.py) · [card_library.py](../jev_harness/card_library.py) · [policy_programs.py](../jev_harness/policy_programs.py) |
-| Sol's prompts, trace access, local trials and history previews | [phase1_optimizer.py](../jev_harness/phase1_optimizer.py) · [semantic_workbench.py](../jev_harness/semantic_workbench.py) · [fragment_trials.py](../jev_harness/fragment_trials.py) · [history_workbench.py](../jev_harness/history_workbench.py) |
+| Sol's prompts, component diagnosis and earlier Train evidence | [batch_revision.py](../jev_harness/batch_revision.py) · [revision_evidence.py](../jev_harness/revision_evidence.py) · [train_precedents.py](../jev_harness/train_precedents.py) |
+| Recorded paths and model previews | [trace_comparison.py](../jev_harness/trace_comparison.py) · [batch_revision_trials.py](../jev_harness/batch_revision_trials.py) · [contrast_probes.py](../jev_harness/contrast_probes.py) |
 | Model worker, AppWorld worker and GPU allocation | [official_model_worker.py](../jev_harness/official_model_worker.py) · [env_worker.py](../jev_harness/env_worker.py) · [allocation.py](../jev_harness/allocation.py) |
 
 [Project overview](../README.md) · [Experiment design](experiment.md)

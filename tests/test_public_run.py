@@ -4,11 +4,13 @@ from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import Mock, patch
 
-from formal_run import read
-from jev_harness.cli import RESOURCES
+from formal_run import read, save
+from jev_harness.allocation import SharedStudy
+from jev_harness.cli import RESOURCES, initialize
 from jev_harness.formal_v2 import include_retries
+from jev_harness.scoped_menu import scoped_library
 from jev_harness.semantic_library import initial_library
-from phase1_run import design_manifest, run
+from phase1_run import design_manifest, initial_harness, run
 
 
 def scored(tasks, stage, successes, cost):
@@ -21,10 +23,33 @@ class PublicRunTests(unittest.TestCase):
     def test_distributed_h0_matches_constructor_and_plan(self):
         config = read(RESOURCES / "experiment.json")
         split = design_manifest()
-        self.assertEqual(read(RESOURCES / "h00.json"), initial_library(semantic_handoffs=True))
+        self.assertEqual(initial_harness(config), scoped_library(initial_library(semantic_handoffs=True)))
+        self.assertEqual(read(RESOURCES / "h00.json"), initial_harness(config))
+        self.assertTrue(config["optimizer"]["batch_revision"])
+        with TemporaryDirectory() as directory:
+            study = SharedStudy(directory, config, {})
+            for phase, batch in (("train", 1), ("dev", 1), ("train", 2), ("dev", 10), ("test", None)):
+                self.assertEqual(study.width_for(phase, batch), 2)
         self.assertEqual(config["batches"], [batch["scenarios"] for batch in split["train_batches"]])
         self.assertEqual(config["execution"]["step_review_mode"], "official_adaptive")
         self.assertEqual(config["execution"]["step_review_thinking_budget"], 256)
+
+    def test_resume_preserves_older_public_optimizer_and_batch_one_width(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            old = read(RESOURCES / "experiment.json")
+            old.pop("menu_format")
+            old["optimizer"].pop("batch_revision")
+            old["optimizer"].update(history_preview=True, fragment_trials=True, same_batch_feedback_from=1)
+            old["inference_schedule"]["first_batch"] = 1
+            for configured_width in (True, False):
+                if not configured_width:
+                    old.pop("inference_schedule")
+                save(root / "configuration.json", old)
+                current = read(RESOURCES / "experiment.json")
+                initialize(root, current)
+                self.assertEqual(current, old)
+                self.assertEqual(initial_harness(current), initial_library(semantic_handoffs=True))
 
     def test_dev_tie_carries_candidate_and_parent_score_is_reused_across_batches(self):
         with TemporaryDirectory() as folder:

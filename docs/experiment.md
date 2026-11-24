@@ -1,6 +1,6 @@
 # AppWorld experiment design
 
-**Phase 1 protocol, November 23, 2026.** Starting from H0, a fixed 27B agent runs the first nine Train tasks. GPT-6.2 Sol studies the execution traces and edits the harness shared by all tasks. Semantic handoffs, feedback from the rest of the current batch, and previews on earlier Train states are available from the first round. The controller writes records under the directory given to `--root`. [Run configuration](../jev_harness/resources/experiment.json) · [Reproduction guide](reproduce.md)
+**Phase 1 protocol, November 24, 2026.** Starting from H0, a fixed 27B agent runs the first nine Train tasks. GPT-6.2 Sol studies the execution traces and edits the harness shared by all tasks. Semantic handoffs, feedback from the rest of the current batch, and previews on earlier Train states are available from the first round. The controller writes records under the directory given to `--root`. [Run configuration](../jev_harness/resources/experiment.json) · [Reproduction guide](reproduce.md)
 
 ## Research question
 
@@ -19,7 +19,7 @@ The model is `autotrust/AutoTrust-Decider-Pro-27B`, served in BF16. Its released
 | Decision and state | Shared questions and guidance cover menu selection, next steps and parameter choices. Per-task state contains actual results, their sources, selected parameters and effects already executed. H0 starts with zero custom state views. |
 | Execution and handoff | Generic API execution, initial Phone login fields, default generation guidance, and an editable Jev handoff question and selection skill. H0 starts with zero task-specific handoff guides. |
 
-The initial fragments and parameter guidance come from earlier Train work. The split manifest identifies the 30 historical source tasks. [Full H0](../jev_harness/resources/h00.json) · [Task manifest](../jev_harness/resources/task_split.json)
+Scoped menus show the short purpose, applicability, inputs and output of an eligible fragment. Parameter guidance appears during binding. Handoff guidance follows the fragment that produced a value still present in the session. The initial fragments and parameter guidance come from earlier Train work. The split manifest identifies the 30 historical source tasks. [Full H0](../jev_harness/resources/h00.json) · [Task manifest](../jev_harness/resources/task_split.json)
 
 ### One task, step by step
 
@@ -46,27 +46,15 @@ One patch changes **one to three named objects**. Editing a shared handoff quest
 | Decision (`decision`) | Menu, step and parameter questions and skills, candidate ordering at supported nodes, and the handoff question and selection skill | Jev confuses “collect the money” with “tell me how much is owed” after reading the same note. |
 | Generation handoff (`handoff`) | Required live data, semantic labels, ordinary alternatives, specialist and default guidance, tool hints and public-read reentry rules | Wording that requests immediate playback should select a playback guide. A recommendation request should receive ordinary guidance. |
 
-An earlier handoff implementation evaluated Sol-authored `requires` and `when` conditions. The current executor also supplies a native Jev call at handoff. The question, options and skill are editable. Call scheduling, accounting, evaluation and the public tool calls themselves belong to the host. Sol can read the host source and include a `capability_gap` in a proposal identifying the trace and the missing host capability.
+The workbench supplies the source of each editable component and shows which component supplied the arguments, candidates, guidance or visible state at a recorded event. For example, a login issued by generated Python and one issued by a compiled fragment take different paths. A compiled-adapter edit can affect the latter.
 
 ## How Sol revises a batch
 
-**Collect the traces.** The incoming harness runs all nine Train tasks. Sol receives per-task success, online token counts, failure locations, executed fragments, the first open-generation step and a searchable trace index. It can open the full instruction, Jev's menu, the adaptive call's actual reasoning usage, initial and post-reasoning probabilities, the fused result and final selection. It can inspect public API calls and returns, generated code, errors, handoffs and the generator's next actual input. Events support text search and paginated reads.
-
-**Locate a change.** The workbench identifies repeated API calls and data operations in the batch's generated code, with source tasks, line numbers and variables. Sol uses that evidence to localize the issue to assembly, selection, execution or handoff and proposes an installable patch with a predicted effect. The current batch supplies the optimization target. Sol may open earlier Train traces from the same experiment. Dev and Test-N are reserved for selection and evaluation outside the optimizer.
-
-**Try the patch.** The workbench can return three kinds of evidence.
-
-| Evidence | What runs | What Sol can learn |
-|---|---|---|
-| Natural execution on the current batch | Run each task under the candidate until completion or first open generation, and compare with the parent trace. A focus task can continue to a later event with a limited number of generation calls. | Was the new fragment selected in a normal run? Where did the paths first diverge? Did the generator's input or another task change? |
-| Local fragment execution | Try a relevant fragment at a recorded public state in the batch. Inspect bound arguments, returned values and downstream use. | Does the fragment compute the intended result when selected? Natural execution separately measures whether Jev chooses it. |
-| Historical Train preview | At the same old state, compare parent and candidate menus, ordering, availability of old bindings, handoff options and visible guidance. Each location has an inspectable record. | Which earlier tasks and steps might change? Missing inputs are marked unknown. An API appearing in old generated code identifies a possible reuse opportunity. The preview measures state-level effects. |
-
-For a specialist guide or handoff judgment, Sol may specify up to six wording checks in a patch. When possible, the workbench selects a state from this batch and one from earlier Train data, preferring actual guide hits. If comparison prompts are missing, offline Sol drafts a paraphrase and a closely matched request with a different intended effect. The latter keeps the objects, data and context as similar as possible.
-
-The same 27B makes native decisions under both harnesses at the same recorded state. The workbench also tests removing one required input. It logs the choices, leading option scores and token counts. If the original used the ordinary handoff and there is no reference for the specialist guide, the paraphrase check is marked inconclusive. AppWorld's end-to-end score determines task success.
-
-**Score one candidate.** Each editing round allows up to 12 interactions. A proposal submitted before the last turn can be revised or confirmed after the preview. A proposal submitted on the last turn is still previewed, and its feedback is recorded for later rounds. Only the final candidate is scored on the full nine tasks. Offline Sol usage, fragment trials and wording checks are accounted for separately from online task execution.
+1. **Locate one costly or failed step.** The incoming harness runs all nine tasks. Sol receives their whole-task outcomes, costs, repeated operations, component usage and earlier measured changes. It can open complete public Train events, including the task, Jev candidates and probabilities, generated code, actual tool calls and observations. Sol identifies a task, event and downstream effect, then compares two explanations for that same fault.
+2. **Find relevant earlier Train evidence.** A lookup for a current event retrieves up to three distinct scenarios from earlier Train traces in this run. Sol can inspect the exact event and its consumers, see whether the task was solved, and record which part of the operation transfers. The history includes entry traces from earlier batches that produced no patch. When the archive is empty or the earlier operation has the wrong scope, Sol can repair the current issue directly. The editor receives Train evidence only.
+3. **Draft a patch.** Sol chooses up to three named objects from the six components and predicts the change for each of the nine tasks. The program installs the edits together, reconstructs parent and candidate requests on current and earlier Train paths, and reports the first difference or the point where a path stops being comparable. Each individual edit is also checked at the focal state. A historical citation is replayed against its cited version even if a newer recording of the task exists.
+4. **Test the change locally.** The workbench runs bounded 27B previews on the focal case and a preservation case. It prioritizes a previously solved task whose request changes and which used an edited component. When the draft is revised, the comparison stays on the same cases. Matching recorded requests can reuse their responses. The draft and revision together may spend up to **12 fresh judgments, three open generations and 4,096 offline 27B output tokens**. Optional wording checks regenerate the candidate arguments at a recorded state. They measure eligibility and ordering. Actual task success is measured in AppWorld.
+5. **Submit or retain.** After inspecting the preview Sol can submit the draft, revise once and inspect the second preview, or retain the parent. A submitted version is scored on the nine complete tasks. The next round can use the per-task flips and costs. Retaining the parent during review ends that batch's editing. The drafting, review and optional final-review conversations allow up to ten replies each, with the last reserved for a decision. [Prompts and dialogue](../jev_harness/batch_revision.py) · [Recorded path comparisons](../jev_harness/trace_comparison.py) · [Local previews](../jev_harness/batch_revision_trials.py)
 
 ## Task splits, selection and held-out evaluation
 
@@ -89,7 +77,7 @@ Both arms allow 40 logical model calls, 8,192 total generated tokens, 1,024 toke
 
 The report gives task goal completion (TGC), the proportion of scenarios with all three variants solved (SGC), mean and total online output tokens, and tasks that changed from failure to success or vice versa. A paired bootstrap resamples scenarios 10,000 times to give 95% intervals for differences. Other recorded measures include native judgments, handoff selections and their scenario coverage, input tokens, model time, tasks using both fragments and generation, tasks completed entirely with fragments, and offline Sol and local judgment usage.
 
-Batch 1 uses one active task per GPU for Train and for both Dev panels. Batch 2 switches Train, independent Sol trials and Dev to two task sessions per GPU. Test-N uses the same two-session setting across different task pairs. A change in concurrent inference can change the generated code and token count. The runner reuses the retained parent's Dev score and records the parent and candidate session counts alongside their comparison.
+From H0 onward, every GPU runs one BF16 model replica with two inference slots. Each slot has an independent AppWorld session. Train, both sides of Dev selection and both Test-N arms share this concurrency setting. The runner reuses the retained parent's Dev records within this run. Paired Test arms run in sequence on the same GPU and session slot, resetting AppWorld between arms. The number of concurrent tasks can fall below capacity at a batch boundary or during a dependent optimizer preview.
 
 ## Worked Train scenario
 

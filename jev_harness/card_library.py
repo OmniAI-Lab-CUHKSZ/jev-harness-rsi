@@ -46,15 +46,18 @@ def validate_card(name, card, functions):
         raise ValueError(f"{name} needs a description and a decision skill")
     if not isinstance(card.get("handoff_skill",""),str):
         raise ValueError("A fragment handoff skill is text")
+    for key in ("scope", "applies_to"):
+        if key in card and (not isinstance(card[key], str) or not card[key].strip()):
+            raise ValueError(key + " must describe the operation in words")
     modes = [key for key in ("builtin", "api", "compute") if key in card]
     if len(modes) != 1:
         raise ValueError(f"{name} needs one executable operation")
     if modes[0] == "builtin":
-        if name != card["builtin"] or name not in BUILTINS or set(card) - {"builtin","description","skill","handoff_skill"}:
+        if name != card["builtin"] or name not in BUILTINS or set(card) - {"builtin","description","skill","handoff_skill","scope","applies_to"}:
             raise ValueError(f"Unknown builtin or unused properties for {name}")
         return
     allowed = {"app","inputs","output","description","skill","handoff_skill","loads","parameters","compute","api",
-               "arguments","paginate","each","public_read"}
+               "arguments","paginate","each","public_read","scope","applies_to"}
     if set(card) - allowed or not isinstance(card.get("inputs"), list) or not all(
         isinstance(k, str) and k.isidentifier() for k in [*card["inputs"], card.get("output"),card.get("app")]
     ):
@@ -138,7 +141,10 @@ scope and explicitly echoed receipts for writes. public_read:true on a single re
 arguments and the program to consume the real API result. Credentials and pagination are supplied by the program.
 Use output=answer for an answer value or effect_receipt for a completed requested write. Other outputs are
 ordinary intermediate roles. Read cards can supply an unrelated future goal.
-parameters:{name:{question,skill?,candidates}} lets Jev bind a finite choice before execution.
+parameters:{name:{question,skill?,candidates,prefer?}} lets Jev bind a finite choice before execution.
+Keep eligibility (owner, object type, permitted scope) in candidates. For a large eligible set, an optional
+prefer expression over item (the candidate value), label, task and state offers likely matches first. If none
+match the preference or Jev abstains on that group, other eligible records are still available to Jev.
 Optional handoff_skill gives guidance to G when this card has executed or failed in the current task.
 Expressions use {ref:'state.role'}, {ref:'task.instruction'}, {ref:'params.name'}, {ref:'item.field'},
 {op:name,args:[...]}, {filter:{source,where,item?}}, {map:{source,value,item?}} or literal JSON.

@@ -180,5 +180,6 @@
     "default": {
       "skill": "Use the scoped intermediate values and completed effects already carried into this Python session. Finish the unresolved part of the user request. You can yield one supported public read to the fragment loop."
     }
-  }
+  },
+  "menu_format": "scoped"
 }

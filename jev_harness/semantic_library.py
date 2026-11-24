@@ -1,7 +1,7 @@
 """Editable components of the Jev-assisted AppWorld menu assembler."""
 from copy import deepcopy
 
-from .card_library import ACTIVE_QUESTIONS, initial_cards, validate_card
+from .card_library import ACTIVE_QUESTIONS, BUILTINS, initial_cards, validate_card
 from .policy_programs import load_program
 
 
@@ -63,6 +63,13 @@ def patch_library(parent, proposal, sources, functions=()):
         if kind not in COMPONENTS or not isinstance(name, str) or not name.isidentifier() or (kind, name) in edits:
             raise ValueError("Use distinct named components from " + ", ".join(COMPONENTS))
         edits.append((kind, name))
+        if value is None and installed.get("menu_format")=="scoped":
+            group = {"card":"cards","state":"views","assembly":"assembly","handoff":"handoffs"}.get(kind)
+            if (not group or name not in installed[group] or kind=="card" and name in BUILTINS
+                    or kind=="handoff" and name=="default"):
+                raise ValueError("Retire an installed, non-builtin card, view, menu, or specialized handoff")
+            del installed[group][name]
+            continue
         if kind == "card":
             validate_card(name, value, known)
             if name in ("submit_answer", "submit_effect") and value.get("builtin") != name:
@@ -89,9 +96,10 @@ def patch_library(parent, proposal, sources, functions=()):
             installed["adapters"][name] = deepcopy(value)
         elif kind == "decision":
             handoff_decision = name == 'handoff' and 'handoff' in parent['questions']
-            if not handoff_decision and name not in (*ACTIVE_QUESTIONS, "assembly"):
+            if not handoff_decision and name not in (*ACTIVE_QUESTIONS, "assembly","card_parameter"):
                 raise ValueError("Use an installed decision or define parameters on a card")
-            check_fields(value, ('question','skill') if handoff_decision else ("question", "skill", "program", "labels"))
+            allowed = ("question","skill") if handoff_decision else ("question","skill","program","labels")
+            check_fields(value, ("skill","program") if name=="card_parameter" else allowed)
             for field in ("question", "skill"):
                 if field in value:
                     if not isinstance(value[field], str) or not value[field].strip():
@@ -106,7 +114,7 @@ def patch_library(parent, proposal, sources, functions=()):
                 installed["decision_policies"][name] = value["program"]
         else:
             fields = {"assembly": ("description", "apps", "cards", "program"),
-                      "state": ("requires", "program"),
+                      "state": ("requires", "program","at"),
                       "handoff": ("requires", "skill", "apis", "reads", "when", "defer")}
             if kind == 'handoff' and 'handoff' in parent['questions']:
                 if 'label' in value:
@@ -126,6 +134,8 @@ def patch_library(parent, proposal, sources, functions=()):
                     load_program(value[field])
             if kind == "state" and "program" not in value:
                 raise ValueError("A view needs a projection program")
+            if kind == "state" and value.get("at","state") not in ("state","parameter"):
+                raise ValueError("A state view is rendered at state or parameter")
             if kind == "assembly" and (not isinstance(value.get("description"), str) or not any(value.get(k) for k in ("apps", "cards", "program"))):
                 raise ValueError("A menu family needs a description and a source of installed cards")
             if kind == "handoff":

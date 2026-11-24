@@ -1,16 +1,15 @@
 """Offline Train evidence and patch application for the public semantic harness."""
-import json
-from pathlib import Path
 import re
 
-from .expressions import OPS
 from .formal_runtime import BudgetExhausted
-from .formal_optimizer import LAYOUT, api_context, cleaned_text, read_events
+from .formal_optimizer import api_context
+from .train_evidence import TrainEvidence, leading_choices, read_page, serialized, visible_event
 from .phase1 import PhaseOneExecutor, patch_library
 from .staged_entry import StagedExecutor, completion
 from .composable_v2 import routed
 from .runtime import STEP_REVIEW, Trace, is_open_generation, parse_json
 from .sol_account import AccountError
+from .transport import WorkerUnavailable
 
 
 PROMPT = """You are GPT-6.2 Sol Max, offline editor of a shared AppWorld harness for one frozen 27B.
@@ -82,40 +81,6 @@ Editable object formats:
     'code/policy_programs' when needed. Do not return patches to the optimizer itself."""
 
 
-def visible_event(event):
-    if event["event"] == "summary":
-        return {k:event[k] for k in ("event","success","output_tokens","seconds","error") if k in event}
-    return event
-
-
-def serialized(value):
-    return cleaned_text(json.dumps(value, ensure_ascii=False, default=str))
-
-
-def leading_choices(event):
-    scores=event["response"].get("probabilities",[])
-    return [(event["request"]["options"][j],round(scores[j],5))
-            for j in sorted(range(len(scores)),key=scores.__getitem__,reverse=True)[:2]]
-
-
-def read_page(lines, start=0, count=6, offset=0, budget=16000):
-    start = max(0, int(start))
-    offset = max(0, int(offset))
-    rows = []
-    for i in range(start, min(len(lines), start+min(max(int(count),1),50))):
-        body = lines[i]
-        skip = offset if i == start else 0
-        size = min(len(body)-min(skip,len(body)), budget)
-        rows.append({"index":i,"offset":skip,"text":body[skip:skip+size]})
-        budget -= size
-        if skip+size < len(body):
-            return {"rows":rows,"next":{"start":i,"offset":skip+size}}
-        if budget == 0:
-            break
-    next_index = rows[-1]["index"]+1 if rows else len(lines)
-    return {"rows":rows,"next":{"start":next_index,"offset":0} if next_index < len(lines) else None}
-
-
 class ProbeComplete(Exception):
     pass
 
@@ -167,7 +132,7 @@ class LegacyPrefixProbe(PrefixProbeMixin, PhaseOneExecutor):
     pass
 
 
-class Workbench:
+class Workbench(TrainEvidence):
     review_probe = False
     trial_reminder = ""
     def opening_evidence(self):
@@ -185,91 +150,9 @@ class Workbench:
         return 1,prompt
 
     def __init__(self, study, lib, rows, history, folder, sources):
-        self.study, self.lib, self.folder, self.sources = study, lib, folder, sources
-        self.previous = history
-        self.tasks = {r["task_id"] for r in rows}
-        self.docs, self.paths, self.index = {}, {}, []
+        super().__init__(study, lib, rows, history, folder, sources)
         self.calls = max((int(p.name[6:]) for p in folder.glob("probe_*") if p.name[6:].isdigit()),default=0)
         self.last_probed = None
-        self.docs["dsl"] = (LAYOUT[LAYOUT.index("Step formats:"):]+"\nSupported operations: "+", ".join(OPS)).splitlines()
-        for k,v in lib.items():
-            self.docs["library/"+k] = [serialized({key:value}) for key,value in v.items()] if isinstance(v,dict) else [serialized(v)]
-        definitions = lib["cards"] if "cards" in lib else lib["workflow"]["fragments"]
-        for key,value in definitions.items():
-            self.docs["fragment/"+key] = [serialized(value)]
-        code_docs = ("card_assembly","card_library","fragment_assembly","expressions") if "cards" in lib else (
-            "staged_entry","catalog_entry","phase1","composable_v2","fragment_library","policy_programs","expressions")
-        for name in code_docs:
-            self.docs["code/"+name] = (Path(__file__).parent/(name+".py")).read_text(encoding="utf-8").splitlines()
-        fs = [f.get("function", f) for f in study.functions]
-        self.docs["api_names"] = [f["name"] for f in fs]
-        self.docs.update({"api/"+f["name"]:[serialized(f)] for f in fs})
-        previous = sorted({p for rev in history for p in rev.get("train_traces",[])+rev.get("parent_traces",[])})
-        for p in previous:
-            path = study.root/p
-            self.paths[path.parts[-4]+"/"+path.parts[-3]] = path
-        for row in rows:
-            path = study.root/row["trace_path"]
-            name = "current/"+row["task_id"]
-            self.paths[name] = path
-            es = read_events(path)
-            details = [{"i":i,"event":e["event"],"detail":
-                        e.get("reason") or e.get("fragment") or e.get("scope") or e.get("node") or e.get("error")}
-                       for i,e in enumerate(es) if e["event"] in ("fragment_choice","fragment_choice_deferred",
-                        "fragment_failure","composition_missing","fallback","execution_error",
-                        "stage_prefilter","stage_choice","stage_binding","stage_deferred","stage_handoff",
-                        "card_menu","card_executed","card_failed","fragment_handoff","fragment_reentry",
-                        "assembly_candidates","assembly_selection","assembly_widen","adapter_login","program_error","step_review","handoff_state","handoff_selection","parameter_state")]
-            executed = [(i,cleaned_text(e["code"])[:1100]) for i,e in enumerate(es) if e["event"]=="tool_batch"]
-            positions = []
-            for i,e in enumerate(es):
-                item = {"i":i, "event":e["event"]}
-                if e["event"] == "tool_batch":
-                    result = e["response"]
-                    item["calls"] = [a["method"]+" "+a["url"].split("?")[0] for a in result.get("actions",[])]
-                    item["output_excerpt"] = cleaned_text(result.get("output",""))[-450:]
-                elif e["event"] == "model":
-                    item.update(op=e["operation"], output_tokens=e["response"].get("output_tokens"))
-                    if e["request"].get("purpose") == STEP_REVIEW:
-                        item["purpose"] = STEP_REVIEW
-                    if "cards" in lib and e["operation"]=="decide":
-                        item["top_choices"]=leading_choices(e)
-                elif e["event"] == "api":
-                    item.update(api=e["app"]+"."+e["api"],node=e.get("node"))
-                else:
-                    item.update({k:e[k] for k in ("menu","fragment","scope","node","stage","reason","error",
-                                "apps","retained","complete","options","opened_by","role","source","completed",
-                                "card","offered","excluded","output","inputs","eligible","families","family","mode",
-                                "native_index","native_confidence","final_index","outcome","guide","choice") if k in e})
-                positions.append(serialized(item))
-            self.docs["events/"+row["task_id"]] = positions
-            self.index.append({"task":row["task_id"],"instruction":es[0]["instruction"],"success":row["success"],
-                "output_tokens":row["output_tokens"],"modes":row.get("model_calls"),"trace":name,"events":len(es),
-                "staged":row.get("staged"),"locations":details[:15],"last_code":executed[-1:],
-                **({"executed_cards":row.get("fragments",[]),"menus":row.get("card_menus",0),
-                    "handoffs":row.get("fallback",[])} if "cards" in lib else {})})
-        self.docs["trace_directory"] = sorted(self.paths)
-        self.docs["history"] = [serialized({k:v for k,v in r.items() if k not in ("train_traces","parent_traces")}) for r in history]
-
-    def lines(self, doc):
-        if doc.startswith("api/"):
-            doc = "api/" + doc[4:].removeprefix("apis.").replace(".", "__")
-        if doc in self.docs:
-            return self.docs[doc]
-        if doc in self.paths:
-            return [serialized(visible_event(e)) for e in read_events(self.paths[doc])]
-        raise ValueError("Unknown document "+str(doc))
-
-    def find_evidence(self, query):
-        needle = query["text"].casefold()
-        hits = []
-        for i, line in enumerate(self.lines(query["doc"])):
-            pos = line.casefold().find(needle)
-            if i >= query.get("start", 0) and pos >= 0:
-                hits.append({"index": i, "offset": pos, "snippet": line[max(0, pos-90):pos+220]})
-                if len(hits) == 25:
-                    break
-        return hits
 
     def probe_key(self, proposal, task):
         return (proposal["objects"],task,proposal.get("until")) if self.review_probe else (proposal["objects"],task)
@@ -351,25 +234,30 @@ def propose_one(study, library, rows, history, folder, sources):
     attempt_folder = folder/"sol"
     if "assembly" in library and "cards" in library:
         from .semantic_workbench import SemanticWorkbench, revision_attempt_folder
-        bench = SemanticWorkbench
-        feedback_from = study.settings.get("optimizer", {}).get("same_batch_feedback_from")
-        # A visit such as b06_revisit03 uses the rules in effect after batch 6.
-        scheduled_batch = folder.parent.name.partition("_")[0].removeprefix("b")
-        if feedback_from is not None and int(scheduled_batch) >= feedback_from:
-            from .batch_feedback import BatchFeedbackWorkbench
-            bench = BatchFeedbackWorkbench
-        if study.settings.get("optimizer", {}).get("fragment_trials"):
-            from .fragment_trials import FragmentTrialWorkbench
-            bench = FragmentTrialWorkbench
-        if study.settings.get('optimizer',{}).get('history_preview'):
+        options = study.settings.get("optimizer", {})
+        bench,attempt_folder = SemanticWorkbench,revision_attempt_folder(folder)
+        if options.get("batch_revision"):
+            from .batch_revision import BatchRevisionWorkbench
+            bench = BatchRevisionWorkbench
+            attempt_folder = folder/"sol_scoped"
+        elif options.get("history_preview"):
             from .history_workbench import HistoryWorkbench
             bench = HistoryWorkbench
-        attempt_folder = revision_attempt_folder(folder)
+        elif options.get("fragment_trials"):
+            from .fragment_trials import FragmentTrialWorkbench
+            bench = FragmentTrialWorkbench
+        elif options.get("same_batch_feedback_from") is not None:
+            # A visit such as b06_revisit03 uses the rules in effect after batch 6.
+            scheduled_batch = int(folder.parent.name.partition("_")[0].removeprefix("b"))
+            if scheduled_batch >= options["same_batch_feedback_from"]:
+                from .batch_feedback import BatchFeedbackWorkbench
+                bench = BatchFeedbackWorkbench
     elif "cards" in library:
         from .card_workbench import CardWorkbench
         bench = CardWorkbench
+    reuse_trials = study.settings.get("optimizer",{}).get("batch_revision") is True
     for attempt in range(2):
-        target=attempt_folder if not attempt else attempt_folder.with_name(attempt_folder.name+"_reconnect")
+        target=attempt_folder if not attempt or reuse_trials else attempt_folder.with_name(attempt_folder.name+"_reconnect")
         work=bench(study,library,rows,history,target,sources)
         try:
             return work.work()
@@ -378,3 +266,9 @@ def propose_one(study, library, rows, history, folder, sources):
             study.close_account()
             if attempt or re.search(r"quota|usage limit|rate.?limit|sign.?in|unauthori[sz]ed",str(exc),re.I):
                 raise
+        except WorkerUnavailable as exc:
+            if not reuse_trials or attempt:
+                raise
+            save(target/"probe_service_error.json",{"error":str(exc)})
+            for service in ("model","environment"):
+                study.workers[0].close_worker(service)

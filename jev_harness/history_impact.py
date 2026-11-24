@@ -1,18 +1,21 @@
 """Local effects of a patch at observed Train states. No task or API is replayed."""
 import re
 
-from .expressions import build_candidates
+from .expressions import parameter_groups
 from .semantic_handoff import menu
+from .scoped_menu import consumer_tips, is_scoped
 
 
 def trace_sites(events):
     sites = {'request':events[0].get('instruction','') if events else '', 'handoffs':{}, 'parameters':[],
              'cards':{}, 'offered':set(), 'apis':set(), 'generated_apis':set(), 'nodes':set(), 'families':set()}
     current = None
+    writers = {}
     for i,event in enumerate(events):
         kind = event['event']
         if kind == 'handoff_state':
             sites['handoffs'][i] = dict(event)
+            sites['handoffs'][i].setdefault('producers',{k:v for k,v in writers.items() if k in event['values']})
         elif kind == 'handoff_selection' and sites['handoffs']:
             sites['handoffs'][next(reversed(sites['handoffs']))]['observed_guide'] = event.get('guide')
         elif kind == 'parameter_state':
@@ -22,6 +25,11 @@ def trace_sites(events):
             current['bound'] = event['bound']
         elif kind in ('card_executed','card_failed','fragment_reentry') and event.get('card'):
             sites['cards'].setdefault(event['card'],set()).add(kind)
+            role = event.get('output') or event.get('role')
+            if role and kind!='card_failed':
+                writers[role] = event['card']
+        elif kind=="result_source":
+            writers[event["role"]] = event["producer"]
         elif kind == 'card_menu':
             sites['offered'].update(event['offered'])
         elif kind == 'assembly_candidates':
@@ -52,15 +60,18 @@ def parameter_views(card, state, request):
             return any(needs_uncaptured(v) for v in value.values())
         return False
     for key,slot in card.get('parameters',{}).items():
-        if absent or needs_uncaptured(slot['candidates']):
+        if absent or needs_uncaptured(slot['candidates']) or needs_uncaptured(slot.get('prefer')):
             views[key] = {'unavailable':'Required public inputs were absent or not recorded exactly'}
             break
         try:
-            choices = build_candidates(slot['candidates'],ctx)
+            groups = parameter_groups(slot,ctx)
+            choices = [choice for group in groups for choice in group]
         except (KeyError,TypeError,ValueError,IndexError,ArithmeticError,re.error) as exc:
             views[key] = {'unavailable':str(exc)[:180]}
             break
         views[key] = {'choices':choices,'question':slot['question'],'skill':card['skill']+' '+slot.get('skill','')}
+        if 'prefer' in slot:
+            views[key]['menu_sizes'] = [len(group) for group in groups]
         if key not in state['bound'] or not any(c['value']==state['bound'][key] for c in choices):
             break
         ctx['params'][key] = state['bound'][key]
@@ -80,17 +91,27 @@ def parameter_changes(parent, candidate, state, request):
                         'question_changed':before['question']!=after['question'],'skill_changed':before['skill']!=after['skill'],
                         'bound_value_still_offered':(any(x['value']==state['bound'][slot] for x in right)
                                                      if slot in state['bound'] else None)})
+        if 'menu_sizes' in before or 'menu_sizes' in after:
+            results[-1]['menu_sizes'] = [v.get('menu_sizes',[len(v['choices'])]) for v in (before,after)]
     return results
 
 
 def handoff_view(lib, state):
     names,choices,evidence = menu(lib,state)
     static = list(dict.fromkeys(state['completed'] + ([state['failed']] if state.get('failed') else [])))
-    text = {n:lib['cards'][n]['handoff_skill'] for n in static if lib['cards'].get(n,{}).get('handoff_skill')}
+    lookup = {}
+    if is_scoped(lib):
+        writers = state.get("producers",{})
+        tips = consumer_tips(lib,state["values"],{role:{"producer":card} for role,card in writers.items()})
+        text = {writers[role]:value for role,value in list(tips.items())[-1:]}
+        if len(tips)>1:
+            lookup = tips
+    else:
+        text = {n:lib['cards'][n]['handoff_skill'] for n in static if lib['cards'].get(n,{}).get('handoff_skill')}
     default = lib['handoffs'].get('default',{}).get('skill','')
     if default:
         text['handoff/default'] = default
-    return names,choices,evidence,text
+    return names,choices,evidence,text,lookup
 
 
 def compare_handoff(parent, candidate, state):
@@ -103,6 +124,7 @@ def compare_handoff(parent, candidate, state):
     return {'eligible_before':old[0], 'eligible_after':new[0], 'menu_changed':old[1]!=new[1],
             'model_evidence_changed':old[2]!=new[2], 'selector_prompt_changed':prompt_changed,
             'changed_conditional_guidance':sorted(n for n in common if parent['handoffs'][n]['skill']!=candidate['handoffs'][n]['skill']),
+            'changed_lookup_roles':sorted(k for k in old[4].keys()|new[4].keys() if old[4].get(k)!=new[4].get(k)),
             'changed_direct_guidance_lengths':changed_text,
             'changed_direct_guidance':{k:{'before':old[3].get(k,'')[:400],'after':new[3].get(k,'')[:400]}
                                        for k in changed_text}}
@@ -134,16 +156,20 @@ def assess(sites, parent, candidate, edits):
             reasons.append('decision_site')
         elif kind=='assembly' and sites['families']:
             reasons.append('family_in_menu' if name in sites['families'] else 'assembly_ran')
-        elif kind in ('state','handoff') and sites['handoffs']:
+        elif kind in ('state','handoff'):
             role_key = 'views' if kind=='state' else 'handoffs'
             rules = [lib[role_key][name] for lib in (parent,candidate) if name in lib[role_key]]
-            if any(all(k in s['values'] for k in rule.get('requires',[])) for rule in rules for s in sites['handoffs'].values()):
+            if any(rule.get('at')=='parameter' and set(rule.get('requires',[])).issubset(s.get('available',s['values']))
+                   for rule in rules for s in sites['parameters']):
+                reasons.append('parameter_projection_site')
+            if any(rule.get('at')!='parameter' and all(k in s['values'] for k in rule.get('requires',[]))
+                   for rule in rules for s in sites['handoffs'].values()):
                 reasons.append('required_roles_present')
         if reasons:
             hits[kind+'/'+name] = reasons
     for i,st in sites['handoffs'].items():
         diff = compare_handoff(parent,candidate,st)
-        if any(diff[k] for k in ('menu_changed','model_evidence_changed','selector_prompt_changed','changed_conditional_guidance','changed_direct_guidance_lengths')):
+        if any(diff[k] for k in ('menu_changed','model_evidence_changed','selector_prompt_changed','changed_conditional_guidance','changed_direct_guidance_lengths','changed_lookup_roles')):
             handoffs.append({'event':i,**diff})
     return {'exposures':hits,'parameter_checks':bindings,'handoff_changes':handoffs}
 

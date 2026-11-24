@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import shlex
 import subprocess
@@ -21,17 +22,23 @@ class WorkerError(RuntimeError):
 class Worker:
     def __init__(self, spec: dict, log_path: Path):
         command = [spec["python"], "-u", spec["script"], *spec.get("args", [])]
+        worker_env = dict(spec.get("env", {}))
+        local_env = None
         if "host" in spec:
             if spec.get("temp_dir"):
-                command = ["env", "TMPDIR="+spec["temp_dir"], *command]
+                worker_env["TMPDIR"] = spec["temp_dir"]
+            if worker_env:
+                command = ["env", *(f"{name}={value}" for name, value in worker_env.items()), *command]
             command = ["ssh", *(["-C"] if spec.get("compression") else []), "-o", "BatchMode=yes", "-o", "ConnectTimeout=15",
                        "-o", "ServerAliveInterval=30", "-o", "ServerAliveCountMax=4",
                        "-i", spec["identity"], "-p", str(spec["port"]),
                        spec["user"] + "@" + spec["host"], shlex.join(command)]
+        elif worker_env:
+            local_env = {**os.environ, **worker_env}
         log_path.parent.mkdir(parents=True, exist_ok=True)
         self.log = log_path.open("a", encoding="utf-8")
         self.process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                        stderr=self.log, text=True, encoding="utf-8", bufsize=1)
+                                        stderr=self.log, text=True, encoding="utf-8", bufsize=1, env=local_env)
         self.lock = threading.Lock()
         self.broken = False
         self.index = 0

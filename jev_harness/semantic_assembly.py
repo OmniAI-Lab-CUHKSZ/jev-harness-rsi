@@ -8,11 +8,8 @@ from .expressions import path_get
 from .formal_runtime import bounded
 from .fragment_assembly import option
 from .policy_programs import load_program
-from .runtime import REVIEW_MAX_TOKENS, REVIEW_THINKING_BUDGET, STEP_REVIEW, Uncovered
-
-
-def abstained(exc):
-    return "uncovered option" in str(exc) or str(exc).startswith(("No grounded choice","No grounded options"))
+from .runtime import REVIEW_MAX_TOKENS, REVIEW_THINKING_BUDGET, STEP_REVIEW, Uncovered, abstained
+from .scoped_menu import is_scoped, result_sources, specific_use
 
 
 class SemanticAssembly(CardAssembly):
@@ -26,7 +23,8 @@ class SemanticAssembly(CardAssembly):
     def policy_context(self):
         return {"request": self.request, "values": self.public, "bindings": self.provenance,
                 "completed": self.completed_cards, "conditions": self.criteria,
-                "receipts": self.receipts, "read_scopes": self.read_scopes}
+                "receipts": self.receipts, "read_scopes": self.read_scopes,
+                "datetime":self.context["task"].get("datetime"),"active_card":self.active_card}
 
     def policy(self, name, source, context, default=None):
         try:
@@ -92,6 +90,10 @@ class SemanticAssembly(CardAssembly):
             page += 1
 
     def choose(self, name, choices, *, widen_on_none=False, **facts):
+        if name == "card_parameter":
+            views = self.project_views("parameter")
+            if views:
+                facts["views"] = views
         program = self.registry["decision_policies"].get(name)
         if program:
             indexes = self.policy("decision/" + name, program,
@@ -118,20 +120,52 @@ class SemanticAssembly(CardAssembly):
 
     def perform_card(self, name):
         self.step_bindings = {}
+        self.active_read_scope = None
         super().perform_card(name)
         card = self.registry["cards"][name]
         _, inputs, output, _ = ports(card)
         self.provenance = {key: value for key, value in self.provenance.items() if key in self.public}
+        if is_scoped(self.registry):
+            self.provenance.pop(output,None)
         self.provenance[output] = {"producer":name, "inputs":list(inputs), "parameters":dict(self.step_bindings)}
+        if is_scoped(self.registry):
+            if self.public.get("scope") and self.registry["cards"][name].get("builtin") in ("library","playlist","album"):
+                self.provenance[output]["source_scope"] = self.public["scope"]
+            if self.active_read_scope is not None:
+                self.read_scopes[output] = self.active_read_scope
+            self.trace.add("result_source", role=output, **self.provenance[output])
+
+    def forget_derived(self, changed):
+        super().forget_derived(changed)
+        if is_scoped(self.registry):
+            self.provenance = {k:v for k,v in self.provenance.items() if k in self.public}
+            self.read_scopes = {k:v for k,v in self.read_scopes.items() if k in self.public}
+
+    def set_subset(self, songs):
+        super().set_subset(songs)
+        if is_scoped(self.registry) and self.active_card:
+            for role in ("song_ids","song_records"):
+                self.provenance[role] = {"producer":self.active_card, "inputs":["song_ids"],
+                                         "parameters":dict(self.step_bindings), "source_scope":self.public.get("scope")}
+                self.read_scopes.pop(role,None)
+
+    def project_views(self, site):
+        views = {}
+        for name, rule in self.registry["views"].items():
+            if rule.get("at","state") == site and all(role in self.public for role in rule.get("requires", [])):
+                value = self.policy("state/" + name, rule["program"], self.policy_context())
+                if value is not None:
+                    views[name] = value
+        return views
 
     def state_view(self):
         state = super().state_view()
         state["bindings"] = {role: info for role, info in self.provenance.items() if info["parameters"]}
-        for name, rule in self.registry["views"].items():
-            if all(role in self.public for role in rule.get("requires", [])):
-                value = self.policy("state/" + name, rule["program"], self.policy_context())
-                if value is not None:
-                    state.setdefault("views", {})[name] = value
+        if is_scoped(self.registry) and self.provenance:
+            state["sources"] = result_sources(self.registry,self.public,self.provenance)
+        views = self.project_views("state")
+        if views:
+            state["views"] = views
         return state
 
     def families(self, eligible):
@@ -196,7 +230,7 @@ class SemanticAssembly(CardAssembly):
                        families={n:members for n, (_, members) in menus.items()}, excluded=excluded)
         chosen, mode = None, "all"
         if len(menus) > 1:
-            choices = [option(desc + " Available steps: " + " | ".join(cards[s]["description"] for s in members[:6]), name)
+            choices = [option(desc if is_scoped(self.registry) else desc + " Available steps: " + " | ".join(cards[s]["description"] for s in members[:6]), name)
                        for name, (desc, members) in menus.items()]
             try:
                 chosen = self.choose("assembly", choices, **state)
@@ -209,6 +243,8 @@ class SemanticAssembly(CardAssembly):
         self.trace.add("assembly_selection", mode=mode, family=chosen, offered=focused, full_count=len(eligible))
 
         def pick(names, menu):
+            if is_scoped(self.registry):
+                return self.pick_scoped(names, menu, eligible, excluded, state)
             self.trace.add("card_menu", offered=names, excluded=excluded, state=state, assembly=menu)
             return self.choose("step", [self.card_option(n, cards[n]) for n in names],
                                widen_on_none=names != eligible, **state)
@@ -220,6 +256,29 @@ class SemanticAssembly(CardAssembly):
                 raise
         self.trace.add("assembly_widen", rejected=chosen, offered=eligible)
         return pick(eligible, None)
+
+    def pick_scoped(self, names, menu, eligible, excluded, state):
+        cards = self.registry["cards"]
+        common = [n for n in names if not specific_use(cards[n])]
+        specific = [n for n in names if specific_use(cards[n])]
+        def select(group, choices, can_widen):
+            self.trace.add("card_menu", offered=group, excluded=excluded, state=state, assembly=menu)
+            return self.choose("step",choices,widen_on_none=can_widen,**state)
+        # A growing collection of specialists occupies one slot in the ordinary menu.
+        # A single specialist is already one slot and can be picked directly.
+        if common and len(specific) > 1:
+            choices = [self.card_option(n,cards[n]) for n in common]
+            choices.append(option("Choose a specialized operation for a particular requested outcome.", {"specialized":True}))
+            choice = select(common,choices,names != eligible)
+            if choice != {"specialized":True}:
+                return choice
+            try:
+                return select(specific,[self.card_option(n,cards[n]) for n in specific],True)
+            except Uncovered as exc:
+                if not abstained(exc):
+                    raise
+                names = common
+        return select(names,[self.card_option(n,cards[n]) for n in names],names != eligible)
 
     def read_offers(self):
         offers = super().read_offers()
@@ -268,8 +327,14 @@ class SemanticAssembly(CardAssembly):
         guide = progress['selected_handoff_guidance']
         visible = super().generation_view({k:v for k,v in progress.items() if k!='selected_handoff_guidance'},compact)
         if guide:
-            # Keep the selected instruction visible even if compiled_progress exceeded its context allocation.
             visible['selected_handoff_guidance'] = {'name':guide['name'],'skill':bounded(guide['skill'],1600 if compact else 3200)}
+        if is_scoped(self.registry):
+            sources = progress.get("decision_evidence",{}).get("sources",{})
+            if sources:
+                visible["available_results"] = {role:{"source":info.get("api",info["producer"]),
+                    **({"scope":info["scope"]} if "scope" in info else {})} for role,info in sources.items()}
+            if lookup := progress.get("usage_lookup"):
+                visible["result_usage"] = f"For a role's full usage note, read compiled['{lookup}'][role]."
         return visible
 
     def generate_message(self, system, progress=None, **kwargs):

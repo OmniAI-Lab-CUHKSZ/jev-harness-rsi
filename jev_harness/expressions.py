@@ -143,3 +143,16 @@ def build_candidates(definition, context):
         result.append({"label": resolve(definition.get("label", {"op": "json", "args": [{"ref": "item"}]}), local),
                        "value": resolve(definition.get("value", {"ref": "item"}), local)})
     return result
+
+
+def parameter_groups(slot, context):
+    """Offer preferred records first, keeping every other eligible record reachable."""
+    choices = build_candidates(slot["candidates"], context)
+    if "prefer" not in slot:
+        return [choices]
+    preferred, remaining = [], []
+    for choice in choices:
+        facts = {**context, "item": choice["value"], "label": choice["label"]}
+        group = preferred if resolve(slot["prefer"], facts) else remaining
+        group.append(choice)
+    return [group for group in (preferred, remaining) if group] or [[]]

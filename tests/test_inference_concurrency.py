@@ -20,13 +20,13 @@ from phase1_run import paired_holdout
 
 WORKER = Path(__file__).resolve().parents[1] / "jev_harness/official_model_worker.py"
 SETTINGS = {"seed": 1, "execution": {}, "inference_schedule": {"first_batch": 1, "later_batches": 2, "test": 2}}
-ENV = """import json,sys
+ENV = """import json,os,sys
 task = None
 for line in sys.stdin:
     request = json.loads(line)
     if request["op"] == "prepare":
         task = request["task"]
-    print(json.dumps({"id":request["id"], "result":{"task":task}}), flush=True)
+    print(json.dumps({"id":request["id"], "result":{"task":task,"profile":os.environ.get("JEV_WORKER_PROFILE")}}), flush=True)
     if request["op"] == "close":
         break
 """
@@ -35,7 +35,8 @@ for line in sys.stdin:
 def connections():
     return {"model_nodes": {"node": {"python": sys.executable, "script": str(WORKER),
             "args": ["--model", "fixture", "--service", "."]}},
-            "environment": {"python": sys.executable, "script": "-c", "args": [ENV]}}
+            "environment": {"python": sys.executable, "script": "-c", "args": [ENV],
+                            "env": {"JEV_WORKER_PROFILE": "local-test"}}}
 
 
 def owner(port):
@@ -101,7 +102,9 @@ class InferenceConcurrencyTests(TestCase):
                         session.worker("environment").request("prepare", task=str(lane))
                         result = session.worker("model").request("decide", state=str(lane), question="Choose",
                                                                  options=["first", "second"])
-                        return result["index"], session.worker("environment").request("get")["task"]
+                        observed = session.worker("environment").request("get")
+                        self.assertEqual(observed["profile"], "local-test")
+                        return result["index"], observed["task"]
                     with ThreadPoolExecutor(2) as pool:
                         self.assertEqual(list(pool.map(call, (0, 1))), [(0, "0"), (1, "1")])
                     device.sessions[0].close_worker("model")

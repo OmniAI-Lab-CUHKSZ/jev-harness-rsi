@@ -11,9 +11,12 @@ SKILL = ('Read the entire request for the intended effect, actor, recipient and 
 
 
 def snapshot(executor):
-    return {'values':{name:bounded(value, 1200) for name,value in executor.public.items() if value is not None},
+    state = {'values':{name:bounded(value, 1200) for name,value in executor.public.items() if value is not None},
             'completed':list(executor.completed_cards), 'failed':executor.failed_card,
             'remaining_model_calls':max(0,executor.max_calls-executor.requests)}
+    if executor.registry.get("menu_format") == "scoped":
+        state["producers"] = {role:info["producer"] for role,info in executor.provenance.items() if role in state["values"]}
+    return state
 
 
 def menu(library, state):

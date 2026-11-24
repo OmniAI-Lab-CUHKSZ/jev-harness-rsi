@@ -16,6 +16,34 @@ def batch_ids(groups):
     return [f"{group}_{i}" for i in (1, 2, 3) for group in groups]
 
 
+def train_entry_stage(label, version, batch, settings):
+    continuation = settings.get("execution_from_next_batch", {})
+    if batch == continuation.get("from_batch"):
+        threshold = str(continuation["step_review_threshold"]).replace(".", "p")
+        return f"{label}_{version}_review_{threshold}_entry"
+    return f"{label}_{version}_entry"
+
+
+def completed_train_entries(root, label, checkpoint, settings):
+    entry = root/"batches"/label/"entry.json"
+    if entry.is_file():
+        saved = read(entry).get("train_traces")
+        if saved is not None:
+            return saved
+    # Older entry reports stored totals only. Recover the scored attempt for each
+    # known task of this completed visit, including visits without any proposal.
+    batch, version = checkpoint["batch"], checkpoint["entry_version"]
+    stage = train_entry_stage(label, version, batch, settings)
+    paths = []
+    for task in batch_ids(BATCHES[batch-1]):
+        for name in dict.fromkeys((stage, f"{label}_{version}_entry")):
+            record = root/"runs"/name/task/"record.json"
+            if record.is_file():
+                paths.append(read(record)["trace_path"])
+                break
+    return paths
+
+
 def design_manifest(protocol=PROTOCOL):
     manifest = read(RESOURCES / "task_split.json")
     manifest["protocol"] = protocol
@@ -157,6 +185,39 @@ def paired_holdout(study, ids, version, library):
     return [a for a,b in pairs],[b for a,b in pairs]
 
 
+def initial_harness(settings):
+    from jev_harness.semantic_library import initial_library
+    if not settings.get("semantic_handoffs"):
+        return initial_library()
+    library = read(RESOURCES / "h00.json")
+    if settings.get("menu_format") != "scoped":
+        library.pop("menu_format", None)
+    return library
+
+
+def offline_optimizer_costs(root, *, historical):
+    folders = [p for p in (root/"batches").glob("b*/b*r*/sol*") if p.is_dir()]
+    paths = [p for folder in folders for p in folder.rglob("usage.json")]
+    fields = ("inputTokens","cachedInputTokens","outputTokens","reasoningOutputTokens","seconds")
+    usages = [read(path) for path in paths]
+    costs = {"offline_sol_usage":{"turns_with_usage":len(usages),
+             **{key:sum(u.get(key,0) for u in usages) for key in fields}}}
+    if historical:
+        authors = [read(p) for p in paths if p.parent.name.startswith("wording_author_")]
+        costs["offline_wording_author"] = {"calls":len(authors), **{key:sum(u.get(key,0) for u in authors) for key in fields}}
+        previews = [read(p)["summary"]["local_native_cost"] for folder in folders for p in folder.glob("probe_*/historical_impact.json")]
+        costs["offline_historical_checks"] = {k:sum(u.get(k,0) for u in previews) for k in ("calls","input_tokens","output_tokens")}
+    meters = []
+    for folder in folders:
+        # The revised trial's meter includes the draft; interrupted calls are charged in the individual meter.
+        meter = next((folder/name/"meter.json" for name in ("trial_revised","trial_draft") if (folder/name/"meter.json").exists()),None)
+        if meter:
+            meters.append(read(meter))
+    if meters:
+        costs["offline_27b_probes"] = {key:sum(m.get(key,0) for m in meters) for key in sorted(set().union(*meters))}
+    return costs
+
+
 def run(study, count, rounds, formal, *, revisit_after_six=(), evaluate_test=True, reference_dev=None):
     """A callable reference_dev scores the retained parent when a candidate first reaches Dev."""
     if not 1 <= rounds <= MAX_REVISIONS:
@@ -165,6 +226,8 @@ def run(study, count, rounds, formal, *, revisit_after_six=(), evaluate_test=Tru
     first = root/"versions"/"h00.json"
     from jev_harness import card_library, semantic_library
     protocol = study.settings.get("protocol", PROTOCOL)
+    optimizer = study.settings.get("optimizer",{})
+    with_impact = optimizer.get("batch_revision") is True or optimizer.get("history_preview") is True
     is_cards = protocol in (card_library.PROTOCOL, semantic_library.PROTOCOL)
     semantic = protocol == semantic_library.PROTOCOL
     if semantic:
@@ -174,11 +237,7 @@ def run(study, count, rounds, formal, *, revisit_after_six=(), evaluate_test=Tru
     else:
         raise ValueError(f"Unknown fragment harness protocol: {protocol}")
     if not first.exists():
-        if semantic:
-            seed_library = (read(RESOURCES / "h00.json") if study.settings.get("semantic_handoffs")
-                            else semantic_library.initial_library())
-        else:
-            seed_library = card_library.initial_cards()
+        seed_library = initial_harness(study.settings) if semantic else card_library.initial_cards()
         save(first, seed_library)
     checkpoint_file = root/"checkpoints.json"
     checkpoints = read(checkpoint_file) if checkpoint_file.is_file() else []
@@ -194,7 +253,12 @@ def run(study, count, rounds, formal, *, revisit_after_six=(), evaluate_test=Tru
     if completed != [label for _, label in visits[:len(completed)]]:
         raise ValueError("The saved batch visits are not a prefix of the requested schedule")
     history = []
+    scoped = optimizer.get("batch_revision") is True
+    if scoped:
+        study.prior_train_entries = []
     for label, checkpoint in zip(completed, checkpoints):
+        if scoped:
+            study.prior_train_entries.extend(completed_train_entries(root, label, checkpoint, study.settings))
         for rnd in range(1, checkpoint["revisions_scored"]+1):
             history.append(read(root/"batches"/label/f"{label}r{rnd:02d}"/"result.json"))
     manifest=design_manifest(protocol if is_cards else PROTOCOL)
@@ -207,7 +271,7 @@ def run(study, count, rounds, formal, *, revisit_after_six=(), evaluate_test=Tru
     def score_dev(ver, library):
         return study.batch(dev, "dev_"+ver, library=library)
     if formal and reference_dev is None:
-        if study.settings.get('optimizer',{}).get('history_preview'):
+        if with_impact:
             reference_dev = lambda current=version, library=lib: score_dev(current,library)
         else:
             reference_dev = score_dev(version, lib)
@@ -219,19 +283,17 @@ def run(study, count, rounds, formal, *, revisit_after_six=(), evaluate_test=Tru
         if hasattr(study, "begin_inference_phase"):
             study.begin_inference_phase("train", batch)
         entry_ver, entry_lib = version, lib
-        entry_stage = label+"_"+version+"_entry"
-        continuation = study.settings.get("execution_from_next_batch", {})
-        if batch == continuation.get("from_batch"):
-            # Isolate the first new-policy Train attempt when taking over a live controller.
-            threshold = str(continuation["step_review_threshold"]).replace(".", "p")
-            entry_stage = f"{label}_{version}_review_{threshold}_entry"
+        entry_stage = train_entry_stage(label, version, batch, study.settings)
         rows = study.batch(ids, entry_stage, library=lib)
+        entry_traces = [r["trace_path"] for r in rows] if scoped else []
         entrance = summary(rows)
         entrance_by_seed={name:summary(part) for name,part in (
             ("historical_seed",[r for r in rows if r["task_id"] in seed_sources]),
             ("outside_seed",[r for r in rows if r["task_id"] not in seed_sources])) if part}
         revisions_scored = 0
-        save(root/"batches"/label/"entry.json", {"version":version, **entrance})
+        optimizer_stop = None
+        save(root/"batches"/label/"entry.json", {"version":version, **entrance,
+             **({"train_traces":entry_traces} if scoped else {})})
         from jev_harness.phase1_optimizer import propose_one
         for rnd in range(1, rounds+1):
             if quality(rows) == (len(ids),0):
@@ -257,11 +319,15 @@ def run(study, count, rounds, formal, *, revisit_after_six=(), evaluate_test=Tru
                 proposal = propose_one(study, lib, rows, history, folder, sources)
                 save(proposal_file, proposal)
             proposal = read(proposal_file)
+            if proposal.get("keep_parent") is True:
+                optimizer_stop = {"round":rnd,"version":version,"reason":proposal["reason"]}
+                save(folder/"retained_parent.json",optimizer_stop)
+                break
             candidate, edits = install(lib, proposal, sources, study.functions)
             save(root/"versions"/(candidate_version+".json"), candidate)
             parent_rows, candidate_rows = study.candidate_batch(ids, candidate_version, candidate, rows, lib)
             comparison = gain(parent_rows, candidate_rows)
-            keep_tie = comparison["tied"] and (study.settings.get("optimizer", {}).get("fragment_trials") is True
+            keep_tie = comparison["tied"] and (optimizer.get("batch_revision") is True or optimizer.get("fragment_trials") is True
                                                or bool(revisit_after_six) and position >= 6)
             accepted = quality(candidate_rows) > quality(parent_rows) or keep_tie
             record = {"batch":batch, "visit":label, "round":rnd, "parent":prior_ver, "candidate":candidate_version,
@@ -269,8 +335,13 @@ def run(study, count, rounds, formal, *, revisit_after_six=(), evaluate_test=Tru
                       "accepted":accepted, "comparison":comparison,
                       "parent_metrics":summary(parent_rows), "candidate_metrics":summary(candidate_rows),
                       "train_traces":[r["trace_path"] for r in candidate_rows],"parent_traces":[r["trace_path"] for r in parent_rows]}
+            for key in ("diagnosis","initial_diagnosis"):
+                if isinstance(proposal.get(key),dict):
+                    record["component_choice" if key=="diagnosis" else "initial_component_choice"] = proposal[key]
+            if "history_use" in proposal:
+                record["history_use"] = proposal["history_use"]
             impact_file = folder/'optimizer_impact.json'
-            if study.settings.get('optimizer',{}).get('history_preview') and impact_file.exists():
+            if with_impact and impact_file.exists():
                 record['historical_impact'] = read(impact_file)
             if study.settings.get('optimizer',{}).get('history_preview') and proposal.get('capability_gap'):
                 record['capability_gap'] = proposal['capability_gap']
@@ -302,8 +373,11 @@ def run(study, count, rounds, formal, *, revisit_after_six=(), evaluate_test=Tru
         checkpoints.append({"batch":batch, "visit":label, "entry_version":entry_ver, "train_version":train_version,
                             "next_version":version, "revisions_scored":revisions_scored,
                             "entry":entrance, "entry_by_seed":entrance_by_seed,
-                            "train":summary(rows),"dev_selection":dev_choice})
+                            "train":summary(rows),"dev_selection":dev_choice,
+                            **({"optimizer_stop":optimizer_stop} if optimizer_stop else {})})
         save(checkpoint_file, checkpoints)
+        if scoped:
+            study.prior_train_entries.extend(entry_traces)
     if formal and evaluate_test:
         if study.settings.get("adaptive_decision") and callable(reference_dev):
             reference_dev = reference_dev()
@@ -317,17 +391,7 @@ def run(study, count, rounds, formal, *, revisit_after_six=(), evaluate_test=Tru
         report["arms"]={"A":"unchanged 27B generation agent","B":"same 27B with Sol-evolved " +
                         ("Jev-assembled menus and six-component harness" if semantic else
                          "fragment-card harness" if is_cards else "staged harness")}
-        usages=[read(p) for p in root.glob("batches/b*/b*r*/sol*/turn_*/usage.json")]
-        if study.settings.get('optimizer',{}).get('history_preview'):
-            authors = [read(p) for p in root.glob('batches/b*/b*r*/sol*/probe_*/wording_author_*/usage.json')]
-            usages.extend(authors)
-            report['offline_wording_author'] = {'calls':len(authors), **{k:sum(u.get(k,0) for u in authors)
-                for k in ('inputTokens','outputTokens','reasoningOutputTokens','seconds')}}
-            previews = [read(p)['summary']['local_native_cost'] for p in root.glob('batches/b*/b*r*/sol*/probe_*/historical_impact.json')]
-            report['offline_historical_checks'] = {k:sum(u.get(k,0) for u in previews) for k in ('calls','input_tokens','output_tokens')}
-        report["offline_sol_usage"]={"turns_with_usage":len(usages),
-                                    **{k:sum(u.get(k,0) for u in usages) for k in
-                                       ("inputTokens","outputTokens","reasoningOutputTokens","seconds")}}
+        report.update(offline_optimizer_costs(root,historical=bool(optimizer.get("history_preview"))))
         report["paired_tasks"]=[{"task":x["task_id"],"A":{k:x.get(k) for k in ("success","output_tokens","gpu","trace_path")},
                                  "B":{k:y.get(k) for k in ("success","output_tokens","gpu","trace_path")}} for x,y in zip(a,b)]
         save(root/"test_report.json",report)

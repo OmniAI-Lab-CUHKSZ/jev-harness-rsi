@@ -6,7 +6,7 @@ from pathlib import Path
 from string import Template
 
 from formal_run import read, save
-from phase1_run import design_manifest, run
+from phase1_run import design_manifest, initial_harness, run
 from .allocation import SharedStudy
 
 
@@ -37,8 +37,18 @@ def load_connections(path):
 
 def initialize(root, settings):
     config_path = root / "configuration.json"
-    if config_path.is_file() and read(config_path) != settings:
-        raise ValueError("Choose a separate output directory for a different experiment configuration")
+    if config_path.is_file():
+        saved = read(config_path)
+        if "menu_format" not in saved:
+            # Earlier releases used the history-preview editor and single-session batch one.
+            settings.pop("menu_format", None)
+            settings["optimizer"].pop("batch_revision", None)
+            settings["optimizer"].update(history_preview=True, fragment_trials=True, same_batch_feedback_from=1)
+            settings["inference_schedule"]["first_batch"] = 1
+        if "inference_schedule" not in saved:
+            settings.pop("inference_schedule", None)
+        if saved != settings:
+            raise ValueError("Choose a separate output directory for a different experiment configuration")
     save(config_path, settings)
     reference = root / "dev_reference.json"
     if not reference.exists():
@@ -69,7 +79,7 @@ def main(argv=None):
     settings = read(RESOURCES / "experiment.json")
     manifest = design_manifest()
     if args.command == "plan":
-        print(json.dumps({"configuration": settings, "split": manifest, "h0": read(RESOURCES / "h00.json")},
+        print(json.dumps({"configuration": settings, "split": manifest, "h0": initial_harness(settings)},
                          ensure_ascii=False, indent=2))
         return
     connections = load_connections(args.connections)
@@ -87,16 +97,13 @@ def main(argv=None):
     model_args = first_node["args"]
     settings["model_path"] = model_args[model_args.index("--model") + 1]
     root = args.root.resolve()
-    if (root / "configuration.json").is_file() and "inference_schedule" not in read(root / "configuration.json"):
-        # Runs created before multi-session inference used one session throughout.
-        settings.pop("inference_schedule", None)
     initialize(root, settings)
     study = SharedStudy(root, settings, connections, devices=devices, max_gpus=getattr(args, "max_gpus", 1),
                         gpu_name=getattr(args, "gpu_name", "A800"))
     try:
         study.start_workers()
         if args.command == "smoke":
-            row = study.run_task(args.task, "smoke_h00", "B", read(RESOURCES / "h00.json"), workers=study.workers[0])
+            row = study.run_task(args.task, "smoke_h00", "B", initial_harness(settings), workers=study.workers[0])
             save(root / "smoke_result.json", {k: row[k] for k in
                  ("task_id", "success", "output_tokens", "gpu", "trace_path", "step_review", "execution_settings")})
             study.status("smoke_completed", task=row["task_id"], success=row["success"])
