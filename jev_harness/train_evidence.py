@@ -7,6 +7,13 @@ from .formal_optimizer import LAYOUT, cleaned_text, read_events
 from .runtime import STEP_REVIEW
 
 
+LOOKUP_EXAMPLES = {
+    "read":{"read":[{"doc":"dsl","start":0,"count":4}]},
+    "find":{"find":{"doc":"dsl","text":"parameters"}},
+    "related_train":{"related_train":{"task":"<current Train ID>","event":0}},
+}
+
+
 def visible_event(event):
     if event["event"] == "summary":
         return {k:event[k] for k in ("event","success","output_tokens","seconds","error") if k in event}
@@ -146,6 +153,42 @@ class TrainEvidence:
             except (ValueError, KeyError, TypeError) as exc:
                 output.append({"doc":doc,"error":str(exc)})
         return output
+
+    def evidence_reply(self, action):
+        """Return a receipt for each request that Sol submitted in this reply."""
+        returned, pending, unexecuted = {}, [], []
+        for operation, value in action.items():
+            if operation not in LOOKUP_EXAMPLES:
+                unexecuted.append({"field":operation,"error":"Submit the final decision in its own reply."})
+                continue
+            if operation == "read":
+                if not isinstance(value,list):
+                    unexecuted.append({"field":"read","error":"Use a list of documents.","example":LOOKUP_EXAMPLES["read"]})
+                    continue
+                pages = returned["read"] = []
+                for index, item in enumerate(value[:6]):
+                    query = {"doc":item} if isinstance(item,str) else item
+                    try:
+                        page, = self.lookup({"read":[query]})
+                        if "error" in page:
+                            raise ValueError(page["error"])
+                        pages.append(page)
+                        if page.get("next"):
+                            pending.append({"read":[{**query,**page["next"]}]})
+                    except (ValueError,KeyError,TypeError,AttributeError) as exc:
+                        unexecuted.append({"field":f"read[{index}]","request":item,"error":str(exc),
+                                           "example":LOOKUP_EXAMPLES["read"]})
+                for start in range(6,len(value),6):
+                    pending.append({"read":value[start:start+6]})
+                continue
+            try:
+                result = self.lookup({operation:value})
+                returned[operation] = result
+                if operation == "find" and len(result) == 25:
+                    pending.append({"find":{**value,"start":result[-1]["index"]+1}})
+            except (ValueError,KeyError,TypeError,IndexError,AttributeError) as exc:
+                unexecuted.append({"field":operation,"request":value,"error":str(exc),"example":LOOKUP_EXAMPLES[operation]})
+        return {"returned":returned,"pending":pending,"unexecuted":unexecuted}
 
     def add_last_round(self, folder, history):
         from .batch_feedback import prefix_changes, prefix_view

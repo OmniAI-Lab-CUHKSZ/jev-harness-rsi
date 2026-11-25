@@ -4,6 +4,7 @@ from functools import cached_property
 from pathlib import Path
 
 from .card_library import CARD_DSL
+from .contrast_probes import FRESH_DECISION_LIMIT, OPEN_GENERATION_LIMIT, PROBE_OUTPUT_LIMIT
 from .formal_optimizer import cleaned_text, read_events
 from .history_impact import trace_sites
 from .history_workbench import SCHEMA as HANDOFF_SCHEMA
@@ -133,7 +134,7 @@ def validate_batch_effects(groups, tasks):
     if not isinstance(groups,list) or not all(isinstance(group,dict) and isinstance(group.get("tasks"),list)
             and group["tasks"] and all(isinstance(t,str) for t in group["tasks"])
             and isinstance(group.get("effect"),str) and group["effect"].strip() for group in groups):
-        raise ValueError("Group current task IDs by their expected effect, including preserved paths.")
+        raise ValueError('batch_effects needs groups such as {"tasks":["<current task ID>"],"effect":"<expected behavior>"}. Cover each current task once.')
     counts = Counter(task for group in groups for task in group["tasks"])
     if counts != Counter(list(tasks)):
         raise ValueError(f"Cover each current task once. Missing: {sorted(set(tasks)-counts.keys())}; "
@@ -229,15 +230,22 @@ class BatchRevisionWorkbench(TrainEvidence):
 
     def check_history_use(self, reply):
         sources = reply.get("history_use", [])
+        example = ('{"trace":"<indexed earlier Train document>","event":0,'
+                   '"shared_step":"<operation shared by both tasks>","scope_difference":"<difference in goal or scope>"}')
         if not isinstance(sources, list):
-            raise ValueError("history_use is a list of earlier Train events, or [].")
-        for source in sources:
-            record = self.precedents.records.get(source["trace"])
+            raise ValueError(f"history_use must be a list. Example entry: {example}")
+        for index, source in enumerate(sources):
+            required = ("trace","event","shared_step","scope_difference")
+            missing = [k for k in required if not isinstance(source,dict) or k not in source]
+            where = f"history_use[{index}]"
+            if missing:
+                raise ValueError(f"{where} is missing {', '.join(missing)}. Example entry: {example}")
+            record = self.precedents.records.get(source["trace"]) if isinstance(source["trace"],str) else None
             i = source["event"]
             if record is None or type(i) is not int or not 0 <= i < record["events"]:
-                raise ValueError("Cite a real earlier Train document and event, or use history_use:[] for a direct repair.")
+                raise ValueError(f"{where}.trace and .event must identify a real earlier Train event. Example entry: {example}")
             if not all(isinstance(source.get(k), str) and source[k].strip() for k in ("shared_step", "scope_difference")):
-                raise ValueError("Explain the shared step and the relevant difference in scope of the earlier Train case.")
+                raise ValueError(f"{where}.shared_step and .scope_difference need nonempty descriptions. Example entry: {example}")
 
     def trace_data(self,doc):
         if doc not in self.sites:
@@ -326,7 +334,9 @@ class BatchRevisionWorkbench(TrainEvidence):
         thread = account.start(folder,"Use only the supplied public Train evidence. Return the requested JSON.")
         prompt = (instructions+'\nYou may reply with {"read":[{"doc":"current/<id>","start":0,"count":4}]} '
                   'or {"find":{"doc":"...","text":"..."}} or {"related_train":{"task":"...","event":0}} before your final action. '
-                  'Trial documents use the exact names in observations.\n'
+                  'You can combine these evidence requests. The reply lists returned results, pending pages or '
+                  'documents, and unexecuted items with a correction. Up to six read documents are returned per reply. '
+                  'Resubmit the exact requests in pending when needed. Trial documents use the names in observations.\n'
                   +serialized(payload))
         for turn in range(1,11):
             if turn>=6:
@@ -346,7 +356,7 @@ class BatchRevisionWorkbench(TrainEvidence):
                     reply = parse_json(reply["action_json"])
                     return parse(reply)
                 if "read" in reply or "find" in reply or "related_train" in reply:
-                    prompt = serialized(self.lookup(reply))
+                    prompt = serialized(self.evidence_reply(reply))
                     continue
                 return parse(reply)
             except (ValueError,KeyError,TypeError,IndexError,AttributeError) as exc:
@@ -357,7 +367,9 @@ class BatchRevisionWorkbench(TrainEvidence):
         if reply.get("keep_parent") is True and reply.get("reason") and not reply.get("objects"):
             return reply
         validate_batch_effects(reply.get("batch_effects"),self.tasks)
-        focus = reply["focus"]
+        focus = reply.get("focus")
+        if not isinstance(focus,dict) or not {"task","event","observable"}.issubset(focus):
+            raise ValueError('focus needs three fields, for example {"task":"<current task ID>","event":1,"observable":"<downstream effect>"}.')
         task,index = focus["task"],focus["event"]
         if task not in self.tasks or type(index) is not int or not 0<=index<len(self.current_events[task]) or not focus.get("observable"):
             raise ValueError("The focus needs a current task, its real event index and an observable downstream result")
@@ -380,6 +392,9 @@ class BatchRevisionWorkbench(TrainEvidence):
         if path.exists():
             return read(path)
         packet = self.packet()
+        packet["local_27b_budget"] = {"fresh_judgments_per_round":FRESH_DECISION_LIMIT,
+            "draft_max_judgments":FRESH_DECISION_LIMIT//2,"open_generations":OPEN_GENERATION_LIMIT,
+            "output_tokens":PROBE_OUTPUT_LIMIT}
         choice_mode = self.study.settings.get("optimizer",{}).get("historical_choice")
         if choice_mode == SOLVED_FIRST_CHANGE:
             packet["historical_choice_preview"] = (
@@ -428,10 +443,10 @@ class BatchRevisionWorkbench(TrainEvidence):
         def decision(reply):
             choice = reply.get("use")
             if not reply.get("reason"):
-                raise ValueError("Explain the observed tradeoff")
+                raise ValueError('Provide the reason, for example {"use":"parent","reason":"<observed tradeoff>"}.')
             if choice in (*patches,"parent") and not reply.get("objects"):
                 return reply
-            if choice=="revise" and "revised" not in patches and (cost.get("fresh_decisions",0)<12 or cost.get("open_generations",0)<3):
+            if choice=="revise" and "revised" not in patches and (cost.get("fresh_decisions",0)<FRESH_DECISION_LIMIT or cost.get("open_generations",0)<OPEN_GENERATION_LIMIT):
                 if "batch_effects" in reply:
                     validate_batch_effects(reply["batch_effects"],self.tasks)
                 self.check_history_use(reply)
@@ -439,7 +454,10 @@ class BatchRevisionWorkbench(TrainEvidence):
                 if reply["objects"] != draft["objects"]:
                     return reply
             raise ValueError("Choose a tested version or parent. Only the first review can propose revised objects")
-        payload = {"parent":self.packet(),"draft":draft,"observations":trials}
+        payload = {"parent":self.packet(),"draft":draft,"observations":trials,
+                   "local_27b_remaining":{"fresh_judgments":FRESH_DECISION_LIMIT-cost.get("fresh_decisions",0),
+                   "open_generations":OPEN_GENERATION_LIMIT-cost.get("open_generations",0),
+                   "output_tokens":PROBE_OUTPUT_LIMIT-cost.get("output_tokens",0)}}
         review_path = self.folder/"review_choice.json"
         if review_path.exists():
             review = read(review_path)

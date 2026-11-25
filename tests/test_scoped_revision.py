@@ -282,12 +282,37 @@ class ScopedOptimizerTests(TestCase):
         account=b.study.solver.return_value
         end={"keep_parent":True,"reason":"No executable improvement"}
         account.turn.side_effect = [json.dumps({"read":["dsl"]})]*9+[json.dumps({"action_json":json.dumps(end)})]
-        with patch.object(b,"lookup",return_value=["public evidence"]) as lookup:
+        with patch.object(b,"lookup",return_value=[{"doc":"dsl","rows":["public evidence"],"next":None}]) as lookup:
             self.assertEqual(b.ask("draft",{},b.folder,b.validate_draft),end)
         self.assertEqual(lookup.call_count,9)
         last=account.turn.call_args
         self.assertIn("public evidence",last.args[1])
         self.assertIn("schema",last.kwargs)
+
+    def test_evidence_receipt_keeps_mixed_requests_overflow_and_page_cursors(self):
+        b=self.bench
+        b.docs={f"d{i}":["first","second"] for i in range(8)}
+        b.paths={}
+        b.__dict__["precedents"]=Mock()
+        b.precedents.related.return_value={"matches":[]}
+        requests=[{"doc":"d0","count":1},"d1","missing","d3","d4","d5","d6","d7"]
+        reply=b.evidence_reply({"read":requests,"find":{"doc":"d1","text":"first"},
+                                "related_train":{"task":"a_1","event":1}})
+        self.assertEqual([row["doc"] for row in reply["returned"]["read"]],["d0","d1","d3","d4","d5"])
+        self.assertEqual(reply["returned"]["find"][0]["index"],0)
+        self.assertEqual(reply["returned"]["related_train"],{"matches":[]})
+        self.assertEqual(reply["unexecuted"][0]["request"],"missing")
+        self.assertIn("example",reply["unexecuted"][0])
+        continued=[b.evidence_reply(q)["returned"]["read"] for q in reply["pending"]]
+        self.assertEqual(continued[0][0]["rows"][0]["text"],"second")
+        self.assertEqual([p["doc"] for p in continued[1]],["d6","d7"])
+        with self.assertRaisesRegex(ValueError,r"history_use\[0\].*event, shared_step, scope_difference.*Example"):
+            b.check_history_use({"history_use":[{"trace":"earlier/one"}]})
+
+    def test_draft_leaves_half_the_judgments_for_revision_and_skips_matched_guard(self):
+        self.assertEqual([c["decisions"] for c in probe_cases(self.draft)],[10,2])
+        self.assertEqual([c["decisions"] for c in probe_cases(self.draft,matched_preservation=True)],[12,0])
+        self.assertEqual([c["decisions"] for c in probe_cases(self.draft,True,spent=8)],[14,2])
 
     def test_candidate_evidence_cache_identifies_the_tested_objects_and_cases(self):
         from jev_harness.contrast_probes import compare_candidates

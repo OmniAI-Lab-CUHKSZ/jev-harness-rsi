@@ -5,7 +5,7 @@ from pathlib import Path
 
 from formal_run import read,save
 
-from .contrast_probes import compare_candidates
+from .contrast_probes import FRESH_DECISION_LIMIT, compare_candidates
 from .formal_optimizer import read_events
 from .history_impact import assess, parameter_views, trace_sites
 from .menu_preview import initial_change
@@ -14,13 +14,15 @@ from .train_evidence import serialized
 from .trace_comparison import ParentPath, compare_path
 
 
-def probe_cases(draft, revised=False, protect_generation=False):
+def probe_cases(draft, revised=False, protect_generation=False, *, spent=0, matched_preservation=False):
+    available = max(0, FRESH_DECISION_LIMIT - spent) if revised else FRESH_DECISION_LIMIT // 2
+    reserve = min(2, available) if draft.get("preserve_task") and not matched_preservation else 0
     cases = [{"trace":"current/"+draft["focus"]["task"],"anchor":"start","relation":"focus",
-              "expect":draft["focus"]["observable"],"decisions":8 if not revised else 12,
+              "expect":draft["focus"]["observable"],"decisions":available-reserve,
               "cells":1 if revised or protect_generation else 2}]
     if draft.get("preserve_task"):
         cases.append({"trace":"current/"+draft["preserve_task"],"anchor":"start","relation":"preserve",
-                      "expect":"Retain the appropriate path on the different request","decisions":2,
+                      "expect":"Retain the appropriate path on the different request","decisions":reserve,
                       "cells":1 if protect_generation else 0})
     return cases
 
@@ -211,7 +213,9 @@ def preview_batch(bench,proposal,worker,key,prior_cost=None):
     preservation["suggested_task"] = proposal.get("preserve_task")
     selected = preservation["task"]
     protect = bool(kept and kept["cells"]) if resuming else selected in preservation["changed_solved_tasks"]
-    cases = probe_cases({**proposal,"preserve_task":selected},revised=prior_cost is not None,protect_generation=protect)
+    cases = probe_cases({**proposal,"preserve_task":selected},revised=prior_cost is not None,
+                        protect_generation=protect,spent=(prior_cost or {}).get("fresh_decisions",0),
+                        matched_preservation=current.get(selected,{}).get("status")=="equal_on_record")
     report = compare_candidates(bench,{"alternatives":[{**proposal,"id":key}],
                                       "cases":cases},
                                 worker,folder=folder,prior_cost=prior_cost,matched_paths=current,

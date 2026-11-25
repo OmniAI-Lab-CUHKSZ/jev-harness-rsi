@@ -92,6 +92,26 @@ class PublicRunTests(unittest.TestCase):
             self.assertEqual(include_retries(root, row)["output_tokens"], 15)
             self.assertEqual(include_retries(root, read(base / "record.json"))["output_tokens"], 15)
 
+    def test_optimizer_restart_reuses_only_matching_ordered_harness_and_parent_pair(self):
+        from phase1_run import previous_revisit_evaluation, train_entry_stage
+        with TemporaryDirectory() as directory:
+            root=Path(directory)
+            original,new="b04_revisit03","b04_24j_revisit03"
+            settings=read(RESOURCES/"experiment.json")
+            initialize(root,settings,revisit_after=(4,3),restart_revisit="24j")
+            resumed=read(RESOURCES/"experiment.json")
+            initialize(root,resumed)
+            self.assertEqual(train_entry_stage(new,"b02r02",3,resumed),original+"_b02r02_entry")
+            save(root/"batches"/original/"entry.json",{"version":"b02r02"})
+            old_round,new_round=original+"r01",new+"r01"
+            for name,value in ((old_round,{"cards":{"a":1,"b":2}}),(new_round,{"cards":{"a":1,"b":2}}),
+                               ("b02r02",{"cards":{}}),("other",{"cards":{"c":3}})):
+                save(root/"versions"/(name+".json"),value)
+            self.assertEqual(previous_revisit_evaluation(root,original,new_round,"b02r02"),(old_round,old_round))
+            self.assertEqual(previous_revisit_evaluation(root,original,new_round,"other"),(old_round,new_round))
+            save(root/"versions"/(new_round+".json"),{"cards":{"b":2,"a":1}})
+            self.assertEqual(previous_revisit_evaluation(root,original,new_round,"b02r02"),(new_round,new_round))
+
     def test_cuda_graph_measures_actual_dev_winner_once_before_revisit_and_reuses_same_mode_on_resume(self):
         for old_candidate_wins in (True, False):
             with self.subTest(old_candidate_wins=old_candidate_wins), TemporaryDirectory() as directory:

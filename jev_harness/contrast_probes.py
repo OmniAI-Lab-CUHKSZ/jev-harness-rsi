@@ -18,6 +18,11 @@ from .transport import WorkerError, WorkerUnavailable
 from .trace_comparison import different_fields
 
 
+FRESH_DECISION_LIMIT = 24
+OPEN_GENERATION_LIMIT = 3
+PROBE_OUTPUT_LIMIT = 4096
+
+
 def request_key(operation, values):
     return json.dumps([operation,values],sort_keys=True,ensure_ascii=False,separators=(",",":"))
 
@@ -56,16 +61,16 @@ class MeteredModel:
             self.cost["cached_decisions"] += 1
             self.events.append({"source":"exact_request_cache","op":op})
             return deepcopy(self.ballots[key])
-        balance = 4096-self.cost["output_tokens"]
+        balance = PROBE_OUTPUT_LIMIT-self.cost["output_tokens"]
         if op == "decide":
-            if self.remaining <= 0 or self.cost["fresh_decisions"] >= 12:
+            if self.remaining <= 0 or self.cost["fresh_decisions"] >= FRESH_DECISION_LIMIT:
                 raise ProbeComplete("Local decision budget reached")
             if values.get("thinking") == "auto" and balance < values.get("think_budget",256):
                 raise ProbeComplete("Insufficient remaining output budget for an official adaptive choice")
             self.remaining -= 1
             self.cost["fresh_decisions"] += 1
         else:
-            if self.generations_left <= 0 or self.cost["open_generations"] >= 3 or balance <= 0:
+            if self.generations_left <= 0 or self.cost["open_generations"] >= OPEN_GENERATION_LIMIT or balance <= 0:
                 raise ProbeComplete("Generation boundary or shared generation budget reached")
             self.generations_left -= 1
             self.cost["open_generations"] += 1
@@ -260,7 +265,7 @@ def compare_candidates(bench,draft,worker,*,folder=None,prior_cost=None,matched_
                 pending -= 1
                 continue
             reader = ExactParentReplay(es)
-            allowance = case.get("decisions",max(1,(12-cost["fresh_decisions"])//pending))
+            allowance = case.get("decisions",max(0,(FRESH_DECISION_LIMIT-cost["fresh_decisions"])//pending))
             cells = case.get("cells",case.get("generation") is True)
             if resumable:
                 start = trial/"cost_at_start.json"

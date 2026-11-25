@@ -16,6 +16,19 @@ class Respond:
 
 
 class ContrastProbeTests(unittest.TestCase):
+    def test_twenty_four_fresh_choices_are_shared_and_cached_choices_are_free(self):
+        remote,cost = Respond(),Counter()
+        draft = MeteredModel(remote,{},cost,12,False)
+        for number in range(12):
+            draft.request("decide",question=str(number))
+        revised = MeteredModel(remote,{},cost,24,False)
+        for number in range(12,24):
+            revised.request("decide",question=str(number))
+        revised.request("decide",question="23")
+        with self.assertRaises(ProbeComplete):
+            revised.request("decide",question="24")
+        self.assertEqual((len(remote.calls),cost["cached_decisions"],cost["output_tokens"]),(24,1,0))
+
     def test_changed_evidence_or_skill_requires_a_new_decision(self):
         values = {"question":"Which source?","options":["Notes","Files"],"state":{"available":2},"skill":"Use live inputs"}
         event = {"operation":"decide","request":{**values,"purpose":STEP_REVIEW},"response":{"thinking_used":True,"index":0}}

@@ -18,11 +18,37 @@ def batch_ids(groups):
 
 
 def train_entry_stage(label, version, batch, settings):
+    if settings.get("restart_revisit") and settings.get("revisit_after"):
+        after, source = settings["revisit_after"]
+        if label == f"b{after:02d}_{settings['restart_revisit']}_revisit{source:02d}":
+            label = f"b{after:02d}_revisit{source:02d}"
     continuation = settings.get("execution_from_next_batch", {})
     if batch == continuation.get("from_batch"):
         threshold = str(continuation["step_review_threshold"]).replace(".", "p")
         return f"{label}_{version}_review_{threshold}_entry"
     return f"{label}_{version}_entry"
+
+
+def previous_revisit_evaluation(root, old_visit, candidate, parent):
+    """An interrupted visit can supply a first pass, and same-parent paired confirmations."""
+    previous = root/"batches"/old_visit
+    if not (previous/"entry.json").is_file():
+        return candidate, candidate
+    versions = root/"versions"
+    proposed = (versions/(candidate+".json")).read_bytes()
+    prior_parent = read(previous/"entry.json")["version"]
+    for rnd in range(1, MAX_REVISIONS+1):
+        name = f"{old_visit}r{rnd:02d}"
+        old = versions/(name+".json")
+        # Menu order is observable. Compare the saved definitions, including insertion order.
+        if old.is_file() and old.read_bytes() == proposed:
+            same_parent = (prior_parent == parent or
+                           (versions/(prior_parent+".json")).read_bytes() == (versions/(parent+".json")).read_bytes())
+            return name, name if same_parent else candidate
+        result = previous/name/"result.json"
+        if result.is_file() and read(result)["accepted"]:
+            prior_parent = name
+    return candidate, candidate
 
 
 def completed_train_entries(root, label, checkpoint, settings):
@@ -304,6 +330,8 @@ def run(study, count, rounds, formal, *, revisit_after_six=(), evaluate_test=Tru
     lib = read(root/"versions"/(version+".json"))
     visits = []
     revisit = study.settings.get("revisit_after")
+    retry = study.settings.get("restart_revisit")
+    retry_visit = original_visit = None
     for batch in range(1, count + 1):
         label = "b07_after_revisits" if batch == 7 and revisit_after_six else f"b{batch:02d}"
         visits.append((batch, label))
@@ -311,7 +339,10 @@ def run(study, count, rounds, formal, *, revisit_after_six=(), evaluate_test=Tru
             visits.extend((source, f"b06_revisit{source:02d}") for source in revisit_after_six)
         if revisit and batch == revisit[0]:
             source = revisit[1]
-            visits.append((source, f"b{batch:02d}_revisit{source:02d}"))
+            original_visit = f"b{batch:02d}_revisit{source:02d}"
+            if retry:
+                retry_visit = f"b{batch:02d}_{retry}_revisit{source:02d}"
+            visits.append((source, retry_visit or original_visit))
     completed = [item.get("visit", f"b{item['batch']:02d}") for item in checkpoints]
     if completed != [label for _, label in visits[:len(completed)]]:
         raise ValueError("The saved batch visits are not a prefix of the requested schedule")
@@ -420,14 +451,18 @@ def run(study, count, rounds, formal, *, revisit_after_six=(), evaluate_test=Tru
                 continue
             candidate, edits = install(lib, proposal, sources, study.functions)
             save(root/"versions"/(candidate_version+".json"), candidate)
-            parent_rows, candidate_rows = study.candidate_batch(ids, candidate_version, candidate, rows, lib)
+            first_pass = comparison_stage = candidate_version
+            if label == retry_visit:
+                first_pass, comparison_stage = previous_revisit_evaluation(root,original_visit,candidate_version,prior_ver)
+            pairing = {"matched_parent_stage":comparison_stage+"_matched_parent"} if first_pass != comparison_stage else {}
+            parent_rows, candidate_rows = study.candidate_batch(ids, first_pass, candidate, rows, lib, **pairing)
             comparison = gain(parent_rows, candidate_rows)
             keep_tie = comparison["tied"] and (optimizer.get("batch_revision") is True or optimizer.get("fragment_trials") is True
                                                or bool(revisit_after_six) and position >= 6)
             accepted = quality(candidate_rows) > quality(parent_rows) or keep_tie
             train_review = None
             if review_enabled:
-                train_review = review_versions(study, candidate_version, folder/"paired_selection.json",
+                train_review = review_versions(study, comparison_stage, folder/"paired_selection.json",
                                               parent_rows, candidate_rows, lib, candidate)
                 accepted = train_review["accepted"]
             record = {"batch":batch, "visit":label, "round":rnd, "parent":prior_ver, "candidate":candidate_version,
@@ -435,6 +470,8 @@ def run(study, count, rounds, formal, *, revisit_after_six=(), evaluate_test=Tru
                       "accepted":accepted, "comparison":comparison,
                       "parent_metrics":summary(parent_rows), "candidate_metrics":summary(candidate_rows),
                       "train_traces":[r["trace_path"] for r in candidate_rows],"parent_traces":[r["trace_path"] for r in parent_rows]}
+            if first_pass != candidate_version:
+                record.update(first_pass_stage=first_pass,confirmation_stage=comparison_stage)
             if train_review is not None:
                 record["paired_selection"] = train_review
             for key in ("diagnosis","initial_diagnosis"):

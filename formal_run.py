@@ -243,13 +243,13 @@ class Study:
         save(self.root/"runs"/stage/"aggregate.json", summary)
         return rows
 
-    def candidate_batch(self, tasks, stage, proposed, parent, library):
+    def candidate_batch(self, tasks, stage, proposed, parent, library, *, matched_parent_stage=None):
         devices = {w.gpu: w for w in self.workers if w.gpu and ":" in w.gpu}
         if not devices:
             return parent, self.batch(tasks, stage, library=proposed)
         primary_node = next(iter(devices)).split(":", 1)[0]
         previous = {row["task_id"]: row for row in parent}
-        reference_stage = stage+"_matched_parent"
+        reference_stage = matched_parent_stage or stage+"_matched_parent"
 
         def node(row):
             return (row.get("gpu") or "").rpartition(":")[0] or primary_node
