@@ -8,6 +8,7 @@ from string import Template
 from formal_run import read, save
 from phase1_run import design_manifest, initial_harness, run
 from .allocation import SharedStudy
+from .paired_selection import INITIAL_PLUS_ONE, TWO_REPEATS_ONLY
 
 
 PACKAGE = Path(__file__).resolve().parent
@@ -35,10 +36,12 @@ def load_connections(path):
     return connections
 
 
-def initialize(root, settings):
+def initialize(root, settings, *, confirmation_scoring=None):
     config_path = root / "configuration.json"
     if config_path.is_file():
         saved = read(config_path)
+        if "confirmation_scoring" in saved:
+            settings["confirmation_scoring"] = saved["confirmation_scoring"]
         if "historical_choice" not in saved.get("optimizer", {}):
             settings["optimizer"].pop("historical_choice", None)
         elif isinstance(saved["optimizer"]["historical_choice"], bool):
@@ -54,6 +57,10 @@ def initialize(root, settings):
             settings.pop("inference_schedule", None)
         if saved != settings:
             raise ValueError("Choose a separate output directory for a different experiment configuration")
+    elif settings.get("paired_selection_from_batch") is not None:
+        settings["confirmation_scoring"] = TWO_REPEATS_ONLY
+    if confirmation_scoring is not None:
+        settings["confirmation_scoring"] = confirmation_scoring
     save(config_path, settings)
     reference = root / "dev_reference.json"
     if not reference.exists():
@@ -82,6 +89,8 @@ def main(argv=None):
             sub.add_argument("--gpu-name", default="A800", help="GPU name substring for automatic allocation")
             sub.add_argument("--paired-selection-from-batch", type=int, choices=range(1, 11),
                              help="First Train batch and Dev selection to use conditional paired confirmation")
+            sub.add_argument("--confirmation-scoring", choices=(INITIAL_PLUS_ONE, TWO_REPEATS_ONLY),
+                             help="Scoring for pending and future confirmations; completed selections are retained")
     args = parser.parse_args(argv)
     settings = read(RESOURCES / "experiment.json")
     manifest = design_manifest()
@@ -110,7 +119,9 @@ def main(argv=None):
             first_review = read(root / "configuration.json").get("paired_selection_from_batch")
         if first_review is not None:
             settings["paired_selection_from_batch"] = first_review
-    initialize(root, settings)
+        elif args.confirmation_scoring is not None:
+            parser.error("--confirmation-scoring requires conditional paired selection")
+    initialize(root, settings, confirmation_scoring=getattr(args, "confirmation_scoring", None))
     study = SharedStudy(root, settings, connections, devices=devices, max_gpus=getattr(args, "max_gpus", 1),
                         gpu_name=getattr(args, "gpu_name", "A800"))
     try:

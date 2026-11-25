@@ -174,7 +174,8 @@ class TrainEvidence:
                 pair = revision.get("paired_selection", {}).get("repeats", {}).get(task)
                 if pair:
                     item["last_measured_round"]["confirmation"] = [
-                        {k:row[k] for k in ("success","output_tokens","trace_path")} for row in pair]
+                        {k:row[k] for k in ("arm","confirmation_pass","success","output_tokens","trace_path")
+                         if k in row} for row in pair]
             break
 
     def paired_paths(self, traces):

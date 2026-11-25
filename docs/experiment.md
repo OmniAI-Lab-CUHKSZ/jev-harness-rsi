@@ -62,7 +62,7 @@ The workbench sends distinct model requests to available sessions and shares exa
 
 ### Comparing the 0.2.2 and 0.2.3 editors
 
-Version 0.2.2 observed one changed menu per round, on a successful earlier Train recording prioritized by Sol's citations and the training index. Version 0.2.3 inspects the first change on one successful recording per eligible task, for both the draft and any revision. The two versions use the same 27B executor, adaptive policy, edit allowance and Train/Dev selection rule.
+Version 0.2.2 observed one changed menu per round, on a successful earlier Train recording prioritized by Sol's citations and the training index. Version 0.2.3 inspects the first change on one successful recording per eligible task, for both the draft and any revision. The two versions use the same 27B executor, adaptive policy and edit allowance. In the formal 0.2.3 run, Batch 2 Train used the original selection rule. Starting at Batch 2 Dev, each flagged task's score is the mean of two new paired confirmations. The switch was specified after the Batch 2 Dev initial panel became available. [Selection procedure](reproduce.md)
 
 We ran both historical checks on the same two recorded Batch 2 drafts, with nine previously solved Train tasks available to each. The table counts calls to the 27B decision endpoint and its generated reasoning tokens. Shared inputs count once.
 

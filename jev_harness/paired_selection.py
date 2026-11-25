@@ -6,6 +6,10 @@ from formal_run import save
 from .formal_optimizer import read_events
 
 
+INITIAL_PLUS_ONE = "initial_plus_one"
+TWO_REPEATS_ONLY = "two_repeats_only"
+
+
 def _actions(events):
     for event in events:
         kind = event["event"]
@@ -73,15 +77,18 @@ def initial_comparison(root, parent, candidate):
     return pairs
 
 
-def review_scores(pairs, repeats):
+def review_scores(pairs, repeats, scoring=INITIAL_PLUS_ONE):
     scores = [[0, 0], [0, 0]]
     for task, row in pairs.items():
         for arm, score in enumerate(scores):
             success, tokens = row["success"][arm], row["tokens"][arm]
             if task in repeats:
-                extra = repeats[task][arm]
-                success = (success + int(extra["success"])) / 2
-                tokens = (tokens + extra["output_tokens"]) / 2
+                observations = [(int(r["success"]), r["output_tokens"]) for r in repeats[task][arm::2]]
+                if scoring == INITIAL_PLUS_ONE:
+                    observations.insert(0, (success, tokens))
+                first, second = observations
+                success = (first[0] + second[0]) / 2
+                tokens = (first[1] + second[1]) / 2
             score[0] += success
             score[1] -= tokens
     return scores
@@ -96,8 +103,8 @@ def accuracy_review(pairs):
     return bounds, tasks
 
 
-def cost_review(pairs, repeats):
-    parent, candidate = review_scores(pairs, repeats)
+def cost_review(pairs, repeats, scoring=INITIAL_PLUS_ONE):
+    parent, candidate = review_scores(pairs, repeats, scoring)
     if parent[0] != candidate[0]:
         return []
     pending = [t for t,r in pairs.items() if t not in repeats and r["same_request_fork"]
@@ -111,10 +118,12 @@ def cost_review(pairs, repeats):
 
 def select_with_review(study, stage, report_path, parent, candidate, paired_rerun):
     pairs = initial_comparison(study.root, parent, candidate)
+    scoring = study.settings.get("confirmation_scoring", INITIAL_PLUS_ONE)
+    passes = {INITIAL_PLUS_ONE: 1, TWO_REPEATS_ONLY: 2}[scoring]
     repeats = {}
     first_seed = {r["task_id"]: r["seed"] for r in parent}
     bounds, accuracy_tasks = accuracy_review(pairs)
-    report = {"stage": stage, "initial_scores": review_scores(pairs, {}),
+    report = {"stage": stage, "confirmation_scoring": scoring, "initial_scores": review_scores(pairs, {}),
               "accuracy_difference_bounds": bounds, "initial_pairs": pairs,
               "accuracy_review_tasks": accuracy_tasks, "cost_review_tasks": [],
               "repeats": repeats}
@@ -122,22 +131,25 @@ def select_with_review(study, stage, report_path, parent, candidate, paired_reru
     def confirm(tasks):
         if not tasks:
             return
-        save(report_path, report)
-        study.status("paired_selection_review", comparison=stage, tasks=tasks)
-        arms = paired_rerun(tasks)
-        for task, left, right in zip(tasks, *arms, strict=True):
-            if (left["task_id"] != task or right["task_id"] != task or left["seed"] != right["seed"]
-                    or left["seed"] != first_seed[task] or left["gpu"] != right["gpu"]):
-                raise ValueError(f"Unmatched confirmation for {task}")
-            repeats[task] = [{k:r[k] for k in ("success","output_tokens","gpu","trace_path")}
-                             for r in (left, right)]
+        for pass_number in range(1, passes + 1):
+            save(report_path, report)
+            study.status("paired_selection_review", comparison=stage, tasks=tasks, confirmation_pass=pass_number)
+            arms = paired_rerun(tasks, pass_number) if passes == 2 else paired_rerun(tasks)
+            for task, left, right in zip(tasks, *arms, strict=True):
+                if (left["task_id"] != task or right["task_id"] != task or left["seed"] != right["seed"]
+                        or left["seed"] != first_seed[task] or left["gpu"] != right["gpu"]):
+                    raise ValueError(f"Unmatched confirmation for {task}")
+                observations = repeats.setdefault(task, [])
+                for arm, row in (("parent", left), ("candidate", right)):
+                    sample = {k:row[k] for k in ("success", "output_tokens", "gpu", "trace_path")}
+                    observations.append(dict(sample, arm=arm, confirmation_pass=pass_number))
 
     confirm(accuracy_tasks)
-    report["cost_review_tasks"] = cost_review(pairs, repeats)
+    report["cost_review_tasks"] = cost_review(pairs, repeats, scoring)
     confirm(report["cost_review_tasks"])
-    left, right = review_scores(pairs, repeats)
+    left, right = review_scores(pairs, repeats, scoring)
     report.update(parent_score=left, candidate_score=right, accepted=right >= left,
-                  repeat_rollouts=2 * len(repeats),
+                  repeat_rollouts=sum(map(len, repeats.values())),
                   repeat_output_tokens=sum(r["output_tokens"] for pair in repeats.values() for r in pair))
     save(report_path, report)
     return {k:v for k,v in report.items() if k != "initial_pairs"}

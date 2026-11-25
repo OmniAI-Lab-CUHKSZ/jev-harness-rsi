@@ -5,9 +5,9 @@ from unittest import TestCase
 from unittest.mock import Mock, patch
 
 from formal_run import read, save
-from jev_harness.cli import RESOURCES
-from jev_harness.paired_selection import accuracy_review, cost_review, first_fork, review_scores
-from phase1_run import run
+from jev_harness.cli import RESOURCES, initialize
+from jev_harness.paired_selection import TWO_REPEATS_ONLY, accuracy_review, cost_review, first_fork, review_scores
+from phase1_run import review_versions, run
 
 
 def generation(prompt, text):
@@ -83,3 +83,74 @@ class PairedSelectionTests(TestCase):
                 self.assertEqual(checkpoint["dev_selection"]["paired_selection"]["repeat_output_tokens"],120)
                 run(study, 1, 1, True, evaluate_test=False)
                 self.assertEqual(rerun.call_count,2)
+
+    def test_two_pass_cost_scores_and_initially_identical_tasks(self):
+        pairs = {"a":{"success":[1,1], "tokens":[15,7], "same_request_fork":"generation_1"},
+                 "b":{"success":[1,1], "tokens":[3,4], "same_request_fork":None}}
+        self.assertEqual(cost_review(pairs, {}, TWO_REPEATS_ONLY), ["a"])
+        repeats = {"a":[{"success":True,"output_tokens":4}, {"success":True,"output_tokens":10},
+                        {"success":True,"output_tokens":8}, {"success":True,"output_tokens":2}]}
+        self.assertEqual(review_scores(pairs, repeats, TWO_REPEATS_ONLY), [[2,-9], [2,-10]])
+        self.assertEqual(cost_review(pairs, repeats, TWO_REPEATS_ONLY), [])
+
+    def test_pending_dev_reuses_first_pass_reverses_arms_and_resumes_second_pass(self):
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            study = Mock(root=root, settings={"confirmation_scoring":TWO_REPEATS_ONLY})
+            worker = Mock(gpu="node:1")
+            study.execute_preferred.side_effect = lambda jobs, op, pref: [op(job, worker) for job in jobs]
+            def record(stage, task, success, tokens):
+                trace = Path("runs", stage, task, "attempt_1", "trace.jsonl")
+                row = {"task_id":task, "seed":1, "gpu":worker.gpu, "success":success,
+                       "output_tokens":tokens, "trace_path":trace.as_posix()}
+                save((root/trace).parents[1]/"record.json", row)
+                (root/trace).parent.mkdir()
+                (root/trace).write_text(json.dumps(generation("same", str(success)))+"\n",encoding="utf-8")
+                return row
+            parent = [record("p","flip",True,8000), record("p","fixed",True,10)]
+            candidate = [record("c","flip",False,13), record("c","fixed",True,10)]
+            record("c_review_parent","flip",False,130)
+            record("c_review_candidate","flip",True,50)
+            executed, warming = [], True
+            def rollout(task, stage, variant, library, *, workers):
+                nonlocal warming
+                path = root/"runs"/stage/task/"record.json"
+                if path.exists():
+                    return read(path)
+                if stage == "c_review_parent_2" and warming:
+                    warming = False
+                    raise InterruptedError()
+                executed.append(stage)
+                return record(stage, task, True, 110 if library=="parent" else 70)
+            study.run_task.side_effect = rollout
+            report_path = root/"selection.json"
+            def select():
+                return review_versions(study, "c", report_path, parent, candidate, "parent", "candidate")
+            with self.assertRaises(InterruptedError):
+                select()
+            self.assertNotIn("accepted", read(report_path))
+            result = select()
+            self.assertEqual(executed, ["c_review_candidate_2","c_review_parent_2"])
+            self.assertEqual(result["parent_score"], [1.5,-130])
+            self.assertEqual(result["candidate_score"], [2,-70])
+            self.assertTrue(result["accepted"])
+            self.assertEqual(result["repeat_rollouts"], 4)
+            self.assertEqual(result["repeat_output_tokens"], 360)
+            observations = result["repeats"]["flip"]
+            self.assertEqual([(r["confirmation_pass"],r["arm"]) for r in observations],
+                             [(1,"parent"),(1,"candidate"),(2,"parent"),(2,"candidate")])
+            self.assertEqual(len({r["trace_path"] for r in observations}), 4)
+
+    def test_new_run_default_and_explicit_scoring_cutover(self):
+        def config():
+            return dict(read(RESOURCES/"experiment.json"), paired_selection_from_batch=2)
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            initialize(root, config())
+            self.assertEqual(read(root/"configuration.json")["confirmation_scoring"], TWO_REPEATS_ONLY)
+            save(root/"configuration.json", config())
+            initialize(root, config())
+            self.assertNotIn("confirmation_scoring", read(root/"configuration.json"))
+            initialize(root, config(), confirmation_scoring=TWO_REPEATS_ONLY)
+            initialize(root, config())
+            self.assertEqual(read(root/"configuration.json")["confirmation_scoring"], TWO_REPEATS_ONLY)

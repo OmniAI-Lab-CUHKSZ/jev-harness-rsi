@@ -158,7 +158,7 @@ def paired_holdout(study, ids, version, library):
     return paired_rollouts(study, ids, stages, {"A":"A", "B":"B"}, {"A":None, "B":library})
 
 
-def paired_rollouts(study, ids, stages, variants, libraries):
+def paired_rollouts(study, ids, stages, variants, libraries, *, preferred_gpus=None, reverse_order=False):
     """Alternate arm order and run each task twice on one GPU in freshly prepared worlds."""
     cached = {}
     if hasattr(study, "root"):
@@ -177,7 +177,8 @@ def paired_rollouts(study, ids, stages, variants, libraries):
         previous = cached.get(task, {"A": {}, "B": {}})
         device = getattr(worker, "gpu", None)
         completed = next((gpu for gpu in previous["A"] if gpu in previous["B"]), None)
-        for arm in (("A","B") if i%2==0 else ("B","A")):
+        parent_first = (i % 2 == 0) != reverse_order
+        for arm in (("A","B") if parent_first else ("B","A")):
             stage = previous[arm].get(completed or device, stages[arm])
             if device and not completed and device not in previous[arm] and stages[arm] in previous[arm].values():
                 stage += "_paired_" + device.replace(":", "_")
@@ -185,7 +186,8 @@ def paired_rollouts(study, ids, stages, variants, libraries):
         return out["A"],out["B"]
     jobs = list(enumerate(ids))
     if hasattr(study, "execute_preferred"):
-        preferred = [next((gpu for arm in cached.get(task, {}).values() for gpu in arm), None) for task in ids]
+        preferred = [next((gpu for arm in cached.get(task, {}).values() for gpu in arm),
+                          (preferred_gpus or {}).get(task)) for task in ids]
         pairs = study.execute_preferred(jobs, pair, preferred if any(preferred) else None)
     else:
         pairs = study.execute_jobs(jobs, pair)
@@ -193,9 +195,17 @@ def paired_rollouts(study, ids, stages, variants, libraries):
 
 
 def review_versions(study, stage, path, parents, candidates, parent_lib, candidate_lib):
-    def rerun(tasks):
-        stages = {"A": stage+"_review_parent", "B": stage+"_review_candidate"}
-        return paired_rollouts(study, tasks, stages, {"A":"B","B":"B"}, {"A":parent_lib,"B":candidate_lib})
+    first_gpus = {}
+    def rerun(tasks, pass_number=1):
+        suffix = "" if pass_number == 1 else "_2"
+        stages = {"A": stage+"_review_parent"+suffix, "B": stage+"_review_candidate"+suffix}
+        variants, libraries = {"A":"B","B":"B"}, {"A":parent_lib,"B":candidate_lib}
+        if pass_number == 1:
+            arms = paired_rollouts(study, tasks, stages, variants, libraries)
+            first_gpus.update((r["task_id"], r["gpu"]) for r in arms[0])
+            return arms
+        return paired_rollouts(study, tasks, stages, variants, libraries,
+                               preferred_gpus=first_gpus, reverse_order=True)
     return select_with_review(study, stage, path, parents, candidates, rerun)
 
 
