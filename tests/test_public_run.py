@@ -112,6 +112,59 @@ class PublicRunTests(unittest.TestCase):
             save(root/"versions"/(new_round+".json"),{"cards":{"b":2,"a":1}})
             self.assertEqual(previous_revisit_evaluation(root,original,new_round,"b02r02"),(new_round,new_round))
 
+    def test_extend_completed_third_revisit_with_fourth_before_pending_fifth(self):
+        for wins_dev in (True, False):
+            with self.subTest(wins_dev=wins_dev), TemporaryDirectory() as directory:
+                root = Path(directory)
+                config = lambda: read(RESOURCES / "experiment.json")
+                initial = config()
+                initialize(root, initial, revisit_after=(4, 3), restart_revisit="24j", cuda_graph_after=4)
+                study = Mock(root=root, settings=initial, functions=[])
+                measured = {}
+                def panel(tasks, stage, library):
+                    if stage not in measured:
+                        successes = 2 if stage == "dev_h00_cuda_graph" else 3 if wins_dev else 1
+                        measured[stage] = scored(tasks, stage, successes, 10)
+                    return measured[stage]
+                study.batch.side_effect = panel
+                study.candidate_batch.side_effect = lambda tasks, stage, candidate, parents, lib: (
+                    parents, scored(tasks, stage, len(tasks), 8))
+                keep = {"keep_parent":True, "reason":"Retain this round's parent"}
+                with patch("jev_harness.phase1_optimizer.propose_one", return_value=keep):
+                    run(study, 4, 2, True, evaluate_test=False)
+                prefix = read(root / "checkpoints.json")
+                self.assertEqual(prefix[-1]["visit"], "b04_24j_revisit03")
+                fifth_tasks = design_manifest()["train_batches"][4]["tasks"]
+                panel(fifth_tasks, "b05_h00_entry", {})
+                # A pending Sol decision was made before the additional fourth visit.
+                save(root / "batches/b05/b05r01/proposal.json", keep)
+                initialize(root, config(), revisit_after=(4, 3, 4))
+                resumed = config()
+                initialize(root, resumed)
+                study.settings = resumed
+                attempts = []
+                def propose(study, lib, rows, history, folder, sources):
+                    attempts.append(folder.name)
+                    if folder.name == "b04_revisit04r02":
+                        return {"objects":[{"kind":"handoff","name":"default","value":{"skill":"Use the scoped result."}}]}
+                    return keep
+                study.batch.reset_mock()
+                with patch("jev_harness.phase1_optimizer.propose_one", side_effect=propose):
+                    run(study, 5, 2, True, evaluate_test=False)
+                    run(study, 5, 2, True, evaluate_test=False)
+                visits = read(root / "checkpoints.json")
+                self.assertEqual(visits[:-2], prefix)
+                self.assertEqual([v["visit"] for v in visits[-2:]], ["b04_revisit04", "b05_after_repeat04"])
+                self.assertEqual(attempts, ["b04_revisit04r01","b04_revisit04r02",
+                                            "b05_after_repeat04r01","b05_after_repeat04r02"])
+                winner = "b04_revisit04r02" if wins_dev else "h00"
+                self.assertEqual(visits[-1]["entry_version"], winner)
+                stages = [call.args[1] for call in study.batch.call_args_list]
+                self.assertEqual(stages, ["b04_revisit04_h00_entry", "dev_h00_cuda_graph",
+                                          "dev_b04_revisit04r02_cuda_graph", f"b05_{winner}_entry"])
+                with self.assertRaisesRegex(ValueError, "already scored"):
+                    initialize(root, config(), revisit_after=(4, 3, 4, 2))
+
     def test_cuda_graph_measures_actual_dev_winner_once_before_revisit_and_reuses_same_mode_on_resume(self):
         for old_candidate_wins in (True, False):
             with self.subTest(old_candidate_wins=old_candidate_wins), TemporaryDirectory() as directory:

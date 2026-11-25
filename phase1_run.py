@@ -18,8 +18,11 @@ def batch_ids(groups):
 
 
 def train_entry_stage(label, version, batch, settings):
+    # An inserted visit changes the next Sol round's history. Its online entry
+    # panel still uses the same task list, engine and version-specific stage.
+    label = label.partition("_after_repeat")[0]
     if settings.get("restart_revisit") and settings.get("revisit_after"):
-        after, source = settings["revisit_after"]
+        after, source = settings["revisit_after"][:2]
         if label == f"b{after:02d}_{settings['restart_revisit']}_revisit{source:02d}":
             label = f"b{after:02d}_revisit{source:02d}"
     continuation = settings.get("execution_from_next_batch", {})
@@ -334,6 +337,8 @@ def run(study, count, rounds, formal, *, revisit_after_six=(), evaluate_test=Tru
     retry_visit = original_visit = None
     for batch in range(1, count + 1):
         label = "b07_after_revisits" if batch == 7 and revisit_after_six else f"b{batch:02d}"
+        if revisit and len(revisit) > 2 and batch == revisit[0] + 1:
+            label = f"{label}_after_repeat{revisit[-1]:02d}"
         visits.append((batch, label))
         if batch == 6:
             visits.extend((source, f"b06_revisit{source:02d}") for source in revisit_after_six)
@@ -343,6 +348,7 @@ def run(study, count, rounds, formal, *, revisit_after_six=(), evaluate_test=Tru
             if retry:
                 retry_visit = f"b{batch:02d}_{retry}_revisit{source:02d}"
             visits.append((source, retry_visit or original_visit))
+            visits.extend((extra, f"b{batch:02d}_revisit{extra:02d}") for extra in revisit[2:])
     completed = [item.get("visit", f"b{item['batch']:02d}") for item in checkpoints]
     if completed != [label for _, label in visits[:len(completed)]]:
         raise ValueError("The saved batch visits are not a prefix of the requested schedule")

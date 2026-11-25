@@ -68,20 +68,24 @@ def initialize(root, settings, *, confirmation_scoring=None, revisit_after=None,
     if confirmation_scoring is not None:
         settings["confirmation_scoring"] = confirmation_scoring
     if revisit_after is not None:
-        after, source = revisit_after
-        if not 1 <= source < after <= len(settings["batches"]):
-            raise ValueError("The repeated Train batch must precede the batch after which it runs")
-        if "revisit_after" in settings and settings["revisit_after"] != [after, source]:
-            raise ValueError("This run already has a different scheduled Train revisit")
+        after, *sources = revisit_after
+        if not sources or not 1 <= after <= len(settings["batches"]) or any(not 1 <= source <= after for source in sources):
+            raise ValueError("Choose one or more Train batches already visited at the insertion point")
+        if len(sources) != len(set(sources)):
+            raise ValueError("List each Train batch once in the revisit sequence")
+        requested = [after, *sources]
+        saved_visits = settings.get("revisit_after", [])
+        if requested[:len(saved_visits)] != saved_visits:
+            raise ValueError("An existing revisit sequence can only be extended")
         checkpoints = root / "checkpoints.json"
-        if ("revisit_after" not in settings and checkpoints.is_file()
+        if (saved_visits != requested and checkpoints.is_file()
                 and any(row["batch"] > after for row in read(checkpoints))):
             raise ValueError("The run has already scored a batch after the requested insertion point")
-        settings["revisit_after"] = [after, source]
+        settings["revisit_after"] = requested
     if restart_revisit is not None:
         if "revisit_after" not in settings or not (restart_revisit.isascii() and restart_revisit.isalnum()):
             raise ValueError("Use --revisit-after and an alphanumeric retry name with --restart-revisit")
-        after, source = settings["revisit_after"]
+        after, source = settings["revisit_after"][:2]
         previous_tag = settings.get("restart_revisit")
         previous_visit = f"b{after:02d}" + (f"_{previous_tag}" if previous_tag else "") + f"_revisit{source:02d}"
         checkpoints = root/"checkpoints.json"
@@ -129,8 +133,8 @@ def main(argv=None):
                              help="First Train batch and Dev selection to use conditional paired confirmation")
             sub.add_argument("--confirmation-scoring", choices=(INITIAL_PLUS_ONE, TWO_REPEATS_ONLY),
                              help="Scoring for pending and future confirmations; completed selections are retained")
-            sub.add_argument("--revisit-after", type=int, nargs=2, metavar=("AFTER", "SOURCE"),
-                             help="Repeat Train batch SOURCE after AFTER completes and carry its Dev selection forward")
+            sub.add_argument("--revisit-after", type=int, nargs="+", metavar="BATCH",
+                             help="After the first batch number, revisit the remaining batch numbers in order")
             sub.add_argument("--restart-revisit", metavar="NAME",
                              help="Restart optimization of the pending revisit under a new name, reusing measured executions")
             sub.add_argument("--cuda-graph-after", type=int, metavar="BATCH",
