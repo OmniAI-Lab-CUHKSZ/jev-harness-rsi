@@ -91,3 +91,38 @@ class PublicRunTests(unittest.TestCase):
                    "input_tokens": 30, "reasoning_tokens": 0, "output_tokens": 11}
             self.assertEqual(include_retries(root, row)["output_tokens"], 15)
             self.assertEqual(include_retries(root, read(base / "record.json"))["output_tokens"], 15)
+
+    def test_revisit_after_four_carries_dev_winner_and_resumes_nonconsecutive_scored_rounds(self):
+        for win in (True, False):
+            with self.subTest(revisit_wins_dev=win), TemporaryDirectory() as directory:
+                root = Path(directory)
+                config = lambda: read(RESOURCES/"experiment.json")
+                initialize(root, config())
+                initialize(root, config(), revisit_after=(4, 3))
+                settings = config()
+                initialize(root, settings)
+                self.assertEqual(settings["revisit_after"], [4, 3])
+                study = Mock(root=root, settings=settings, functions=[])
+                dev = {"dev_h00":1, "dev_b04r02":2, "dev_b04_revisit03r02":3 if win else 1}
+                study.batch.side_effect = lambda tasks,stage,library: scored(tasks,stage,dev.get(stage,1),10)
+                study.candidate_batch.side_effect = lambda tasks,stage,lib,parents,old: (parents,scored(tasks,stage,2,8))
+                versions = {"b04r02":"Use the live result.", "b04_revisit03r02":"Read the scoped result."}
+                def propose(study, lib, rows, history, folder, sources):
+                    if folder.name.startswith("b05"):
+                        self.assertEqual([v["candidate"] for v in history], list(versions))
+                    if folder.name in versions:
+                        return {"objects":[{"kind":"handoff","name":"default","value":{"skill":versions[folder.name]}}]}
+                    return {"keep_parent":True,"reason":"Retain this round's parent"}
+                with patch("jev_harness.phase1_optimizer.propose_one",side_effect=propose):
+                    run(study,4,2,True,evaluate_test=False)
+                    prefix = read(root/"checkpoints.json")
+                    run(study,5,2,True,evaluate_test=False)
+                all_visits = read(root/"checkpoints.json")
+                self.assertEqual(all_visits[:len(prefix)], prefix)
+                self.assertEqual([c["visit"] for c in all_visits],["b01","b02","b03","b04","b04_revisit03","b05"])
+                self.assertEqual(prefix[-1]["entry_version"],"b04r02")
+                self.assertEqual(prefix[-1]["round_outcomes"],["retained_parent","scored"])
+                self.assertEqual(prefix[-1]["revisions_scored"],1)
+                self.assertEqual(all_visits[-1]["entry_version"],"b04_revisit03r02" if win else "b04r02")
+                calls = {call.args[1]:call.args[0] for call in study.batch.call_args_list}
+                self.assertEqual(calls["b03_h00_entry"],calls["b04_revisit03_b04r02_entry"])

@@ -72,6 +72,8 @@ For a flagged task, the score uses the two confirmation successes and token coun
 
 New paired runs default to `two_repeats_only`. A run created under the original scoring rule keeps `initial_plus_one` on resume unless the command explicitly requests the new rule. The original rule averages the initial observation and one confirmation. Changing the rule applies it to pending and future selections. Earlier completed selections retain their recorded scores.
 
+For the November 25 continuation, add `--revisit-after 4 3` to the run command. The controller saves this schedule in the run configuration. After Batch 4 Dev selection it uses the retained harness for a fresh visit to the nine Batch 3 Train tasks, stored under `b04_revisit03`. Its selected harness enters Batch 5. The original `b03` results remain available. From version 0.2.3.post3 the scoped optimizer attempts both configured rounds, including when it keeps the parent in round one. The per-visit `round_outcomes` field records each attempt and `revisions_scored` counts the candidates that received a full Train evaluation.
+
 ### Use separate machines
 
 Place the repository on the AppWorld and model machines. Start from the SSH template and set the variables it references in the controller's shell. The Python, repository, model and data paths are paths on the respective worker machine. `SSH_IDENTITY` points to the key on the controller. Add entries under `model_nodes` for additional nodes and set the SSH port for each as needed. The local template resolves `PACKAGE_DIR` from the installed controller package automatically. [Local template](../configs/connections.local.example.json) · [SSH template](../configs/connections.ssh.example.json)

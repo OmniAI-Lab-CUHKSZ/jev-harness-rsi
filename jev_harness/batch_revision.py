@@ -244,6 +244,38 @@ class BatchRevisionWorkbench(TrainEvidence):
             self.sites[doc] = trace_sites(read_events(self.paths[doc]))
         return self.sites[doc]
 
+    @cached_property
+    def retained_rounds(self):
+        """Expose local evidence from earlier unsubmitted rounds on this Train batch."""
+        from formal_run import read
+        round_dir = self.folder.parent
+        visit = round_dir.parent
+        earlier = sorted(p for p in visit.glob(visit.name+"r[0-9][0-9]") if p.name < round_dir.name)
+        _, separator, source = visit.name.partition("_revisit")
+        if separator and source.isdigit():
+            original = visit.parent/("b"+source)
+            earlier = sorted(original.glob(original.name+"r[0-9][0-9]")) + earlier
+        summaries = []
+        for previous in earlier:
+            decision = previous/"retained_parent.json"
+            if not decision.is_file():
+                continue
+            info = read(decision)
+            documents = []
+            for which in ("draft", "revised"):
+                trial = previous/"sol_scoped"/("trial_"+which)
+                for name, filename, field in (("edits", "tested_patch.json", "objects"),
+                                              ("observations", "local_evidence.json", "cases"),
+                                              ("old_choices", "historical_choice.json", "tasks")):
+                    file = trial/filename
+                    if file.is_file() and field in (data := read(file)):
+                        doc = f"retained/{previous.name}/{which}/{name}"
+                        self.docs[doc] = [serialized(item) for item in data[field]]
+                        documents.append(doc)
+            summaries.append({"visit":previous.parent.name, "round":info["round"], "parent":info["version"],
+                              "reason":info["reason"], "whole_candidate_scored":False, "documents":documents})
+        return summaries
+
     def packet(self):
         tasks = [task_summary(item,self.current_events[item["task"]]) for item in self.index]
         families = {}
@@ -264,7 +296,11 @@ class BatchRevisionWorkbench(TrainEvidence):
         patterns = batch_patterns(tasks,self.incidents)
         self.docs["batch/patterns"] = [serialized(p) for p in patterns]
         past = self.precedents
-        return {"parent_batch":{"tasks":len(tasks),"solved":sum(row["success"] for row in tasks),
+        retained = self.retained_rounds
+        return {**({"earlier_retained_train_rounds":retained,
+                    "next_round":"Inspect the previous edits and observations. Try another cause or a repair "
+                                 "for the observed limitation. You may keep the parent again if warranted."} if retained else {}),
+                "parent_batch":{"tasks":len(tasks),"solved":sum(row["success"] for row in tasks),
                                 "output_tokens":sum(row["output_tokens"] for row in tasks)},
                 "scenarios":families,"tasks":tasks,"editable_components":surfaces,
                 "last_round_cost_by_paired_outcome":paired_outcome_costs(

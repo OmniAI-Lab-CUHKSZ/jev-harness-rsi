@@ -36,12 +36,14 @@ def load_connections(path):
     return connections
 
 
-def initialize(root, settings, *, confirmation_scoring=None):
+def initialize(root, settings, *, confirmation_scoring=None, revisit_after=None):
     config_path = root / "configuration.json"
     if config_path.is_file():
         saved = read(config_path)
         if "confirmation_scoring" in saved:
             settings["confirmation_scoring"] = saved["confirmation_scoring"]
+        if "revisit_after" in saved:
+            settings["revisit_after"] = saved["revisit_after"]
         if "historical_choice" not in saved.get("optimizer", {}):
             settings["optimizer"].pop("historical_choice", None)
         elif isinstance(saved["optimizer"]["historical_choice"], bool):
@@ -61,6 +63,17 @@ def initialize(root, settings, *, confirmation_scoring=None):
         settings["confirmation_scoring"] = TWO_REPEATS_ONLY
     if confirmation_scoring is not None:
         settings["confirmation_scoring"] = confirmation_scoring
+    if revisit_after is not None:
+        after, source = revisit_after
+        if not 1 <= source < after <= len(settings["batches"]):
+            raise ValueError("The repeated Train batch must precede the batch after which it runs")
+        if "revisit_after" in settings and settings["revisit_after"] != [after, source]:
+            raise ValueError("This run already has a different scheduled Train revisit")
+        checkpoints = root / "checkpoints.json"
+        if ("revisit_after" not in settings and checkpoints.is_file()
+                and any(row["batch"] > after for row in read(checkpoints))):
+            raise ValueError("The run has already scored a batch after the requested insertion point")
+        settings["revisit_after"] = [after, source]
     save(config_path, settings)
     reference = root / "dev_reference.json"
     if not reference.exists():
@@ -91,6 +104,8 @@ def main(argv=None):
                              help="First Train batch and Dev selection to use conditional paired confirmation")
             sub.add_argument("--confirmation-scoring", choices=(INITIAL_PLUS_ONE, TWO_REPEATS_ONLY),
                              help="Scoring for pending and future confirmations; completed selections are retained")
+            sub.add_argument("--revisit-after", type=int, nargs=2, metavar=("AFTER", "SOURCE"),
+                             help="Repeat Train batch SOURCE after AFTER completes and carry its Dev selection forward")
     args = parser.parse_args(argv)
     settings = read(RESOURCES / "experiment.json")
     manifest = design_manifest()
@@ -121,7 +136,8 @@ def main(argv=None):
             settings["paired_selection_from_batch"] = first_review
         elif args.confirmation_scoring is not None:
             parser.error("--confirmation-scoring requires conditional paired selection")
-    initialize(root, settings, confirmation_scoring=getattr(args, "confirmation_scoring", None))
+    initialize(root, settings, confirmation_scoring=getattr(args, "confirmation_scoring", None),
+               revisit_after=getattr(args, "revisit_after", None))
     study = SharedStudy(root, settings, connections, devices=devices, max_gpus=getattr(args, "max_gpus", 1),
                         gpu_name=getattr(args, "gpu_name", "A800"))
     try:

@@ -303,11 +303,15 @@ def run(study, count, rounds, formal, *, revisit_after_six=(), evaluate_test=Tru
     version = checkpoints[-1]["next_version"] if checkpoints else "h00"
     lib = read(root/"versions"/(version+".json"))
     visits = []
+    revisit = study.settings.get("revisit_after")
     for batch in range(1, count + 1):
         label = "b07_after_revisits" if batch == 7 and revisit_after_six else f"b{batch:02d}"
         visits.append((batch, label))
         if batch == 6:
             visits.extend((source, f"b06_revisit{source:02d}") for source in revisit_after_six)
+        if revisit and batch == revisit[0]:
+            source = revisit[1]
+            visits.append((source, f"b{batch:02d}_revisit{source:02d}"))
     completed = [item.get("visit", f"b{item['batch']:02d}") for item in checkpoints]
     if completed != [label for _, label in visits[:len(completed)]]:
         raise ValueError("The saved batch visits are not a prefix of the requested schedule")
@@ -318,10 +322,13 @@ def run(study, count, rounds, formal, *, revisit_after_six=(), evaluate_test=Tru
     for label, checkpoint in zip(completed, checkpoints):
         if scoped:
             study.prior_train_entries.extend(completed_train_entries(root, label, checkpoint, study.settings))
-        for rnd in range(1, checkpoint["revisions_scored"]+1):
-            history.append(read(root/"batches"/label/f"{label}r{rnd:02d}"/"result.json"))
+        # Older checkpoints scored consecutive rounds before ending the batch.
+        outcomes = checkpoint.get("round_outcomes", ["scored"] * checkpoint["revisions_scored"])
+        for rnd, outcome in enumerate(outcomes, 1):
+            if outcome == "scored":
+                history.append(read(root/"batches"/label/f"{label}r{rnd:02d}"/"result.json"))
     manifest=design_manifest(protocol if is_cards else PROTOCOL)
-    if revisit_after_six:
+    if revisit_after_six or revisit:
         manifest["train_visits"] = [{"visit": label, "source_batch": batch} for batch, label in visits]
     save(root/"task_split.json",manifest)
     seed_sources=set(manifest["historical_seed_train_ids"])
@@ -351,13 +358,12 @@ def run(study, count, rounds, formal, *, revisit_after_six=(), evaluate_test=Tru
         entrance_by_seed={name:summary(part) for name,part in (
             ("historical_seed",[r for r in rows if r["task_id"] in seed_sources]),
             ("outside_seed",[r for r in rows if r["task_id"] not in seed_sources])) if part}
-        revisions_scored = 0
-        optimizer_stop = None
+        round_outcomes = []
         save(root/"batches"/label/"entry.json", {"version":version, **entrance,
              **({"train_traces":entry_traces} if scoped else {})})
         from jev_harness.phase1_optimizer import propose_one
         for rnd in range(1, rounds+1):
-            if quality(rows) == (len(ids),0):
+            if not scoped and quality(rows) == (len(ids),0):
                 break
             candidate_version = f"{label}r{rnd:02d}"
             folder = root/"batches"/label/candidate_version
@@ -366,7 +372,7 @@ def run(study, count, rounds, formal, *, revisit_after_six=(), evaluate_test=Tru
                 # The recorded pair can come from GPUs outside today's worker pool.
                 record = read(result_file)
                 history.append(record)
-                revisions_scored += 1
+                round_outcomes.append("scored")
                 if record["accepted"]:
                     version = candidate_version
                     lib = read(root/"versions"/(version+".json"))
@@ -381,9 +387,10 @@ def run(study, count, rounds, formal, *, revisit_after_six=(), evaluate_test=Tru
                 save(proposal_file, proposal)
             proposal = read(proposal_file)
             if proposal.get("keep_parent") is True:
-                optimizer_stop = {"round":rnd,"version":version,"reason":proposal["reason"]}
-                save(folder/"retained_parent.json",optimizer_stop)
-                break
+                save(folder/"retained_parent.json", {"round":rnd, "version":version, "reason":proposal["reason"]})
+                round_outcomes.append("retained_parent")
+                study.status("round_retained_parent", batch=batch, visit=label, round=rnd, version=version)
+                continue
             candidate, edits = install(lib, proposal, sources, study.functions)
             save(root/"versions"/(candidate_version+".json"), candidate)
             parent_rows, candidate_rows = study.candidate_batch(ids, candidate_version, candidate, rows, lib)
@@ -415,7 +422,7 @@ def run(study, count, rounds, formal, *, revisit_after_six=(), evaluate_test=Tru
                 record['capability_gap'] = proposal['capability_gap']
             save(result_file, record)
             history.append(record)
-            revisions_scored += 1
+            round_outcomes.append("scored")
             rows = parent_rows
             if accepted:
                 version, lib, rows = candidate_version, candidate, candidate_rows
@@ -448,10 +455,10 @@ def run(study, count, rounds, formal, *, revisit_after_six=(), evaluate_test=Tru
             else:
                 version, lib = entry_ver, entry_lib
         checkpoints.append({"batch":batch, "visit":label, "entry_version":entry_ver, "train_version":train_version,
-                            "next_version":version, "revisions_scored":revisions_scored,
+                            "next_version":version, "round_outcomes":round_outcomes,
+                            "revisions_scored":round_outcomes.count("scored"),
                             "entry":entrance, "entry_by_seed":entrance_by_seed,
-                            "train":summary(rows),"dev_selection":dev_choice,
-                            **({"optimizer_stop":optimizer_stop} if optimizer_stop else {})})
+                            "train":summary(rows),"dev_selection":dev_choice})
         save(checkpoint_file, checkpoints)
         if scoped:
             study.prior_train_entries.extend(entry_traces)

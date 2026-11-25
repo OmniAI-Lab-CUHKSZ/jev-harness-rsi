@@ -424,11 +424,30 @@ class ScopedOptimizerTests(TestCase):
         rows = [{"task_id":"a_1","success":True,"output_tokens":10,"trace_path":"parent","model_calls":{"G":1},
                  "seconds":1,"api_calls":1,"input_tokens":1,"reasoning_tokens":0}]
         b.study.batch.return_value=rows
-        with patch("jev_harness.phase1_optimizer.propose_one",return_value={"keep_parent":True,"reason":"Preserve correct action"}):
+        with patch("jev_harness.phase1_optimizer.propose_one",return_value={"keep_parent":True,"reason":"Preserve correct action"}) as optimize:
             run(b.study,1,2,True,evaluate_test=False,reference_dev=lambda: self.fail("Unnecessary Dev call"))
+        self.assertEqual([c.args[4].name for c in optimize.call_args_list], ["b01r01", "b01r02"])
         self.assertEqual(b.study.batch.call_count,1)
         b.study.candidate_batch.assert_not_called()
         checkpoint=read(b.study.root/"checkpoints.json")[0]
         self.assertEqual(checkpoint["next_version"],"h00")
+        self.assertEqual(checkpoint["round_outcomes"],["retained_parent","retained_parent"])
         self.assertEqual(checkpoint["revisions_scored"],0)
         self.assertEqual(read(b.study.root/"versions/h00.json")["menu_format"],"scoped")
+
+    def test_revisit_reads_original_and_earlier_same_visit_retention_only(self):
+        from formal_run import save
+        root=Path(self.tmp.name)
+        b=self.bench
+        for visit, rnd in (("b03",1),("b04",1),("b04_revisit03",1),("b04_revisit03",2)):
+            folder=root/visit/f"{visit}r{rnd:02d}"
+            save(folder/"retained_parent.json",{"round":rnd,"version":"h00","reason":"No observed consumer"})
+            trial=folder/"sol_scoped/trial_revised"
+            save(trial/"tested_patch.json",{"objects":[["revised",[{"kind":"card","name":"read_file"}]]]})
+            save(trial/"local_evidence.json",{"cases":[{"stop":"Reached budget"}]})
+        b.folder=root/"b04_revisit03/b04_revisit03r02/sol_scoped"
+        b.docs={}
+        self.assertEqual([(d["visit"],d["round"]) for d in b.retained_rounds],[("b03",1),("b04_revisit03",1)])
+        self.assertTrue(all(d["whole_candidate_scored"] is False for d in b.retained_rounds))
+        self.assertIn("read_file", b.docs["retained/b03r01/revised/edits"][0])
+        self.assertIn("Reached budget", b.docs["retained/b04_revisit03r01/revised/observations"][0])

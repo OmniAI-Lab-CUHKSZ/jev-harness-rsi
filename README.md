@@ -70,7 +70,7 @@ Sol can try a proposed edit on the focal Train case and a preservation case. The
 
 | Split | Scenarios / tasks | How it is used |
 |---|---:|---|
-| Train | 30 / 90 | Ten batches of nine tasks. Sol gets up to two revisions per batch. Each candidate reruns the nine tasks. |
+| Train | 30 / 90 | Ten batches of nine tasks. Sol has two optimization rounds per visit. Each submitted candidate reruns the nine tasks. |
 | Dev | 19 / 57 | Select the harness carried into the next batch. H0 is measured once and the retained parent's scores are reused. |
 | Test-N | 30 / 90 | On a subset of AppWorld Test-Normal, compare the generation-only 27B agent with the same 27B using the final harness, paired by task and GPU. |
 
