@@ -334,9 +334,36 @@ def run(study, count, rounds, formal, *, revisit_after_six=(), evaluate_test=Tru
     seed_sources=set(manifest["historical_seed_train_ids"])
     sources=seed_sources.copy()
     dev=manifest["dev_tasks"] if formal else []
+    after = study.settings.get("cuda_graph_after")
+    switch_visit = f"b{after:02d}" if after is not None else None
+    graph_dev = switch_visit in completed
+
+    def dev_stage(ver):
+        return "dev_" + ver + ("_cuda_graph" if graph_dev else "")
+
     def score_dev(ver, library):
-        return study.batch(dev, "dev_"+ver, library=library)
-    if formal and reference_dev is None:
+        return study.batch(dev, dev_stage(ver), library=library)
+
+    def measure_graph_parent(ver, library):
+        study.enable_cuda_graph()
+        if not formal:
+            return None
+        stage = dev_stage(ver)
+        study.status("cuda_graph_parent_dev", after_visit=switch_visit, version=ver, evaluation_stage=stage)
+        rows = score_dev(ver, library)
+        save(root/"cuda_graph_dev_reference.json", {"after_visit":switch_visit, "version":ver, "stage":stage,
+             "decode_mode":"cuda_graph", "tasks":len(rows), "successes":sum(row["success"] for row in rows),
+             "output_tokens":sum(row["output_tokens"] for row in rows)})
+        return rows
+
+    if graph_dev:
+        if completed[-1] == switch_visit:
+            reference_dev = measure_graph_parent(version, lib)
+        else:
+            study.enable_cuda_graph()
+            if formal:
+                reference_dev = lambda current=version, library=lib: score_dev(current,library)
+    elif formal and reference_dev is None:
         if with_impact:
             reference_dev = lambda current=version, library=lib: score_dev(current,library)
         else:
@@ -439,12 +466,15 @@ def run(study, count, rounds, formal, *, revisit_after_six=(), evaluate_test=Tru
             reference_score, evaluated_score = quality(reference_dev), quality(ev)
             dev_review = None
             if review_enabled:
-                dev_review = review_versions(study, "dev_"+version, root/"batches"/label/"dev_paired_selection.json",
+                dev_review = review_versions(study, dev_stage(version), root/"batches"/label/"dev_paired_selection.json",
                                             reference_dev, ev, entry_lib, lib)
                 reference_score, evaluated_score = dev_review["parent_score"], dev_review["candidate_score"]
             carry=evaluated_score >= reference_score
             dev_choice={"compared_to":entry_ver,"candidate":version,"reference":reference_score,
                         "evaluated":evaluated_score,"carry":carry,"tied":evaluated_score == reference_score}
+            if graph_dev:
+                dev_choice.update(decode_mode="cuda_graph", reference_stage=dev_stage(entry_ver),
+                                  candidate_stage=dev_stage(version))
             if dev_review is not None:
                 dev_choice["paired_selection"] = dev_review
             if study.settings.get("inference_schedule"):
@@ -462,6 +492,9 @@ def run(study, count, rounds, formal, *, revisit_after_six=(), evaluate_test=Tru
         save(checkpoint_file, checkpoints)
         if scoped:
             study.prior_train_entries.extend(entry_traces)
+        if label == switch_visit:
+            graph_dev = True
+            reference_dev = measure_graph_parent(version, lib)
     if formal and evaluate_test:
         if study.settings.get("adaptive_decision") and callable(reference_dev):
             reference_dev = reference_dev()

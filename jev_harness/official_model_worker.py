@@ -15,12 +15,13 @@ from urllib.request import Request, urlopen
 
 
 class OfficialModel:
-    def __init__(self, model, gpu, service, max_context, max_num_seqs=1, attach_port=None):
+    def __init__(self, model, gpu, service, max_context, max_num_seqs=1, attach_port=None, *, cuda_graph=False):
         self.model = model
         self.max_context = max_context
         self.served = "autotrust/JEV-27B"
         self.tokenizer = None
         self.max_num_seqs = max_num_seqs
+        self.decode_mode = "cuda_graph" if cuda_graph else "eager"
         self.proc = None
         if attach_port is not None:
             self.port = attach_port
@@ -42,8 +43,14 @@ class OfficialModel:
                "--model", model, "--served-model-name", self.served, "--dtype", "bfloat16",
                "--enable-lora", "--max-lora-rank", "32", "--lora-modules", "jev-decision="+str(service / "adapter_vllm"),
                "--trust-request-chat-template", "--logprobs-mode", "processed_logprobs", "--max-logprobs", "32",
-               "--max-model-len", str(max_context), "--max-num-seqs", str(max_num_seqs), "--enforce-eager",
+               "--max-model-len", str(max_context), "--max-num-seqs", str(max_num_seqs),
                "--gpu-memory-utilization", f"{utilization:.4f}", "--kv-cache-memory-bytes", str(3 * 1024**3)]
+        if cuda_graph:
+            cmd.extend(["--compilation-config", json.dumps({
+                "mode": 0, "cudagraph_mode": "FULL_DECODE_ONLY",
+                "cudagraph_capture_sizes": list(range(1, max_num_seqs + 1))})])
+        else:
+            cmd.append("--enforce-eager")
         cache = Path(tempfile.gettempdir()) / f"jev_official_engine_{os.getuid()}"
         cache.mkdir(parents=True, exist_ok=True)
         cuda_home = os.environ.get("CUDA_HOME", "/usr/local/cuda")
@@ -103,7 +110,7 @@ class OfficialModel:
             raise RuntimeError(f"The official service exited with {self.proc.returncode}")
         return {"model": self.model, "precision": "bf16", "merged": False, "backend": "official_vllm",
                 "service_pid": self.proc.pid if self.proc is not None else None, "profile": self.profile,
-                "port": self.port, "max_num_seqs": self.max_num_seqs}
+                "port": self.port, "max_num_seqs": self.max_num_seqs, "decode_mode": self.decode_mode}
 
     def health(self):
         self.info()
@@ -171,6 +178,7 @@ def main():
     parser.add_argument("--max-context", default=16384, type=int)
     parser.add_argument("--max-num-seqs", type=int, choices=(1, 2), default=1)
     parser.add_argument("--attach-port", type=int, help="Use an existing official service on this host")
+    parser.add_argument("--cuda-graph", action="store_true", help="Capture CUDA graphs for decode batches")
     args = parser.parse_args()
     model = None
     try:
@@ -184,7 +192,7 @@ def main():
                     break
                 if model is None:
                     model = OfficialModel(args.model, args.gpu, args.service, args.max_context,
-                                          args.max_num_seqs, args.attach_port)
+                                          args.max_num_seqs, args.attach_port, cuda_graph=args.cuda_graph)
                 if op not in ("info", "health", "decide", "generate"):
                     raise ValueError("Unknown model operation: "+op)
                 result = getattr(model, op)(**req)

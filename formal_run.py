@@ -61,6 +61,7 @@ class ExecutionWorkers:
             else:
                 args.extend(["--gpu", device])
             self.connections["model"] = {**model, "args": args}
+            self.decode_mode = "cuda_graph" if "--cuda-graph" in args else "eager"
 
     def worker(self, name):
         if name not in self.workers:
@@ -153,6 +154,8 @@ class Study:
         device = {"gpu": workers.gpu} if variant != "Sol" and workers.gpu is not None else {}
         if device and hasattr(workers, "lanes_per_gpu"):
             device.update(lanes_per_gpu=workers.lanes_per_gpu, lane=workers.lane)
+        if device and hasattr(workers, "decode_mode"):
+            device["decode_mode"] = workers.decode_mode
         # Preserve partial receipts and use a fresh AppWorld run name on resume.
         prior_attempts = [int(p.name.split("_")[-1]) for p in folder.glob("attempt_*")
                           if p.name.split("_")[-1].isdigit()]

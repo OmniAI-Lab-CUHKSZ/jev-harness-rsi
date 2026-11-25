@@ -53,8 +53,33 @@ class SharedStudy(PhaseOneStudy):
         self.started_utc = utcnow()
         self.fixed_width = lanes_per_gpu
         checkpoints = self.root / "checkpoints.json"
-        finished = len(read(checkpoints)) if checkpoints.is_file() else 0
-        self.lanes_per_gpu = self.width_for("train", finished + 1)
+        completed = read(checkpoints) if checkpoints.is_file() else []
+        self.lanes_per_gpu = self.width_for("train", len(completed) + 1)
+        self.decode_mode = "eager"
+        self.preferred_devices = ()
+        after = settings.get("cuda_graph_after")
+        if after is not None:
+            previous = self.root / "controller.json"
+            if previous.is_file():
+                self.preferred_devices = tuple(read(previous).get("devices", "").split(","))
+            if any(c.get("visit", f"b{c['batch']:02d}") == f"b{after:02d}" for c in completed):
+                self.enable_cuda_graph()
+
+    def enable_cuda_graph(self):
+        if self.decode_mode == "cuda_graph":
+            return
+        warm = bool(self.groups)
+        if warm:
+            self.preferred_devices = tuple(self.groups)
+            self.status("switching_decode_mode", decode_mode="cuda_graph")
+            self.close_devices()
+        self.connections = {**self.connections, "model_nodes": {
+            node: {**spec, "args": [*spec.get("args", []), "--cuda-graph"]}
+            for node, spec in self.connections["model_nodes"].items()}}
+        self.decode_mode = "cuda_graph"
+        self.last_scan = float("-inf")
+        if warm:
+            self.start_workers()
 
     def width_for(self, phase, batch):
         schedule = self.settings.get("inference_schedule", {})
@@ -76,7 +101,7 @@ class SharedStudy(PhaseOneStudy):
     def metadata(self):
         save(self.root / "controller.json", {"pid": os.getpid(), "started_utc": self.started_utc,
              "devices": ",".join(self.groups), "max_devices": self.max_gpus,
-             "lanes_per_gpu": self.lanes_per_gpu, "task_slots": len(self.workers)})
+             "lanes_per_gpu": self.lanes_per_gpu, "task_slots": len(self.workers), "decode_mode": self.decode_mode})
 
     def load_worker(self, row):
         device = DeviceWorkers(self.root, self.connections, row, self.lanes_per_gpu)
@@ -102,7 +127,8 @@ class SharedStudy(PhaseOneStudy):
             candidates = [row for rows in nodes.values() if isinstance(rows, list) for row in rows
                           if row["gpu"] not in active and self.gpu_name in row["name"]
                           and row["free_mib"] >= FREE_MIB and row["util_pct"] <= LOW_UTIL]
-            candidates.sort(key=lambda row: (row["util_pct"], -row["free_mib"], row["gpu"]))
+            candidates.sort(key=lambda row: (row["gpu"] not in self.preferred_devices,
+                                             row["util_pct"], -row["free_mib"], row["gpu"]))
             inspection.update(nodes=nodes, min_free_mib=FREE_MIB, max_util_pct=LOW_UTIL)
         inspection["candidates"] = [row["gpu"] for row in candidates]
         take = candidates[:self.max_gpus - len(active)]

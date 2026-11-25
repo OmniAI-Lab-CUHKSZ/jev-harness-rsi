@@ -63,7 +63,32 @@ class InferenceConcurrencyTests(TestCase):
                     self.assertEqual(cmd[cmd.index("--max-model-len") + 1], "16384")
                     self.assertEqual(cmd[cmd.index("--kv-cache-memory-bytes") + 1], str(3 * 1024**3))
                     self.assertEqual(model.info()["max_num_seqs"], width)
-                self.assertEqual(launch.call_count, 2)
+                    self.assertIn("--enforce-eager", cmd)
+                    graph_model = OfficialModel("fixture", "0", folder, 16384, width, cuda_graph=True)
+                    graph_cmd = launch.call_args.args[0]
+                    self.assertNotIn("--enforce-eager", graph_cmd)
+                    config = json.loads(graph_cmd[graph_cmd.index("--compilation-config") + 1])
+                    self.assertEqual(config, {"mode":0, "cudagraph_mode":"FULL_DECODE_ONLY",
+                                              "cudagraph_capture_sizes":list(range(1,width+1))})
+                    self.assertEqual(graph_model.info()["decode_mode"], "cuda_graph")
+                self.assertEqual(launch.call_count, 4)
+
+    def test_graph_resume_loads_both_lanes_and_future_gpus_with_the_new_mode(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = {**SETTINGS, "cuda_graph_after":4}
+            source = connections()
+            save(root/"checkpoints.json", [{"batch":3}])
+            self.assertEqual(SharedStudy(root,config,source).decode_mode,"eager")
+            save(root/"checkpoints.json", [{"batch":4,"visit":"b04"}])
+            study = SharedStudy(root,config,source)
+            study.enable_cuda_graph()
+            self.assertEqual(study.decode_mode,"cuda_graph")
+            self.assertNotIn("--cuda-graph",source["model_nodes"]["node"]["args"])
+            for gpu in ("node:0","node:1"):
+                device = DeviceWorkers(root,study.connections,{"gpu":gpu},2)
+                self.assertEqual(device.spec["args"].count("--cuda-graph"),1)
+                self.assertTrue(all(w.decode_mode == "cuda_graph" for w in device.sessions))
 
     def test_two_real_client_pipes_share_decision_service_and_isolate_simulators(self):
         simultaneous = Barrier(2)

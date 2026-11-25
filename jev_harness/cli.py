@@ -36,7 +36,7 @@ def load_connections(path):
     return connections
 
 
-def initialize(root, settings, *, confirmation_scoring=None, revisit_after=None):
+def initialize(root, settings, *, confirmation_scoring=None, revisit_after=None, cuda_graph_after=None):
     config_path = root / "configuration.json"
     if config_path.is_file():
         saved = read(config_path)
@@ -44,6 +44,8 @@ def initialize(root, settings, *, confirmation_scoring=None, revisit_after=None)
             settings["confirmation_scoring"] = saved["confirmation_scoring"]
         if "revisit_after" in saved:
             settings["revisit_after"] = saved["revisit_after"]
+        if "cuda_graph_after" in saved:
+            settings["cuda_graph_after"] = saved["cuda_graph_after"]
         if "historical_choice" not in saved.get("optimizer", {}):
             settings["optimizer"].pop("historical_choice", None)
         elif isinstance(saved["optimizer"]["historical_choice"], bool):
@@ -74,6 +76,17 @@ def initialize(root, settings, *, confirmation_scoring=None, revisit_after=None)
                 and any(row["batch"] > after for row in read(checkpoints))):
             raise ValueError("The run has already scored a batch after the requested insertion point")
         settings["revisit_after"] = [after, source]
+    if cuda_graph_after is not None:
+        if not 1 <= cuda_graph_after <= len(settings["batches"]):
+            raise ValueError("Choose a scheduled Train batch for the CUDA Graph switch")
+        if settings.get("cuda_graph_after", cuda_graph_after) != cuda_graph_after:
+            raise ValueError("The saved run already uses a different decode switch")
+        checkpoints = root / "checkpoints.json"
+        if "cuda_graph_after" not in settings and checkpoints.exists():
+            visits = [c.get("visit", f"b{c['batch']:02d}") for c in read(checkpoints)]
+            if f"b{cuda_graph_after:02d}" in visits[:-1]:
+                raise ValueError("A later visit has already been scored with the original engine")
+        settings["cuda_graph_after"] = cuda_graph_after
     save(config_path, settings)
     reference = root / "dev_reference.json"
     if not reference.exists():
@@ -106,6 +119,8 @@ def main(argv=None):
                              help="Scoring for pending and future confirmations; completed selections are retained")
             sub.add_argument("--revisit-after", type=int, nargs=2, metavar=("AFTER", "SOURCE"),
                              help="Repeat Train batch SOURCE after AFTER completes and carry its Dev selection forward")
+            sub.add_argument("--cuda-graph-after", type=int, metavar="BATCH",
+                             help="Switch after this regular visit and measure its retained Dev parent on the new engine")
     args = parser.parse_args(argv)
     settings = read(RESOURCES / "experiment.json")
     manifest = design_manifest()
@@ -137,7 +152,7 @@ def main(argv=None):
         elif args.confirmation_scoring is not None:
             parser.error("--confirmation-scoring requires conditional paired selection")
     initialize(root, settings, confirmation_scoring=getattr(args, "confirmation_scoring", None),
-               revisit_after=getattr(args, "revisit_after", None))
+               revisit_after=getattr(args, "revisit_after", None), cuda_graph_after=getattr(args, "cuda_graph_after", None))
     study = SharedStudy(root, settings, connections, devices=devices, max_gpus=getattr(args, "max_gpus", 1),
                         gpu_name=getattr(args, "gpu_name", "A800"))
     try:

@@ -92,6 +92,62 @@ class PublicRunTests(unittest.TestCase):
             self.assertEqual(include_retries(root, row)["output_tokens"], 15)
             self.assertEqual(include_retries(root, read(base / "record.json"))["output_tokens"], 15)
 
+    def test_cuda_graph_measures_actual_dev_winner_once_before_revisit_and_reuses_same_mode_on_resume(self):
+        for old_candidate_wins in (True, False):
+            with self.subTest(old_candidate_wins=old_candidate_wins), TemporaryDirectory() as directory:
+                root = Path(directory)
+                settings = read(RESOURCES/"experiment.json")
+                initialize(root,settings,revisit_after=(4,3),cuda_graph_after=4)
+                resumed = read(RESOURCES/"experiment.json")
+                initialize(root,resumed)
+                self.assertEqual(resumed["cuda_graph_after"],4)
+                study = Mock(root=root,settings=resumed,functions=[])
+                parent = "b04r02" if old_candidate_wins else "h00"
+                graph_parent = "dev_"+parent+"_cuda_graph"
+                dev = {"dev_h00":10,"dev_b04r02":11 if old_candidate_wins else 9,
+                       graph_parent:13,"dev_b04_revisit03r02_cuda_graph":12,"dev_b05r01_cuda_graph":14}
+                calls, measured = [], {}
+                partial = True
+                def panel(tasks,stage,library):
+                    nonlocal partial
+                    calls.append(stage)
+                    rows = scored(tasks,stage,dev.get(stage,1),10)
+                    for row in rows:
+                        key = (stage,row["task_id"])
+                        if key not in measured:
+                            measured[key] = row
+                            if stage == graph_parent and partial:
+                                partial = False
+                                raise RuntimeError("interrupted after one graph Dev task")
+                    return [measured[stage,t] for t in tasks]
+                study.batch.side_effect = panel
+                study.candidate_batch.side_effect = lambda tasks,s,c,p,lib: (p,scored(tasks,s,2,8))
+                def proposal(study, lib, rows, history, folder, sources):
+                    if folder.name in ("b04r02","b04_revisit03r02","b05r01"):
+                        return {"objects":[{"kind":"handoff","name":"default","value":{"skill":"Use the scoped result."}}]}
+                    return {"keep_parent":True,"reason":"Retain the parent"}
+                with patch("jev_harness.phase1_optimizer.propose_one", side_effect=proposal):
+                    with self.assertRaisesRegex(RuntimeError,"one graph Dev"):
+                        run(study,4,2,True,evaluate_test=False)
+                    prior = read(root/"checkpoints.json")
+                    self.assertEqual(prior[-1]["next_version"],parent)
+                    self.assertFalse(any(s.startswith("b04_revisit03") for s in calls))
+                    self.assertFalse((root/"cuda_graph_dev_reference.json").exists())
+                    run(study,4,2,True,evaluate_test=False)
+                    self.assertEqual(sum(s == graph_parent for s,_ in measured),57)
+                    revisited = read(root/"checkpoints.json")[-1]
+                    self.assertEqual(revisited["entry_version"],parent)
+                    self.assertFalse(revisited["dev_selection"]["carry"])
+                    self.assertEqual(revisited["dev_selection"]["reference_stage"],graph_parent)
+                    run(study,5,2,True,evaluate_test=False)
+                reference = read(root/"cuda_graph_dev_reference.json")
+                self.assertEqual((reference["version"],reference["tasks"],reference["successes"]),(parent,57,13))
+                final = read(root/"checkpoints.json")
+                self.assertEqual(final[:4],prior)
+                self.assertEqual(final[-1]["dev_selection"]["reference_stage"],graph_parent)
+                self.assertTrue(final[-1]["dev_selection"]["carry"])
+                self.assertLess(calls.index(graph_parent),calls.index("b04_revisit03_"+parent+"_entry"))
+
     def test_revisit_after_four_carries_dev_winner_and_resumes_nonconsecutive_scored_rounds(self):
         for win in (True, False):
             with self.subTest(revisit_wins_dev=win), TemporaryDirectory() as directory:
