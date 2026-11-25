@@ -229,6 +229,12 @@ def offline_optimizer_costs(root, *, historical):
             meters.append(read(meter))
     if meters:
         costs["offline_27b_probes"] = {key:sum(m.get(key,0) for m in meters) for key in sorted(set().union(*meters))}
+    choices = [read(p) for folder in folders for p in folder.glob("trial_draft/historical_choice.json")]
+    if choices:
+        costs["offline_27b_historical_choice"] = {
+            **{k:sum(row.get(k,0) for row in choices) for k in
+               ("model_calls","backend_requests","input_tokens","output_tokens","reasoning_tokens","seconds")},
+            "unconfirmed_calls":sum(row["status"]=="outcome_unconfirmed" for row in choices)}
     return costs
 
 

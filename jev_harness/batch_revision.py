@@ -335,6 +335,11 @@ class BatchRevisionWorkbench(TrainEvidence):
         if path.exists():
             return read(path)
         packet = self.packet()
+        if self.study.settings.get("optimizer",{}).get("historical_choice"):
+            packet["historical_choice_preview"] = (
+                "One extra 27B choice is available on a successful earlier Train task at its first changed "
+                "decision. Cite a relevant contrast in history_use to prioritize it. The draft review receives "
+                "the recorded selection and the new choice on that page.")
         save(self.folder/"index.json",packet)
         result = self.ask(INSTRUCTIONS,packet,self.folder/"focus",self.validate_draft)
         save(path,result)
@@ -363,6 +368,8 @@ class BatchRevisionWorkbench(TrainEvidence):
                            "path_comparison":obs.get("path_comparison"),"preservation":obs.get("preservation"),
                            "wording":obs.get("wording"),
                            "documents":obs.get("documents",[])})
+            if "historical_choice" in obs:
+                trials[-1]["historical_choice"] = obs["historical_choice"]
             save(self.folder/"local_evidence.json",{"trials":trials,"cost":obs["cost"]})
             return obs["cost"]
         cost = preview("draft")
@@ -386,7 +393,14 @@ class BatchRevisionWorkbench(TrainEvidence):
         if review_path.exists():
             review = read(review_path)
         else:
-            review = self.ask(REVIEW,payload,self.folder/"review",decision)
+            instructions = REVIEW
+            if "historical_choice" in trials[0]:
+                instructions += ("\nInspect historical_choice on the draft when its status is observed. "
+                                 "Compare the old and new choices with the old goal. Explain whether the new choice "
+                                 "preserves the next step, offers useful reuse, or introduces interference. "
+                                 "You can revise the relevant components. This is a single page observation; "
+                                 "whole-task success and any subsequent revised menu remain unmeasured.")
+            review = self.ask(instructions,payload,self.folder/"review",decision)
             save(review_path,review)
         if review["use"] == "revise":
             patches["revised"] = revised_patch(draft,review)

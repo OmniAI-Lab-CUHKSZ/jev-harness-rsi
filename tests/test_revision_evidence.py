@@ -71,7 +71,7 @@ class RevisionEvidenceTests(TestCase):
     def test_changed_bound_values_stop_even_when_the_names_match(self):
         ref = SimpleNamespace(requests=[(5,"bind_progress",{"values":{"rows":[1]}})],matched=1,
                               tape=[(5,"bind_progress",{"names":["rows"]},{})],complete=True,reason=None,stop="returned")
-        def rerender(es,lib,func,settings,client):
+        def rerender(es,lib,func,settings,client,executor_type=None):
             from jev_harness.trace_comparison import Boundary
             try:
                 client.request("bind_progress",values={"rows":lib})

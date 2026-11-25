@@ -195,6 +195,10 @@ def preview_batch(bench,proposal,worker,key,prior_cost=None):
     report = compare_candidates(bench,{"alternatives":[{**proposal,"id":key}],
                                       "cases":cases},
                                 worker,folder=folder,prior_cost=prior_cost,matched_paths=current)
+    if key == "draft" and bench.study.settings.get("optimizer",{}).get("historical_choice"):
+        from .historical_choice import historical_choice
+        report["historical_choice"] = historical_choice(bench,proposal,candidate,old,paths,worker,
+                                                        folder/"historical_choice.json")
     save(folder/"path_comparison.json",{"batch":batch,"history":old,**paths})
     documents = []
     for i,case in enumerate(report["cases"],1):

@@ -77,7 +77,8 @@ class ParentPath:
         return self.reason is None and self.matched == len(self.tape)
 
 
-def compare_path(events, parent_path, candidate, functions, settings, *, inspect_change=None):
+def compare_path(events, parent_path, candidate, functions, settings, *, inspect_change=None,
+                 executor_type=SemanticAssembly):
     position = 0
     difference = None
 
@@ -106,7 +107,7 @@ def compare_path(events, parent_path, candidate, functions, settings, *, inspect
             position += 1
             return deepcopy(result)
 
-    stop = run_on_tape(events, candidate, functions, settings, Candidate())
+    stop = run_on_tape(events, candidate, functions, settings, Candidate(), executor_type)
     if difference is None and stop != "boundary":
         if position < len(parent_path.requests):
             index, op, _ = parent_path.requests[position]

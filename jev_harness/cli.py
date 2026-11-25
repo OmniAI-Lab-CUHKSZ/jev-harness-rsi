@@ -39,6 +39,8 @@ def initialize(root, settings):
     config_path = root / "configuration.json"
     if config_path.is_file():
         saved = read(config_path)
+        if "historical_choice" not in saved.get("optimizer", {}):
+            settings["optimizer"].pop("historical_choice", None)
         if "menu_format" not in saved:
             # Earlier releases used the history-preview editor and single-session batch one.
             settings.pop("menu_format", None)

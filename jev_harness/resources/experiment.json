@@ -22,7 +22,8 @@
     "rounds": 2,
     "max_objects": 3,
     "candidates": 1,
-    "batch_revision": true
+    "batch_revision": true,
+    "historical_choice": true
   },
   "post_task_generation_budget": 0,
   "initial_learning": "Original H0 business cards and general handoff selector; specialist handoffs learned within this run.",
