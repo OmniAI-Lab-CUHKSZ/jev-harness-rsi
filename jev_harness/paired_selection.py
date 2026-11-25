@@ -1,6 +1,7 @@
 """Conditional, task-paired confirmation for Train and Dev selection."""
 from itertools import zip_longest
 from pathlib import Path
+from threading import Lock
 
 from formal_run import save
 from .formal_optimizer import read_events
@@ -116,7 +117,7 @@ def cost_review(pairs, repeats, scoring=INITIAL_PLUS_ONE):
     return pending if sign(saving) != sign(residual) else []
 
 
-def select_with_review(study, stage, report_path, parent, candidate, paired_rerun):
+def select_with_review(study, stage, report_path, parent, candidate, paired_rerun, *, paired_confirmations=None):
     pairs = initial_comparison(study.root, parent, candidate)
     scoring = study.settings.get("confirmation_scoring", INITIAL_PLUS_ONE)
     passes = {INITIAL_PLUS_ONE: 1, TWO_REPEATS_ONLY: 2}[scoring]
@@ -127,22 +128,37 @@ def select_with_review(study, stage, report_path, parent, candidate, paired_reru
               "accuracy_difference_bounds": bounds, "initial_pairs": pairs,
               "accuracy_review_tasks": accuracy_tasks, "cost_review_tasks": [],
               "repeats": repeats}
+    per_task = passes == 2 and paired_confirmations is not None
+    if per_task:
+        report["confirmation_schedule"] = "per_task"
+    report_lock = Lock()
+
+    def record_pair(task, pass_number, left, right):
+        if (left["task_id"] != task or right["task_id"] != task or left["seed"] != right["seed"]
+                or left["seed"] != first_seed[task] or left["gpu"] != right["gpu"]):
+            raise ValueError(f"Unmatched confirmation for {task}")
+        with report_lock:
+            observations = repeats.setdefault(task, [])
+            for arm, row in (("parent", left), ("candidate", right)):
+                sample = {k:row[k] for k in ("success", "output_tokens", "gpu", "trace_path")}
+                observations.append(dict(sample, arm=arm, confirmation_pass=pass_number))
+            if per_task:
+                save(report_path, report)
 
     def confirm(tasks):
         if not tasks:
+            return
+        if per_task:
+            save(report_path, report)
+            study.status("paired_selection_review", comparison=stage, tasks=tasks, confirmation_schedule="per_task")
+            paired_confirmations(tasks, record_pair)
             return
         for pass_number in range(1, passes + 1):
             save(report_path, report)
             study.status("paired_selection_review", comparison=stage, tasks=tasks, confirmation_pass=pass_number)
             arms = paired_rerun(tasks, pass_number) if passes == 2 else paired_rerun(tasks)
             for task, left, right in zip(tasks, *arms, strict=True):
-                if (left["task_id"] != task or right["task_id"] != task or left["seed"] != right["seed"]
-                        or left["seed"] != first_seed[task] or left["gpu"] != right["gpu"]):
-                    raise ValueError(f"Unmatched confirmation for {task}")
-                observations = repeats.setdefault(task, [])
-                for arm, row in (("parent", left), ("candidate", right)):
-                    sample = {k:row[k] for k in ("success", "output_tokens", "gpu", "trace_path")}
-                    observations.append(dict(sample, arm=arm, confirmation_pass=pass_number))
+                record_pair(task, pass_number, left, right)
 
     confirm(accuracy_tasks)
     report["cost_review_tasks"] = cost_review(pairs, repeats, scoring)

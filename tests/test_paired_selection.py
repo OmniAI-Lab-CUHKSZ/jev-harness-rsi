@@ -1,6 +1,8 @@
 import json
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from threading import Event
 from unittest import TestCase
 from unittest.mock import Mock, patch
 
@@ -140,6 +142,50 @@ class PairedSelectionTests(TestCase):
             self.assertEqual([(r["confirmation_pass"],r["arm"]) for r in observations],
                              [(1,"parent"),(1,"candidate"),(2,"parent"),(2,"candidate")])
             self.assertEqual(len({r["trace_path"] for r in observations}), 4)
+
+    def test_fast_task_starts_its_second_confirmation_while_slow_task_is_in_its_first(self):
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            study = Mock(root=root, settings={"confirmation_scoring": TWO_REPEATS_ONLY})
+            tasks = ["slow", "fast"]
+            fast_second_pass = Event()
+            calls = {task: [] for task in tasks}
+
+            def panel(stage, success):
+                rows = []
+                for task in tasks:
+                    trace = Path("runs", stage, task, "attempt_1", "trace.jsonl")
+                    (root/trace).parent.mkdir(parents=True)
+                    (root/trace).write_text(json.dumps(generation("same", str(success)))+"\n", encoding="utf-8")
+                    rows.append({"task_id": task, "seed": 17, "success": success,
+                                 "output_tokens": 9, "trace_path": trace.as_posix()})
+                return rows
+
+            def dispatch(jobs, operation, preferred):
+                with ThreadPoolExecutor(2) as pool:
+                    work = [pool.submit(operation, job, Mock(gpu=f"node:{job[0]}")) for job in jobs]
+                    return [future.result() for future in work]
+
+            def rollout(task, stage, variant, library, *, workers):
+                calls[task].append((stage, workers.gpu))
+                if task == "slow" and len(calls[task]) == 1:
+                    self.assertTrue(fast_second_pass.wait(timeout=3), "The fast task was blocked by the slow one")
+                if task == "fast" and stage.endswith("_2"):
+                    fast_second_pass.set()
+                return {"task_id": task, "seed": 17, "gpu": workers.gpu, "success": True,
+                        "output_tokens": 4, "trace_path": f"runs/{stage}/{task}/attempt_1/trace.jsonl"}
+
+            study.execute_preferred.side_effect = dispatch
+            study.run_task.side_effect = rollout
+            result = review_versions(study, "c", root/"selection.json", panel("p", True),
+                                     panel("c", False), "parent", "candidate")
+            self.assertEqual(result["repeat_rollouts"], 8)
+            self.assertEqual(result["parent_score"], [2, -8])
+            self.assertEqual(result["candidate_score"], [2, -8])
+            self.assertTrue(result["accepted"])
+            for task, arms, gpu in (("slow", ["parent","candidate","candidate_2","parent_2"], "node:0"),
+                                    ("fast", ["candidate","parent","parent_2","candidate_2"], "node:1")):
+                self.assertEqual(calls[task], [(f"c_review_{arm}", gpu) for arm in arms])
 
     def test_new_run_default_and_explicit_scoring_cutover(self):
         def config():

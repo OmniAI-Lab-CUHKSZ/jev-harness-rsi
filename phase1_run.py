@@ -158,8 +158,8 @@ def paired_holdout(study, ids, version, library):
     return paired_rollouts(study, ids, stages, {"A":"A", "B":"B"}, {"A":None, "B":library})
 
 
-def paired_rollouts(study, ids, stages, variants, libraries, *, preferred_gpus=None, reverse_order=False):
-    """Alternate arm order and run each task twice on one GPU in freshly prepared worlds."""
+def _prepare_pair(study, ids, stages, variants, libraries, *, reverse_order=False):
+    """Prepare one same-GPU pair per task, including any complete or partial receipts."""
     cached = {}
     if hasattr(study, "root"):
         runs = study.root / "runs"
@@ -184,29 +184,45 @@ def paired_rollouts(study, ids, stages, variants, libraries, *, preferred_gpus=N
                 stage += "_paired_" + device.replace(":", "_")
             out[arm]=study.run_task(task,stage,variants[arm],libraries[arm],workers=worker)
         return out["A"],out["B"]
+    preferred = [next((gpu for arm in cached.get(task, {}).values() for gpu in arm), None) for task in ids]
+    return pair, preferred
+
+
+def _dispatch_pairs(study, ids, operation, preferred):
     jobs = list(enumerate(ids))
     if hasattr(study, "execute_preferred"):
-        preferred = [next((gpu for arm in cached.get(task, {}).values() for gpu in arm),
-                          (preferred_gpus or {}).get(task)) for task in ids]
-        pairs = study.execute_preferred(jobs, pair, preferred if any(preferred) else None)
-    else:
-        pairs = study.execute_jobs(jobs, pair)
+        return study.execute_preferred(jobs, operation, preferred if any(preferred) else None)
+    return study.execute_jobs(jobs, operation)
+
+
+def paired_rollouts(study, ids, stages, variants, libraries, *, preferred_gpus=None, reverse_order=False):
+    """Alternate arm order and run each task twice on one GPU in freshly prepared worlds."""
+    pair, preferred = _prepare_pair(study, ids, stages, variants, libraries, reverse_order=reverse_order)
+    if preferred_gpus:
+        preferred = [gpu or preferred_gpus.get(task) for task, gpu in zip(ids, preferred, strict=True)]
+    pairs = _dispatch_pairs(study, ids, pair, preferred)
     return [a for a,b in pairs],[b for a,b in pairs]
 
 
 def review_versions(study, stage, path, parents, candidates, parent_lib, candidate_lib):
-    first_gpus = {}
-    def rerun(tasks, pass_number=1):
-        suffix = "" if pass_number == 1 else "_2"
-        stages = {"A": stage+"_review_parent"+suffix, "B": stage+"_review_candidate"+suffix}
-        variants, libraries = {"A":"B","B":"B"}, {"A":parent_lib,"B":candidate_lib}
-        if pass_number == 1:
-            arms = paired_rollouts(study, tasks, stages, variants, libraries)
-            first_gpus.update((r["task_id"], r["gpu"]) for r in arms[0])
-            return arms
-        return paired_rollouts(study, tasks, stages, variants, libraries,
-                               preferred_gpus=first_gpus, reverse_order=True)
-    return select_with_review(study, stage, path, parents, candidates, rerun)
+    stages = {"A": stage+"_review_parent", "B": stage+"_review_candidate"}
+    variants, libraries = {"A":"B","B":"B"}, {"A":parent_lib,"B":candidate_lib}
+    def rerun(tasks):
+        return paired_rollouts(study, tasks, stages, variants, libraries)
+
+    def two_passes(tasks, record_pair):
+        second_stages = {arm:name+"_2" for arm, name in stages.items()}
+        first, first_gpus = _prepare_pair(study, tasks, stages, variants, libraries)
+        second, second_gpus = _prepare_pair(study, tasks, second_stages, variants, libraries, reverse_order=True)
+        # A resumed second pass may already have one arm on a different GPU.
+        preferred = [later or earlier for earlier, later in zip(first_gpus, second_gpus, strict=True)]
+        def run_both(job, worker):
+            _, task = job
+            record_pair(task, 1, *first(job, worker))
+            record_pair(task, 2, *second(job, worker))
+        _dispatch_pairs(study, tasks, run_both, preferred)
+
+    return select_with_review(study, stage, path, parents, candidates, rerun, paired_confirmations=two_passes)
 
 
 def initial_harness(settings):
