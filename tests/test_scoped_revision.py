@@ -353,17 +353,23 @@ class ScopedOptimizerTests(TestCase):
         self.assertEqual(row["offline_27b_probes"],{"open_generations":2,"output_tokens":128})
 
     def test_revised_patch_inherits_case_and_has_its_own_measurements(self):
+        from jev_harness.solved_train_preview import MODE
         b = self.bench
         other = [{"kind":"decision","name":"step","value":{"skill":"Keep the scope."}}]
         def ask(prompt,payload,folder,parse):
+            self.assertIn("first difference",prompt)
             if folder.name=="review":
+                self.assertEqual(payload["observations"][0]["historical_choice"]["details"],"historical_choices/draft")
                 return parse({"use":"revise","focus":{"task":"b_1"},"preserve_task":"a_1","objects":other,
                               "reason":"The data existed; the consumer missed it.","prediction":"Select correctly"})
+            self.assertEqual([t["historical_choice"]["details"] for t in payload["trials"]],
+                             ["historical_choices/draft","historical_choices/revised"])
             return parse({"use":"revised","reason":"Matched revised observation"})
         seen=[]
         def probe(bench,p,worker,key,prior):
             seen.append((key,probe_cases(p),prior,p["objects"]))
             return {"cases":[key],"batch":[],"historical_impact":{key:{"arm":key}},
+                    "historical_choice":{"mode":MODE,"details":"historical_choices/"+key},
                     "cost":{"fresh_decisions":3 if not prior else 6}, "stage_cost":{"fresh_decisions":3}}
         with patch.object(b,"packet",return_value={}),patch.object(b,"draft",return_value=self.draft),patch.object(b,"ask",side_effect=ask), \
              patch("jev_harness.batch_revision_trials.preview_batch",side_effect=probe):

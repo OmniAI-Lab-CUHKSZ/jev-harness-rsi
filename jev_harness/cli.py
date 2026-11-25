@@ -41,6 +41,9 @@ def initialize(root, settings):
         saved = read(config_path)
         if "historical_choice" not in saved.get("optimizer", {}):
             settings["optimizer"].pop("historical_choice", None)
+        elif isinstance(saved["optimizer"]["historical_choice"], bool):
+            # Existing experiments keep their recorded single-choice or disabled protocol.
+            settings["optimizer"]["historical_choice"] = saved["optimizer"]["historical_choice"]
         if "menu_format" not in saved:
             # Earlier releases used the history-preview editor and single-session batch one.
             settings.pop("menu_format", None)

@@ -9,6 +9,7 @@ from .contrast_probes import compare_candidates
 from .formal_optimizer import read_events
 from .history_impact import assess, parameter_views, trace_sites
 from .menu_preview import initial_change
+from . import solved_train_preview
 from .train_evidence import serialized
 from .trace_comparison import ParentPath, compare_path
 
@@ -87,24 +88,29 @@ def compare_wording(lib, events, original, rewrite):
     return comparisons
 
 
-def compare_train_paths(bench, proposal, candidate):
-    """Use every current task and the latest scored Train reference per earlier task."""
+def compare_train_paths(bench, proposal, candidate, *, solved_ballots=None):
+    """Render current Train paths and the historical references selected by this experiment."""
+    solved_mode = getattr(bench.study, "settings", {}).get("optimizer", {}).get("historical_choice") == solved_train_preview.MODE
     if not hasattr(bench,"reference_paths"):
         docs = {task:"current/"+task for task in bench.tasks}
-        for revision in reversed(bench.previous):
-            for field in (("train_traces","parent_traces") if revision.get("accepted") else ("parent_traces","train_traces")):
-                for name in revision.get(field,[]):
-                    path = Path(name)
-                    task = path.parts[-3]
-                    doc = path.parts[-4]+"/"+task
-                    if doc in bench.paths:
-                        docs.setdefault(task,doc)
-        for doc in reversed(bench.archived):
-            docs.setdefault(doc.split("/", 1)[1], doc)
+        if solved_mode:
+            docs.update(solved_train_preview.solved_documents(bench))
+        else:
+            for revision in reversed(bench.previous):
+                for field in (("train_traces","parent_traces") if revision.get("accepted") else ("parent_traces","train_traces")):
+                    for name in revision.get(field,[]):
+                        path = Path(name)
+                        task = path.parts[-3]
+                        doc = path.parts[-4]+"/"+task
+                        if doc in bench.paths:
+                            docs.setdefault(task,doc)
+            for doc in reversed(bench.archived):
+                docs.setdefault(doc.split("/", 1)[1], doc)
         bench.reference_paths = {}
         for task,doc in sorted(docs.items()):
             events = bench.current_events[task] if task in bench.tasks else read_events(bench.paths[doc])
-            ref = ParentPath(events,bench.lib,bench.study.functions,bench.study.execution)
+            ref_type = solved_train_preview.SolvedReference if solved_mode and task not in bench.tasks else ParentPath
+            ref = ref_type(events,bench.lib,bench.study.functions,bench.study.execution)
             bench.reference_paths[task] = (doc,events,ref)
 
     def rerender(task,lib):
@@ -112,10 +118,20 @@ def compare_train_paths(bench, proposal, candidate):
         return {"trace":doc, **compare_path(events,ref,lib,bench.study.functions,bench.study.execution)}
 
     current = {task:rerender(task,candidate) for task in sorted(bench.tasks)}
-    old = {task:rerender(task,candidate) for task in bench.reference_paths if task not in current}
+    old = {}
+    for task,(doc,events,ref) in bench.reference_paths.items():
+        if task in current:
+            continue
+        if solved_mode:
+            path, ballot = solved_train_preview.first_change(events,ref,candidate,bench.study.functions,bench.study.execution)
+            old[task] = {"trace":doc, **path}
+            if ballot and solved_ballots is not None:
+                solved_ballots[task] = ballot
+        else:
+            old[task] = rerender(task,candidate)
     openings = Counter()
     for task,row in old.items():
-        if row["status"] != "unresolved":
+        if row["status"] != "unresolved" or solved_mode:
             continue
         events = bench.reference_paths[task][1]
         opening = initial_change(bench.lib,candidate,events,bench.study.functions)
@@ -151,6 +167,8 @@ def compare_train_paths(bench, proposal, candidate):
         # Replaying the most recent record for that task would test the wrong example.
         if doc in paths_by_doc:
             result = dict(paths_by_doc[doc])
+        elif solved_mode:
+            return {"status":"source_only","reason":"Outside the selected first-change preservation references."}
         else:
             events = read_events(bench.paths[doc])
             ref = ParentPath(events, bench.lib, bench.study.functions, bench.study.execution)
@@ -177,7 +195,9 @@ def compare_train_paths(bench, proposal, candidate):
 
 def preview_batch(bench,proposal,worker,key,prior_cost=None):
     candidate,_ = bench.install(bench.lib,proposal,bench.sources,bench.study.functions)
-    current,old,paths = compare_train_paths(bench,proposal,candidate)
+    choice_mode = bench.study.settings.get("optimizer",{}).get("historical_choice")
+    ballots = {}
+    current,old,paths = compare_train_paths(bench,proposal,candidate,solved_ballots=ballots)
     batch = [{"task":item["task"],"parent_success":item["success"],"parent_tokens":item["output_tokens"],
               **current[item["task"]]} for item in bench.index]
     folder = bench.folder/("trial_"+key)
@@ -194,13 +214,18 @@ def preview_batch(bench,proposal,worker,key,prior_cost=None):
     cases = probe_cases({**proposal,"preserve_task":selected},revised=prior_cost is not None,protect_generation=protect)
     report = compare_candidates(bench,{"alternatives":[{**proposal,"id":key}],
                                       "cases":cases},
-                                worker,folder=folder,prior_cost=prior_cost,matched_paths=current)
-    if key == "draft" and bench.study.settings.get("optimizer",{}).get("historical_choice"):
+                                worker,folder=folder,prior_cost=prior_cost,matched_paths=current,
+                                history_docs=[r["trace"] for r in old.values()] if choice_mode==solved_train_preview.MODE else None)
+    if choice_mode == solved_train_preview.MODE:
+        report["historical_choice"] = solved_train_preview.review_solved(bench, old, ballots, folder)
+    elif key == "draft" and choice_mode:
         from .historical_choice import historical_choice
         report["historical_choice"] = historical_choice(bench,proposal,candidate,old,paths,worker,
                                                         folder/"historical_choice.json")
     save(folder/"path_comparison.json",{"batch":batch,"history":old,**paths})
     documents = []
+    if choice_mode == solved_train_preview.MODE:
+        documents.append(report["historical_choice"]["details"])
     for i,case in enumerate(report["cases"],1):
         name = f"trial/{key}/{case['relation']}"
         trace = folder/f"case_{i}_alt_1"/"trace.jsonl"

@@ -194,7 +194,7 @@ def observations(events,names):
     return {"events":values,"natural_use":natural_use(events,names)}
 
 
-def compare_candidates(bench,draft,worker,*,folder=None,prior_cost=None,matched_paths=None):
+def compare_candidates(bench,draft,worker,*,folder=None,prior_cost=None,matched_paths=None,history_docs=None):
     study = bench.study
     resumable = folder is not None
     folder = folder or bench.folder
@@ -209,7 +209,7 @@ def compare_candidates(bench,draft,worker,*,folder=None,prior_cost=None,matched_
     if target.is_file():
         return read(target)
     hypotheses = draft["alternatives"]
-    archive = {doc:bench.trace_data(doc) for doc in bench.archived}
+    archive = {doc:bench.trace_data(doc) for doc in (bench.archived if history_docs is None else history_docs)}
     candidates,impact = {},{}
     for j,h in enumerate(hypotheses):
         lib,_ = bench.install(bench.lib,h,bench.sources,study.functions)

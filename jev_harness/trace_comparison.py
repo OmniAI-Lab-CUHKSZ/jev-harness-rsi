@@ -78,7 +78,7 @@ class ParentPath:
 
 
 def compare_path(events, parent_path, candidate, functions, settings, *, inspect_change=None,
-                 executor_type=SemanticAssembly):
+                 executor_type=SemanticAssembly, compare_menu=None):
     position = 0
     difference = None
 
@@ -93,6 +93,8 @@ def compare_path(events, parent_path, candidate, functions, settings, *, inspect
                 raise Boundary
             index, expected, source = parent_path.requests[position]
             fields = different_fields(source, args) if op == expected else []
+            if compare_menu and op == expected == "decide" and position < parent_path.matched:
+                fields = compare_menu(position, args, fields, self.menu)
             if expected != op or fields:
                 if inspect_change is not None:
                     inspect_change(expected,source,op,args)

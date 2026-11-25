@@ -50,6 +50,10 @@ def put_ids(rows):
 
 
 class FragmentAssembly(FormalExecutor):
+    def pick_page(self, part, pick, **mode):
+        local = [option(row["label"], i) for i, row in enumerate(part)]
+        return part[pick(local, **mode)]
+
     def choose(self, name, choices, *, widen_on_none=False, **facts):
         if not choices:
             raise Uncovered("No grounded options for " + name)
@@ -67,26 +71,24 @@ class FragmentAssembly(FormalExecutor):
             closest = None
             for start in range(0, len(choices), MAX_REAL_OPTIONS):
                 part = choices[start:start + MAX_REAL_OPTIONS]
-                local = [option(row["label"], i) for i, row in enumerate(part)]
                 try:
-                    i = pick(local)
+                    winner = self.pick_page(part, pick)
                 except NativeNone as exc:
                     if review and not widen_on_none:
                         confidence = max(exc.response["probabilities"])
                         if confidence < self.step_review_threshold and (closest is None or confidence < closest[0]):
-                            closest = (confidence, part, local, exc.response)
+                            closest = (confidence, part, exc.response)
                 except Uncovered as exc:
                     if "uncovered option" not in str(exc):
                         raise
                 else:
-                    winners.append(part[i])
+                    winners.append(winner)
             choices = winners
             if not choices:
                 # All pages abstained. Revisit the least certain page, keeping its original option indices.
                 if closest is not None:
-                    _, part, local, response = closest
-                    i = pick(local, review_step=True, native_response=response)
-                    return part[i]["value"]
+                    _, part, response = closest
+                    return self.pick_page(part, pick, review_step=True, native_response=response)["value"]
                 raise Uncovered("No grounded choice for " + name)
         return pick(choices, review_step=True, widen_on_none=widen_on_none) if review else pick(choices)
 

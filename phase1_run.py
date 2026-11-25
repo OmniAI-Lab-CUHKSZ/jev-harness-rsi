@@ -229,12 +229,25 @@ def offline_optimizer_costs(root, *, historical):
             meters.append(read(meter))
     if meters:
         costs["offline_27b_probes"] = {key:sum(m.get(key,0) for m in meters) for key in sorted(set().union(*meters))}
-    choices = [read(p) for folder in folders for p in folder.glob("trial_draft/historical_choice.json")]
-    if choices:
+    from jev_harness.solved_train_preview import USAGE, saved_requests
+    choices = []
+    has_preview = False
+    for folder in folders:
+        for trial in folder.glob("trial_*"):
+            calls = saved_requests(trial)
+            saved_choice = trial/"historical_choice.json"
+            if calls:
+                choices.extend(calls)
+                has_preview = True
+            elif saved_choice.is_file():
+                item = read(saved_choice)
+                if "summary" not in item:  # Single-choice experiments store usage with the result.
+                    choices.append(item)
+                has_preview = True
+    if has_preview:
         costs["offline_27b_historical_choice"] = {
-            **{k:sum(row.get(k,0) for row in choices) for k in
-               ("model_calls","backend_requests","input_tokens","output_tokens","reasoning_tokens","seconds")},
-            "unconfirmed_calls":sum(row["status"]=="outcome_unconfirmed" for row in choices)}
+            **{k:sum(row.get(k,0) for row in choices) for k in USAGE},
+            "unconfirmed_calls":sum(row["model_calls"] for row in choices if row["status"]=="outcome_unconfirmed")}
     return costs
 
 

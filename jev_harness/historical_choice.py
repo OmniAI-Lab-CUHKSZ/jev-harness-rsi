@@ -1,4 +1,6 @@
 """Give the editor one live choice at a changed decision in a successful earlier Train trace."""
+import json
+
 from formal_run import read, save
 
 from .formal_optimizer import cleaned_text, read_events
@@ -20,6 +22,39 @@ def recorded_decision(events, index):
             return event
         break
     return None
+
+
+def official_request(page, args, settings):
+    args = dict(args)
+    page["native_widens"] = page["widen"] and page["review"] and args.get("thinking") != "auto"
+    if page["review"] and settings.get("step_review_threshold") is not None:
+        if settings.get("step_review_mode") != "official_adaptive" or page["budget"] <= 0:
+            return None
+        if args.get("thinking") != "auto":
+            if page["calls_left"] < 2:
+                return None
+            args.update(thinking="auto", threshold=settings["step_review_threshold"],
+                        think_budget=min(page["budget"], settings["step_review_thinking_budget"]))
+    return args
+
+
+def ballot_outcome(answer, choices, prior, page, *, page_indices=False):
+    selected = answer.get("index")
+    probabilities = answer.get("probabilities") or []
+    native = answer.get("native_probabilities") or probabilities
+    if (len(probabilities) != len(choices) or len(native) != len(choices)
+            or type(selected) is not int or not 0 <= selected < len(choices)):
+        return {"status":"invalid_response"}
+    widened = page["native_widens"] and native.index(max(native)) == len(choices)-1
+    if widened:
+        selected, probabilities = len(choices)-1, native
+    chosen = choices[selected]
+    same = (chosen["label"] == prior["label"] if page_indices else
+            json.dumps(chosen["value"], sort_keys=True) == json.dumps(prior["value"], sort_keys=True))
+    result = dict(status="observed", candidate_choice=chosen, same_choice=same, confidence=probabilities[selected])
+    if max(probabilities) < page["minimum"] and (widened or not answer.get("thinking_used")):
+        result.update(status="policy_abstained", same_choice=None)
+    return result
 
 
 def changed_ballot(events, parent, candidate, functions, settings):
@@ -52,17 +87,11 @@ def changed_ballot(events, parent, candidate, functions, settings):
     choices = [*page["choices"], {"value": None, "label": args["options"][-1]}]
     if [str(c["label"]) for c in choices] != args["options"]:
         return None
-    page["native_widens"] = page["widen"] and page["review"] and args.get("thinking") != "auto"
     # Ask the official fused endpoint once. A focused menu that natively abstains
     # widens before review in the online executor, even if the endpoint also deliberated.
-    if page["review"] and settings.get("step_review_threshold") is not None:
-        if settings.get("step_review_mode") != "official_adaptive" or page["budget"] <= 0:
-            return None
-        if args.get("thinking") != "auto":
-            if page["calls_left"] < 2:
-                return None
-            args.update(thinking="auto", threshold=settings["step_review_threshold"],
-                        think_budget=min(page["budget"], settings["step_review_thinking_budget"]))
+    page["request"] = official_request(page, args, settings)
+    if page["request"] is None:
+        return None
     return change, before, page, choices
 
 
@@ -113,23 +142,8 @@ def historical_choice(bench, proposal, candidate, old, paths, worker, target):
         else:
             result.update({k:answer[k] for k in ("input_tokens","output_tokens","reasoning_tokens",
                           "backend_requests","seconds","thinking_used") if k in answer})
-            selected = answer.get("index")
-            probabilities = answer.get("probabilities", [])
-            native = answer.get("native_probabilities") or probabilities
-            if (len(probabilities) == len(choices) and len(native) == len(choices)
-                    and type(selected) is int and 0 <= selected < len(choices)):
-                widened = page["native_widens"] and native.index(max(native)) == len(choices)-1
-                if widened:
-                    selected, probabilities = len(choices)-1, native
-                chosen = choices[selected]
-                local_indices = [c["value"] for c in choices[:-1]] == list(range(len(choices)-1))
-                same = chosen["label"] == prior["label"] if local_indices else chosen["value"] == prior["value"]
-                result.update(status="observed", candidate_choice=chosen, same_choice=same,
-                              confidence=probabilities[selected])
-                if max(probabilities) < page["minimum"] and (widened or not answer.get("thinking_used")):
-                    result.update(status="policy_abstained", same_choice=None)
-            else:
-                result.update(status="invalid_response")
+            local_indices = [c["value"] for c in choices[:-1]] == list(range(len(choices)-1))
+            result.update(ballot_outcome(answer, choices, prior, page, page_indices=local_indices))
         save(target, result)
         return result
     result = {"status":"no_comparable_solved_train_choice", "model_calls":0, "version":"draft"}

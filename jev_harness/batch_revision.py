@@ -16,6 +16,7 @@ from .semantic_workbench import DSL
 from .train_evidence import TrainEvidence, serialized
 from .train_precedents import TrainPrecedents
 from .runtime import is_open_generation, parse_json
+from .solved_train_preview import MODE as SOLVED_FIRST_CHANGE
 
 
 OBJECTIVE = """Optimize the shared harness for the fixed 27B: maximize whole tasks solved first, then minimize
@@ -107,6 +108,14 @@ An unresolved past trace may still have a comparable opening menu, conditional o
 Use this only for those menus. If an outcome was not observed, say so."""
 
 FINAL_REVIEW = REVIEW_CRITERIA + '\nReturn {use:"draft"|"revised"|"parent",reason}. Compare each version using its own measured evidence.'
+
+SOLVED_REVIEW = """
+Read historical_choice for each tested patch. The program checks one successful earlier Train recording per
+distinct task and stops at its first difference. Compare each listed choice change with the old goal and
+grounded action. Consider changed tool arguments, handoffs and generation inputs as possible interference.
+An equal choice establishes only that page's result. An unaligned prefix or missing reply is unknown.
+Use read/find on the details document for any task, including a task folded into the counts. Use this
+evidence to decide whether to retain, revise or submit the patch. Whole-task outcomes require execution."""
 
 
 def revised_patch(draft, review):
@@ -335,7 +344,13 @@ class BatchRevisionWorkbench(TrainEvidence):
         if path.exists():
             return read(path)
         packet = self.packet()
-        if self.study.settings.get("optimizer",{}).get("historical_choice"):
+        choice_mode = self.study.settings.get("optimizer",{}).get("historical_choice")
+        if choice_mode == SOLVED_FIRST_CHANGE:
+            packet["historical_choice_preview"] = (
+                "The program checks the first change on each previously solved earlier Train task for both "
+                "the draft and any revision. Comparable changed Jev menus receive a real selection. Matching "
+                "inputs share a response. Historical failures are available for diagnosis in the Train catalogue.")
+        elif choice_mode:
             packet["historical_choice_preview"] = (
                 "One extra 27B choice is available on a successful earlier Train task at its first changed "
                 "decision. Cite a relevant contrast in history_use to prioritize it. The draft review receives "
@@ -394,7 +409,9 @@ class BatchRevisionWorkbench(TrainEvidence):
             review = read(review_path)
         else:
             instructions = REVIEW
-            if "historical_choice" in trials[0]:
+            if trials[0].get("historical_choice", {}).get("mode") == SOLVED_FIRST_CHANGE:
+                instructions += SOLVED_REVIEW
+            elif "historical_choice" in trials[0]:
                 instructions += ("\nInspect historical_choice on the draft when its status is observed. "
                                  "Compare the old and new choices with the old goal. Explain whether the new choice "
                                  "preserves the next step, offers useful reuse, or introduces interference. "
@@ -405,7 +422,10 @@ class BatchRevisionWorkbench(TrainEvidence):
         if review["use"] == "revise":
             patches["revised"] = revised_patch(draft,review)
             cost = preview("revised",cost)
-            review = self.ask(FINAL_REVIEW,
+            instructions = FINAL_REVIEW
+            if trials[-1].get("historical_choice", {}).get("mode") == SOLVED_FIRST_CHANGE:
+                instructions += SOLVED_REVIEW
+            review = self.ask(instructions,
                               {"focus":draft["focus"],"patches":patches,"trials":trials},self.folder/"final_review",decision)
         chosen = review["use"]
         if chosen=="parent":
