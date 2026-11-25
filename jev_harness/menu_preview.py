@@ -47,8 +47,12 @@ def initial_change(parent, candidate, events, functions=()):
     fields = ("question","skill","state","options","ids")
     def changes(pair):
         return [field for field in fields if pair[0].get(field) != pair[1].get(field)]
+    family_pages = [[p for p in arm if p["node"]=="fragment/assembly"] for arm in pages]
+    family_changes = [field for field in fields if [p[field] for p in family_pages[0]] !=
+                      [p[field] for p in family_pages[1]]]
     comparable = selection is not None and all(steps) and (
-        family is None or all(family in page.get("ids",[]) for page in assembly))
+        family is None or all(any(p["node"]=="fragment/assembly" and family in p["ids"] for p in arm)
+                              for arm in pages))
     return {"observed_parent_family":family, "family_menu_rendered":any(assembly),
             "action_menu_comparable":comparable, "changed_fields":{
-                "fragment/assembly":changes(assembly), "fragment/step":changes(steps) if comparable else None}}
+                "fragment/assembly":family_changes, "fragment/step":changes(steps) if comparable else None}}

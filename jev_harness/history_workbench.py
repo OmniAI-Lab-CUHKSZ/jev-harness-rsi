@@ -48,7 +48,7 @@ def check_choice(model, lib, request, state):
         select_guidance(engine,state)
     except (WorkerError,WorkerUnavailable) as exc:
         replies = [e['response'] for e in engine.trace.events if e['event']=='model' and not e['response'].get('error')]
-        return {'guide':None,'choice':None,'eligible':menu(lib,state)[0],'unavailable':str(exc)[:200],
+        return {'guide':None,'choice':None,'eligible':menu(lib,{**state,'request':request})[0],'unavailable':str(exc)[:200],
                 'calls':len(replies),'input_tokens':sum(r.get('input_tokens',0) for r in replies),
                 'output_tokens':sum(r.get('output_tokens',0) for r in replies)}
     event = engine.trace.events[-1]
@@ -207,7 +207,7 @@ class HistoryWorkbench(FragmentTrialWorkbench):
             key = (doc,idx,arm,request,missing)
             if key not in cache:
                 lib = self.lib if arm=='parent' else candidate
-                names = menu(lib,state)[0]
+                names = menu(lib,{**state,'request':request})[0]
                 try:
                     model = worker.worker('model') if names else None
                     cache[key] = check_choice(model,lib,request,state)

@@ -96,6 +96,30 @@ def values(choices):
     return [json.dumps(c["value"], sort_keys=True) for c in choices]
 
 
+def before_ballot(events, event):
+    # A second adaptive request for the same page can follow its native request.
+    pos = event - 1
+    while pos >= 0 and events[pos]["event"] == "model" and events[pos]["operation"] == "decide":
+        pos -= 1
+    return pos
+
+
+def saved_page(events, event, choices):
+    pos = before_ballot(events,event)
+    if pos >= 0 and events[pos]["event"] == "decision_rules":
+        pos -= 1
+    if pos >= 0 and events[pos]["event"] == "page_bindings":
+        data = events[pos]["values"]
+        if len(data) == len(choices):
+            return [dict(c,value=v) for c,v in zip(choices,data)]
+
+
+def different_rules(events, event, page):
+    pos = before_ballot(events,event)
+    return pos >= 0 and events[pos]["event"] == "decision_rules" and any(
+        events[pos][k] != page[k] for k in ("review","widen","minimum"))
+
+
 class SolvedReference(ParentPath):
     def __init__(self, events, library, functions, settings):
         self.events, self.menus = events, {}
@@ -109,15 +133,18 @@ class SolvedReference(ParentPath):
         result = super().request(op, **args)
         if op == "decide":
             _, before = self.menus[position]
+            bound = saved_page(self.events,self.tape[position][0],before["candidates"][:-1]) if before else None
             if before and (before["node"] != self.menu["node"] or
-                           values(before["candidates"][:-1]) != values(self.menu["raw"])):
+                           values(before["candidates"][:-1]) != values(self.menu["raw"]) or
+                           bound is not None and values(bound) != values(self.menu["choices"]) or
+                           different_rules(self.events,self.tape[position][0],self.menu)):
                 self.matched = position
                 self.reason = "parent decision bindings differ from recording"
                 raise Boundary
         return result
 
 
-def menu_ballot(before, old_choices, old_request, page, request, settings):
+def menu_ballot(before, old_choices, old_request, page, request, settings, *, force_live=False):
     none = before["candidates"][-1]
     choices = [*page["choices"], none]
     if [str(c["label"]) for c in choices] != request.get("options"):
@@ -132,35 +159,61 @@ def menu_ballot(before, old_choices, old_request, page, request, settings):
                   added_values=[c["value"] for c,v in zip(page["choices"],new_values) if v not in old_values][:4],
                   added_options=[s for s in request["options"] if s not in old_request["options"]],
                   removed_options=[s for s in old_request["options"] if s not in request["options"]])
-    if different_fields(old_request, request):
+    if force_live or different_fields(old_request, request):
         ballot["request"] = official_request(page, request, settings)
     else:
         ballot["recorded"] = dict(candidate_choice=choices[selected], same_choice=values([choices[selected]])==values([prior]))
     return ballot
 
 
-def recording_boundary_ballot(events, parent, page, request, functions, settings, source_library):
+def new_route_ballot(operation, page, request, settings, before=None):
+    choices = [*page["choices"], {"label":request["options"][-1],"value":None}]
+    if [str(c["label"]) for c in choices] != request["options"]:
+        return {}
+    return dict(route_from=operation, previous_node=before and before["node"],
+                node=page["node"], question=request["question"], page=page, choices=choices,
+                request=official_request(page, request, settings))
+
+
+def recording_boundary_ballot(events, parent, page, request, functions, settings, source_library, *, retrieval=False):
     """All requests before this position matched. Compare at this position without supplying its old response."""
     position = parent.matched
     if position >= len(parent.tape):
         return {}
     event, op, old_request, _ = parent.tape[position]
-    if op != "decide" or not (before := recorded_decision(events, event)):
-        return {}
-    if page["node"] != before["node"]:
+    before = recorded_decision(events, event) if op=="decide" else None
+    if retrieval and (op != "decide" or before and page["node"] != before["node"]):
+        result = new_route_ballot(op,page,request,settings,before)
+        if result:
+            result["recording_comparison"] = {"event":event,"fields":["decision_route"]}
+        return result
+    if not before and retrieval:
+        result = new_route_ballot(op,page,request,settings)
+        if result:
+            result["recording_comparison"] = {"event":event,"fields":["unrecorded_final_selection"]}
+        return result
+    if not before or page["node"] != before["node"]:
         return {}
     old_choices = before["candidates"][:-1]
     # Paged decisions record indices instead of the underlying rows. Recover those
     # rows with their originating harness. A coincident index cannot identify an action.
-    if old_choices and [c["value"] for c in old_choices] == list(range(len(old_choices))):
+    bound = saved_page(events,event,old_choices)
+    if bound is not None:
+        old_choices = bound
+    elif old_choices and [c["value"] for c in old_choices] == list(range(len(old_choices))):
         original = source_library() if source_library is not None else None
-        if original is None:
-            return {}
-        archive = SolvedReference(events, original, functions, settings)
-        if archive.matched <= position:
+        archive = SolvedReference(events, original, functions, settings) if original is not None else None
+        if archive is None or archive.matched <= position:
+            # The candidate input is grounded at the shared prefix, even if the old row ID was lost.
+            if retrieval:
+                result = new_route_ballot(op,page,request,settings,before)
+                if result:
+                    result["recording_comparison"] = {"event":event,"fields":["unavailable_recorded_binding"]}
+                return result
             return {}
         old_choices = archive.menus[position][0]["choices"]
-    ballot = menu_ballot(before, old_choices, old_request, page, request, settings)
+    policy_changed = different_rules(events,event,page)
+    ballot = menu_ballot(before, old_choices, old_request, page, request, settings, force_live=policy_changed)
     if not ballot:
         return {}
     parent_page = parent.menus.get(position, (None,None))[0]
@@ -171,6 +224,8 @@ def recording_boundary_ballot(events, parent, page, request, functions, settings
                    and all(parent_page[k] == page[k] for k in ("review","widen","minimum"))
                    and official_request(dict(parent_page),parent_request,settings) == official_request(dict(page),request,settings))
     fields = different_fields(old_request, request)
+    if policy_changed:
+        fields.append("decision_policy")
     if values(old_choices) != values(page["choices"]):
         fields.append("option_values")
     ballot["recording_comparison"] = {"event":event, "fields":fields, "candidate_menu_matches_parent":matches}
@@ -180,6 +235,7 @@ def recording_boundary_ballot(events, parent, page, request, functions, settings
 def first_change(events, parent, candidate, functions, settings, *, source_library=None):
     ballot = {}
     request_detail = {}
+    retrieval = isinstance(candidate, dict) and bool(candidate.get("menu_retrieval"))
 
     def locate(before, old, after, new):
         if before == after == "call":
@@ -202,16 +258,27 @@ def first_change(events, parent, candidate, functions, settings, *, source_libra
         extra = [] if same_node else ["decision_node"]
         if old_values != new_values:
             extra.append("option_values")
+        if not same_node and retrieval:
+            ballot.update(new_route_ballot("decide",menu,args,settings,before))
+        policy_changed = any(previous[k] != menu[k] for k in ("review","widen","minimum"))
+        if policy_changed:
+            extra.append("decision_policy")
         if not (fields or extra) or not before or not same_node:
             return fields + extra
-        ballot.update(menu_ballot(before, previous["choices"], parent.requests[position][2], menu, args, settings))
+        ballot.update(menu_ballot(before, previous["choices"], parent.requests[position][2], menu, args, settings,
+                                  force_live=policy_changed))
         return fields + extra
 
     def inspect_boundary(request, page):
-        ballot.update(recording_boundary_ballot(events, parent, page, request, functions, settings, source_library))
+        ballot.update(recording_boundary_ballot(events, parent, page, request, functions, settings, source_library,
+                                                retrieval=retrieval))
+
+    def inspect_route(op, request, page):
+        ballot.update(new_route_ballot(op,page,request,settings))
 
     path = compare_path(events, parent, candidate, functions, settings, executor_type=MenuReplay,
-                        compare_menu=compare_menu, inspect_change=locate, inspect_boundary=inspect_boundary)
+                        compare_menu=compare_menu, inspect_change=locate, inspect_boundary=inspect_boundary,
+                        inspect_route=inspect_route if retrieval else None)
     if request_detail:
         path["first_change"].update(request_detail)
     if "recording_comparison" in ballot:
@@ -257,6 +324,23 @@ def task_observation(task, path, reference, ballot, cache):
     if change:
         row["first_change"] = change
     recording = ballot.get("recording_comparison")
+    if "route_from" in ballot:
+        row.update(previous_operation=ballot["route_from"], previous_node=ballot["previous_node"], node=ballot["node"])
+        if recording:
+            row["recording_comparison"] = recording
+        req = ballot.get("request")
+        if not req:
+            return {**row, "status":"outcome_unconfirmed","reason":"candidate decision exceeds the recorded budget"}
+        record = cache[request_key("decide",req)]
+        if record["status"] != "received":
+            return {**row, "status":"outcome_unconfirmed","reason":record.get("error","no reply")}
+        outcome = ballot_outcome(record["answer"],ballot["choices"],{"value":None},ballot["page"])
+        if outcome["status"] != "observed":
+            return {**row,"status":outcome["status"],"source":"historical_27b"}
+        status = "observed_without_old_binding" if recording and any(field in recording["fields"] for field in
+                 ("unavailable_recorded_binding","unrecorded_final_selection")) else "new_decision"
+        return {**row,"status":status,"source":"historical_27b",
+                "candidate_choice":public_choice(outcome["candidate_choice"]), "confidence":outcome["confidence"]}
     if recording:
         row["recording_comparison"] = recording
     elif not parent.complete and path["matched"] >= parent.matched:

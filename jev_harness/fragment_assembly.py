@@ -51,6 +51,8 @@ def put_ids(rows):
 
 class FragmentAssembly(FormalExecutor):
     def pick_page(self, part, pick, **mode):
+        if self.registry.get("menu_retrieval"):
+            self.trace.add("page_bindings", values=[row["value"] for row in part])
         local = [option(row["label"], i) for i, row in enumerate(part)]
         return part[pick(local, **mode)]
 
@@ -170,7 +172,7 @@ class FragmentAssembly(FormalExecutor):
             raise Uncovered("No live matches for the named " + kind)
         request = " " + normalized(self.request) + " "
         exact = [r for r in records if " " + normalized(r["title"]) + " " in request]
-        options = exact or records
+        options = records if self.registry.get("menu_retrieval") else exact or records
         i = self.choose("entity", [option(r["title"], i) for i, r in enumerate(options)], kind=kind)
         return options[i]
 

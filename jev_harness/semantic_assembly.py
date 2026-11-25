@@ -10,6 +10,7 @@ from .fragment_assembly import option
 from .policy_programs import load_program
 from .runtime import REVIEW_MAX_TOKENS, REVIEW_THINKING_BUDGET, STEP_REVIEW, Uncovered, abstained
 from .scoped_menu import is_scoped, result_sources, specific_use
+from . import retrieval
 
 
 class SemanticAssembly(CardAssembly):
@@ -100,7 +101,18 @@ class SemanticAssembly(CardAssembly):
                                   {**self.policy_context(), "options":choices, "evidence":facts})
             if isinstance(indexes, list) and all(type(i) is int and 0 <= i < len(choices) for i in indexes):
                 choices = [choices[i] for i in dict.fromkeys(indexes)]
-        selected = super().choose(name, choices, widen_on_none=widen_on_none, **facts)
+        groups = [choices]
+        if self.registry.get("menu_retrieval") and name in {"entity", "query", "directory", "genre"}:
+            groups = retrieval.record_groups(choices, self.request)
+        if not groups:
+            raise Uncovered("No grounded options for " + name)
+        for i, group in enumerate(groups):
+            try:
+                selected = super().choose(name, group, widen_on_none=widen_on_none, **facts)
+                break
+            except Uncovered as exc:
+                if i + 1 == len(groups) or not abstained(exc):
+                    raise
         if self.active_card and name != "card_parameter":
             self.step_bindings[name] = selected
         return selected
@@ -228,6 +240,8 @@ class SemanticAssembly(CardAssembly):
         menus = self.families(eligible)
         self.trace.add("assembly_candidates", app_hints=sorted(self.app_hints), eligible=eligible,
                        families={n:members for n, (_, members) in menus.items()}, excluded=excluded)
+        if self.registry.get("menu_retrieval"):
+            return self.retrieved_card(menus, eligible, excluded, state)
         chosen, mode = None, "all"
         if len(menus) > 1:
             choices = [option(desc if is_scoped(self.registry) else desc + " Available steps: " + " | ".join(cards[s]["description"] for s in members[:6]), name)
@@ -257,7 +271,40 @@ class SemanticAssembly(CardAssembly):
         self.trace.add("assembly_widen", rejected=chosen, offered=eligible)
         return pick(eligible, None)
 
-    def pick_scoped(self, names, menu, eligible, excluded, state):
+    def retrieved_card(self, menus, eligible, excluded, state):
+        cards = self.registry["cards"]
+        scores = retrieval.card_scores(cards, self.request, self.public, self.app_hints)
+        chosen = None
+        if len(menus) > 1:
+            for i, group in enumerate(retrieval.family_groups(menus, scores, self.request, self.app_hints)):
+                self.trace.add("retrieval_menu", node="assembly", batch=i+1, offered=group)
+                try:
+                    chosen = self.choose("assembly", [option(menus[n][0], n) for n in group], **state)
+                    break
+                except Uncovered as exc:
+                    if not abstained(exc):
+                        raise
+        focused = menus[chosen][1] if chosen else eligible
+        groups = retrieval.step_groups(focused, eligible, scores, cards, self.public, self.request)
+        self.trace.add("assembly_selection", mode="jev" if chosen else "retrieved", family=chosen,
+                       offered=groups[0] if groups else [], full_count=len(eligible))
+        for i, group in enumerate(groups):
+            facts = state
+            if i:
+                # Give the selector concrete evidence for previously offered consumers.
+                facts = retrieval.continuation_state(group, cards, self.public, state)
+                if group == groups[0] and facts == state:
+                    break
+                self.trace.add("assembly_widen", rejected=chosen, offered=group)
+            self.trace.add("retrieval_menu", node="step", batch=i+1, offered=group)
+            try:
+                return self.pick_scoped(group, chosen, eligible, excluded, facts, widen=i+1 < len(groups))
+            except Uncovered as exc:
+                if i+1 == len(groups) or not abstained(exc):
+                    raise
+        raise Uncovered("No grounded choice for step")
+
+    def pick_scoped(self, names, menu, eligible, excluded, state, *, widen=None):
         cards = self.registry["cards"]
         common = [n for n in names if not specific_use(cards[n])]
         specific = [n for n in names if specific_use(cards[n])]
@@ -269,7 +316,7 @@ class SemanticAssembly(CardAssembly):
         if common and len(specific) > 1:
             choices = [self.card_option(n,cards[n]) for n in common]
             choices.append(option("Choose a specialized operation for a particular requested outcome.", {"specialized":True}))
-            choice = select(common,choices,names != eligible)
+            choice = select(common,choices,names != eligible if widen is None else widen)
             if choice != {"specialized":True}:
                 return choice
             try:
@@ -278,7 +325,7 @@ class SemanticAssembly(CardAssembly):
                 if not abstained(exc):
                     raise
                 names = common
-        return select(names,[self.card_option(n,cards[n]) for n in names],names != eligible)
+        return select(names,[self.card_option(n,cards[n]) for n in names],names != eligible if widen is None else widen)
 
     def read_offers(self):
         offers = super().read_offers()
@@ -290,7 +337,13 @@ class SemanticAssembly(CardAssembly):
         return offers
 
     def preferred_tool_docs(self):
-        return {api for _, rule in self.matching_handoffs() for api in rule.get("apis", [])}
+        preferred = {api for _, rule in self.matching_handoffs() for api in rule.get("apis", [])}
+        if self.registry.get("menu_retrieval"):
+            cards = self.registry["cards"]
+            ready = [n for n,c in cards.items() if c.get("api") and self.unavailable(n,c) is None]
+            scores = retrieval.card_scores(cards, self.request, self.public, self.app_hints)
+            preferred.update(cards[n]["api"] for n in retrieval.ranked(ready,scores,3))
+        return preferred
 
     def delegate_read(self, identifier, arguments):
         self.step_bindings = {}
@@ -302,6 +355,13 @@ class SemanticAssembly(CardAssembly):
 
     def handoff(self, reason):
         data = super().handoff(reason)
+        if self.registry.get("menu_retrieval") and data.get("available_public_reads"):
+            offers = self.read_offers()
+            scores = retrieval.card_scores(self.registry["cards"],self.request,self.public,self.app_hints)
+            names = retrieval.ranked(offers,scores,retrieval.FIRST)
+            names.extend(n for _,rule in self.matching_handoffs() for n in rule.get("reads",[]) if n in offers)
+            shown = {n:offers[n] for n in names}
+            data["available_public_reads"] = shown if isinstance(data["available_public_reads"],dict) else list(shown.values())
         data["decision_evidence"] = self.state_view()
         for name, rule in self.matching_handoffs():
             data.setdefault("handoff_rules", []).append(name)

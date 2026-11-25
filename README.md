@@ -74,8 +74,10 @@ Sol can try a proposed edit on the focal Train case and a preservation case. The
 | Dev | 19 / 57 | Select the harness carried into the next batch. H0 is measured once and the retained parent's scores are reused. |
 | Test-N | 30 / 90 | On a subset of AppWorld Test-Normal, compare the generation-only 27B agent with the same 27B using the final harness, paired by task and GPU. |
 
-All three variants of a scenario stay in one split. Train and Dev select first by tasks solved, then by fewer online output tokens. An exact tie keeps the candidate. Starting with H0, each GPU runs one model replica serving two independent AppWorld sessions. Four GPUs provide eight task slots.
+All three variants of a scenario stay in one split. Train and Dev select first by tasks solved, then by fewer online output tokens. An exact tie keeps the candidate. The retrieval experiment uses six GPUs from H0, with one CUDA Graph model replica and two independent AppWorld sessions per GPU.
+
+The runtime retrieves families and executable fragments from the public request, live inputs and declared outputs. After an abstention it can retrieve a second menu with evidence about the remaining work. Entity bindings and handoff guides have their own candidate sources. The offline Train checks run the same menu builders and ask the real model once at the first changed decision. [Menu retrieval](jev_harness/retrieval.py)
 
 Both Test-N arms get 40 model calls and 8,192 generated tokens per task. The runner reports task success, the share of scenarios with all three tasks solved, and online output tokens. These include open generation, low-confidence reasoning and recorded retries. Decision readouts and offline Sol usage are reported separately. [Experiment design](docs/experiment.md) · [Exact configuration](jev_harness/resources/experiment.json)
 
-[Four-GPU run and output files](docs/reproduce.md#run-the-experiment) · [AutoTrust 27B model](https://huggingface.co/autotrust/AutoTrust-Decider-Pro-27B) · [AppWorld](https://github.com/StonyBrookNLP/appworld) · [JevAgentHarness](https://github.com/JevAgentHarness/JevAgentHarness)
+[Six-GPU run and output files](docs/reproduce.md#run-the-experiment) · [AutoTrust 27B model](https://huggingface.co/autotrust/AutoTrust-Decider-Pro-27B) · [AppWorld](https://github.com/StonyBrookNLP/appworld) · [JevAgentHarness](https://github.com/JevAgentHarness/JevAgentHarness)

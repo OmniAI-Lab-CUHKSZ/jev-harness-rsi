@@ -21,7 +21,7 @@
     "order": "Use the attribute of the individual song. Release date and date added to a collection are different.",
     "residual": "Use the scoped intermediate values and completed effects already carried into this Python session. Finish the unresolved part of the user request. You can yield one supported public read to the fragment loop.",
     "step": "Work on the first unmet prerequisite. Read or filter the required population before ranking it. A card can fetch the fields listed under reads. Submit only a completed answer or confirmed effect.",
-    "assembly": "Use the wording of the request, completed work and live inputs. Choose a menu whose operations can advance the next missing step, including an intermediate source or a different app. Choosing a menu does not execute anything. NONE asks the program to show all executable operations.",
+    "assembly": "Use the wording of the request, completed work and live inputs. Choose a menu whose operations can advance the next missing step, including an intermediate source or a different app. Choosing a menu does not execute anything. Choose NONE if this set does not cover the next step. The program can retrieve other relevant operations.",
     "handoff": "Read the entire request for the intended effect, actor, recipient and direction. Use the live data as evidence. Distinguish acting from reporting, an action from its reverse, and completed work from work still requested. Select ordinary assistance when no specialized guide fits."
   },
   "collections": {
@@ -181,5 +181,6 @@
       "skill": "Use the scoped intermediate values and completed effects already carried into this Python session. Finish the unresolved part of the user request. You can yield one supported public read to the fragment loop."
     }
   },
-  "menu_format": "scoped"
+  "menu_format": "scoped",
+  "menu_retrieval": "state"
 }

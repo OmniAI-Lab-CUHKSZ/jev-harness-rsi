@@ -259,6 +259,9 @@ def initial_harness(settings):
     if not settings.get("semantic_handoffs"):
         return initial_library()
     library = read(RESOURCES / "h00.json")
+    if not settings.get("menu_retrieval") or settings.get("menu_format") != "scoped":
+        library.pop("menu_retrieval", None)
+        library["skills"]["assembly"] = initial_library()["skills"]["assembly"]
     if settings.get("menu_format") != "scoped":
         library.pop("menu_format", None)
     return library

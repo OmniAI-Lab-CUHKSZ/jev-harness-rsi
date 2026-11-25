@@ -30,7 +30,8 @@ class DeviceWorkers:
         model_args = self.spec["args"]
         model_path = model_args[model_args.index("--model") + 1]
         if (info["backend"] != "official_vllm" or info["precision"] != "bf16" or info["merged"]
-                or info["model"] != model_path or info.get("max_num_seqs", 1) != self.width):
+                or info["model"] != model_path or info.get("max_num_seqs", 1) != self.width
+                or "--cuda-graph" in model_args and info.get("decode_mode") != "cuda_graph"):
             raise ValueError(f"Unexpected model or sequence limit on {self.gpu}")
         save(self.root / "workers" / (self.name + ".json"),
              {**info, "loaded_utc": datetime.now(timezone.utc).isoformat(),

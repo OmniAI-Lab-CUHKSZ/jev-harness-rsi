@@ -154,9 +154,12 @@ class CardAssembly(FragmentAssembly):
         ctx = {"state":self.public, "task":{"instruction":self.request,"datetime":self.context["task"].get("datetime")},
                "params":{}}
         for key, slot in card.get("parameters",{}).items():
-            groups = parameter_groups(slot,ctx)
+            groups = parameter_groups(slot,ctx,retrieve=bool(self.registry.get("menu_retrieval")))
             skill = card["skill"]+" "+slot.get("skill","")
             for position, choices in enumerate(groups):
+                if self.registry.get("menu_retrieval"):
+                    self.trace.add("retrieval_menu", node="card_parameter", card=self.active_card, slot=key,
+                                   batch=position+1, offered_count=len(choices))
                 try:
                     ctx["params"][key] = self.choose_inline(slot["question"],choices,skill,ctx["params"])
                     break

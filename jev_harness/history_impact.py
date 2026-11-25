@@ -2,7 +2,7 @@
 import re
 
 from .expressions import parameter_groups
-from .semantic_handoff import menu
+from .semantic_handoff import guide_groups, menu
 from .scoped_menu import consumer_tips, is_scoped
 
 
@@ -14,7 +14,7 @@ def trace_sites(events):
     for i,event in enumerate(events):
         kind = event['event']
         if kind == 'handoff_state':
-            sites['handoffs'][i] = dict(event)
+            sites['handoffs'][i] = {**event,'request':sites['request']}
             sites['handoffs'][i].setdefault('producers',{k:v for k,v in writers.items() if k in event['values']})
         elif kind == 'handoff_selection' and sites['handoffs']:
             sites['handoffs'][next(reversed(sites['handoffs']))]['observed_guide'] = event.get('guide')
@@ -44,7 +44,7 @@ def trace_sites(events):
     return sites
 
 
-def parameter_views(card, state, request):
+def parameter_views(card, state, request, retrieve=False):
     views = {}
     ctx = {'state':state['values'],'task':{'instruction':request,'datetime':state.get('datetime')},'params':{}}
     # A trial may add inputs, or the original trace may have omitted a large public object.
@@ -64,13 +64,13 @@ def parameter_views(card, state, request):
             views[key] = {'unavailable':'Required public inputs were absent or not recorded exactly'}
             break
         try:
-            groups = parameter_groups(slot,ctx)
+            groups = parameter_groups(slot,ctx,retrieve=retrieve)
             choices = [choice for group in groups for choice in group]
         except (KeyError,TypeError,ValueError,IndexError,ArithmeticError,re.error) as exc:
             views[key] = {'unavailable':str(exc)[:180]}
             break
         views[key] = {'choices':choices,'question':slot['question'],'skill':card['skill']+' '+slot.get('skill','')}
-        if 'prefer' in slot:
+        if 'prefer' in slot or retrieve:
             views[key]['menu_sizes'] = [len(group) for group in groups]
         if key not in state['bound'] or not any(c['value']==state['bound'][key] for c in choices):
             break
@@ -78,8 +78,8 @@ def parameter_views(card, state, request):
     return views
 
 
-def parameter_changes(parent, candidate, state, request):
-    views = [parameter_views(card,state,request) for card in (parent,candidate)]
+def parameter_changes(parent, candidate, state, request, retrieval_modes=(False,False)):
+    views = [parameter_views(card,state,request,mode) for card,mode in zip((parent,candidate),retrieval_modes)]
     results = []
     for slot in sorted(set(views[0]) | set(views[1])):
         before,after = [v.get(slot,{}) for v in views]
@@ -118,10 +118,12 @@ def compare_handoff(parent, candidate, state):
     old, new = (handoff_view(lib,state) for lib in (parent,candidate))
     changed_text = {k:[len(old[3].get(k,'')),len(new[3].get(k,''))] for k in old[3].keys()|new[3].keys()
                     if old[3].get(k)!=new[3].get(k)}
-    common = set(old[0]) & set(new[0])
-    prompt_changed = bool(old[1] or new[1]) and any(parent[k].get('handoff')!=candidate[k].get('handoff')
-                                                     for k in ('questions','skills'))
-    return {'eligible_before':old[0], 'eligible_after':new[0], 'menu_changed':old[1]!=new[1],
+    batches = [[menu(lib,state,g) for g in guide_groups(lib,state)] for lib in (parent,candidate)]
+    names = [[name for group,_,_ in pages for name in group] for pages in batches]
+    common = set(names[0]).intersection(names[1])
+    prompt_changed = any(names) and any(parent[k].get('handoff')!=candidate[k].get('handoff')
+                                        for k in ('questions','skills'))
+    return {'eligible_before':names[0], 'eligible_after':names[1], 'menu_changed':batches[0]!=batches[1],
             'model_evidence_changed':old[2]!=new[2], 'selector_prompt_changed':prompt_changed,
             'changed_conditional_guidance':sorted(n for n in common if parent['handoffs'][n]['skill']!=candidate['handoffs'][n]['skill']),
             'changed_lookup_roles':sorted(k for k in old[4].keys()|new[4].keys() if old[4].get(k)!=new[4].get(k)),
@@ -146,7 +148,8 @@ def assess(sites, parent, candidate, edits):
                 reasons.append('same_public_api_called')
             for st in sites['parameters']:
                 if st['card']==name:
-                    bindings.append({'event':st['index'],'card':name,'slots':parameter_changes(old,new,st,sites['request'])})
+                    modes = [bool(lib.get("menu_retrieval")) for lib in (parent,candidate)]
+                    bindings.append({'event':st['index'],'card':name,'slots':parameter_changes(old,new,st,sites['request'],modes)})
             if not old and any(set(new.get('inputs',[])).issubset(s['values']) for s in sites['handoffs'].values()):
                 reasons.append('inputs_available_at_recorded_handoff')
         elif kind=='adapter':

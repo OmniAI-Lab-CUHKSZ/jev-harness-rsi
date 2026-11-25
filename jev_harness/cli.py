@@ -40,6 +40,10 @@ def initialize(root, settings, *, confirmation_scoring=None, revisit_after=None,
     config_path = root / "configuration.json"
     if config_path.is_file():
         saved = read(config_path)
+        if "menu_retrieval" not in saved:
+            settings.pop("menu_retrieval", None)
+        if saved.get("cuda_graph_from_start"):
+            settings["cuda_graph_from_start"] = True
         if "confirmation_scoring" in saved:
             settings["confirmation_scoring"] = saved["confirmation_scoring"]
         if "revisit_after" in saved:
@@ -127,7 +131,7 @@ def main(argv=None):
         else:
             allocation = sub.add_mutually_exclusive_group()
             allocation.add_argument("--gpus", help="Use fixed devices, e.g. local:0,local:1")
-            allocation.add_argument("--max-gpus", type=int, choices=range(1, 5), default=4)
+            allocation.add_argument("--max-gpus", type=int, choices=range(1, 7), default=4)
             sub.add_argument("--gpu-name", default="A800", help="GPU name substring for automatic allocation")
             sub.add_argument("--paired-selection-from-batch", type=int, choices=range(1, 11),
                              help="First Train batch and Dev selection to use conditional paired confirmation")
@@ -139,6 +143,7 @@ def main(argv=None):
                              help="Restart optimization of the pending revisit under a new name, reusing measured executions")
             sub.add_argument("--cuda-graph-after", type=int, metavar="BATCH",
                              help="Switch after this regular visit and measure its retained Dev parent on the new engine")
+        sub.add_argument("--cuda-graph", action="store_true", help="Use CUDA Graph from the first model request")
     args = parser.parse_args(argv)
     settings = read(RESOURCES / "experiment.json")
     manifest = design_manifest()
@@ -153,14 +158,18 @@ def main(argv=None):
         node, separator, index = device.rpartition(":")
         if not separator or not index.isdecimal() or node not in connections["model_nodes"]:
             parser.error(f"Unknown GPU {device!r}. Use a model_nodes name followed by : and its GPU index.")
-    if len(set(devices)) != len(devices) or len(devices) > 4:
-        parser.error("Specify up to four distinct GPU devices")
+    if len(set(devices)) != len(devices) or len(devices) > 6:
+        parser.error("Specify up to six distinct GPU devices")
     if args.command == "smoke" and not any(args.task in b["tasks"] for b in manifest["train_batches"]):
         parser.error("Choose a Train task from the plan for the H0 smoke run")
     first_node = next(iter(connections["model_nodes"].values()))
     model_args = first_node["args"]
     settings["model_path"] = model_args[model_args.index("--model") + 1]
     root = args.root.resolve()
+    if args.cuda_graph:
+        if getattr(args, "cuda_graph_after", None) is not None:
+            parser.error("Choose either --cuda-graph or --cuda-graph-after")
+        settings["cuda_graph_from_start"] = True
     if args.command == "run":
         first_review = args.paired_selection_from_batch
         if first_review is None and (root / "configuration.json").is_file():

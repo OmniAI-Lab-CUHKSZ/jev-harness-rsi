@@ -145,14 +145,26 @@ def build_candidates(definition, context):
     return result
 
 
-def parameter_groups(slot, context):
+def parameter_groups(slot, context, *, retrieve=False):
     """Offer preferred records first, keeping every other eligible record reachable."""
     choices = build_candidates(slot["candidates"], context)
+    if retrieve:
+        from .retrieval import FIRST, record_groups, refine_records
     if "prefer" not in slot:
+        if retrieve and len(choices) > FIRST:
+            return record_groups(choices, context["task"]["instruction"]) or [[]]
         return [choices]
     preferred, remaining = [], []
     for choice in choices:
         facts = {**context, "item": choice["value"], "label": choice["label"]}
         group = preferred if resolve(slot["prefer"], facts) else remaining
         group.append(choice)
+    if retrieve and preferred:
+        request = context["task"]["instruction"]
+        refined = refine_records(preferred, request)
+        later = record_groups(remaining, request, allow_unranked=len(remaining)<=FIRST)
+        second = refined + (later[0] if later else [])
+        return [preferred, second] if second else [preferred]
+    if retrieve and len(remaining) > FIRST:
+        return record_groups(remaining, context["task"]["instruction"]) or [[]]
     return [group for group in (preferred, remaining) if group] or [[]]

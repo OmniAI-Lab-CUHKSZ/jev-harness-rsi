@@ -8,7 +8,7 @@ from formal_run import read, save
 from jev_harness.allocation import SharedStudy
 from jev_harness.cli import RESOURCES, initialize
 from jev_harness.formal_v2 import include_retries
-from jev_harness.scoped_menu import scoped_library
+from jev_harness.scoped_menu import retrieval_library
 from jev_harness.semantic_library import initial_library
 from phase1_run import design_manifest, initial_harness, run
 
@@ -23,7 +23,7 @@ class PublicRunTests(unittest.TestCase):
     def test_distributed_h0_matches_constructor_and_plan(self):
         config = read(RESOURCES / "experiment.json")
         split = design_manifest()
-        self.assertEqual(initial_harness(config), scoped_library(initial_library(semantic_handoffs=True)))
+        self.assertEqual(initial_harness(config), retrieval_library(initial_library(semantic_handoffs=True)))
         self.assertEqual(read(RESOURCES / "h00.json"), initial_harness(config))
         self.assertTrue(config["optimizer"]["batch_revision"])
         with TemporaryDirectory() as directory:

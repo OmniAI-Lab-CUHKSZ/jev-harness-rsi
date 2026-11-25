@@ -72,7 +72,8 @@ def compare_wording(lib, events, original, rewrite):
         name = state["card"]
         if name not in lib["cards"]:
             continue
-        before,after = (parameter_views(lib["cards"][name],state,request) for request in (original,rewrite))
+        before,after = (parameter_views(lib["cards"][name],state,request,bool(lib.get("menu_retrieval")))
+                        for request in (original,rewrite))
         for slot in sorted(before.keys()|after.keys()):
             a,b = (v.get(slot,{}) for v in (before,after))
             row = {"event":state["index"],"card":name,"slot":slot}

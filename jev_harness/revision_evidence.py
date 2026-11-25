@@ -88,6 +88,8 @@ def request_context(events, index, lib):
         spec = lib["cards"].get(name,{})
         return {**base,"route":"compiled operation","card":name,"source_api":spec.get("api"),
                 "inputs":spec.get("inputs",[]),"parameter_names":list(spec.get("parameters",{})),"output":e.get("output",spec.get("output"))}
+    if kind == "retrieval_menu":
+        return {**base, **{k:e[k] for k in ("node","batch","offered","offered_count","slot","card") if k in e}}
     if kind in ("assembly_selection","assembly_candidates","assembly_widen","card_menu"):
         return {**base,"route":"menu assembly","family":e.get("family",e.get("assembly")),
                 "offered":e.get("offered",[]),"eligible":e.get("eligible",[])}

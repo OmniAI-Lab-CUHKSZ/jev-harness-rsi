@@ -107,5 +107,6 @@
     "scope": "fragment/step; preserve existing menu expansion before final review",
     "generation": "same 27B backbone"
   },
-  "menu_format": "scoped"
+  "menu_format": "scoped",
+  "menu_retrieval": "state"
 }

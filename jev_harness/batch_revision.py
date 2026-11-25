@@ -212,6 +212,9 @@ class BatchRevisionWorkbench(TrainEvidence):
         schema += ("State views can specify at:'parameter' to project only into a declared slot decision. Default at:'state' serves action menus and handoff. "
                    "Public datetime and active_card are available to projections. decision/card_parameter accepts skill or program over grounded option indices.\n")
         self.docs["dsl"] = (schema + CARD_DSL[CARD_DSL.index("An added card"):]).splitlines()
+        if self.lib.get("menu_retrieval"):
+            self.docs["code/retrieval"] = Path(__file__).with_name("retrieval.py").read_text(encoding="utf-8").splitlines()
+            self.docs["dsl"].append("The program retrieves family, step, parameter and guide menus before Jev chooses. Inspect retrieval_menu and the actual decision page. Distinguish an excluded or unretrieved target from one offered and rejected. Improve the appropriate description, typed interface, state view, binding or decision skill. See code/retrieval.")
         if self.lib.get("menu_format") == "scoped":
             self.docs["code/scoped_menu"] = Path(__file__).with_name("scoped_menu.py").read_text(encoding="utf-8").splitlines()
             self.docs["dsl"] = [s for s in self.docs["dsl"] if "when this card has executed or failed" not in s] + [

@@ -127,6 +127,9 @@ class Executor:
             raise Uncovered("Candidate builder returned no objects")
         if len(candidates) > MAX_REAL_OPTIONS:
             raise Uncovered("Candidate set needs an offline decomposition; no silent truncation")
+        if getattr(self, "registry", {}).get("menu_retrieval"):
+            self.trace.add("decision_rules", review=bool(review_step and node == "fragment/step"),
+                           widen=bool(widen_on_none), minimum=policy.get("minimum_probability",0))
         choices = candidates + [{"label": "NONE: no listed option is supported by the evidence", "value": None}]
         labels = [str(item["label"]) for item in choices]
         if policy.get("mode", "D") == "R":

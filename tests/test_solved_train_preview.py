@@ -154,6 +154,19 @@ class SolvedPreviewTests(TestCase):
         self.assertEqual(rows["restored"]["source"], "recorded_index")
         self.assertEqual(self.review("revised")["model_calls"],0)
 
+    def test_new_retrieval_decision_before_old_generation_still_dispatches_one_live_choice(self):
+        def run(engine, library):
+            execute_recorded_steps(engine, library["steps"])
+        parent = {"menu_retrieval":"state", "steps":[("generate","continue")]}
+        child = {"menu_retrieval":"state", "steps":[("decide",menu(("Read contacts","contacts")))]}
+        with patch.object(SemanticAssembly,"execute_task",run):
+            self.add_path("cross_route",parent,child)
+        result = self.review()
+        self.assertEqual((result["counts"],result["model_calls"]),({"new_decision":1},1))
+        row, = result["exceptions"]
+        self.assertEqual((row["previous_operation"],row["candidate_choice"]["value"]),("generate","contacts"))
+        self.assertNotIn("parent_choice",row)
+
     def test_drifted_paged_menu_uses_archived_actions_and_keeps_missing_bindings_unknown(self):
         archive = [("paged",menu(*[(f"Row {i}",100+i) for i in range(18)]))]
         new = [("paged",menu(("New",900), *[(f"Row {i}",100+i) for i in range(18)]))]

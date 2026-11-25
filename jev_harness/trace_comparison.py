@@ -78,7 +78,7 @@ class ParentPath:
 
 
 def compare_path(events, parent_path, candidate, functions, settings, *, inspect_change=None,
-                 executor_type=SemanticAssembly, compare_menu=None, inspect_boundary=None):
+                 executor_type=SemanticAssembly, compare_menu=None, inspect_boundary=None, inspect_route=None):
     position = 0
     difference = None
 
@@ -98,6 +98,8 @@ def compare_path(events, parent_path, candidate, functions, settings, *, inspect
             if compare_menu and op == expected == "decide" and position < parent_path.matched:
                 fields = compare_menu(position, args, fields, self.menu)
             if expected != op or fields:
+                if inspect_route and op == "decide" and expected != op and position < parent_path.matched:
+                    inspect_route(expected, args, self.menu)
                 if inspect_change is not None:
                     inspect_change(expected,source,op,args)
                 # Never serialize bound records, credentials or generated code in the short report.

@@ -57,10 +57,11 @@ jev-appworld smoke --connections configs/connections.local.example.json \
 
 ```bash
 jev-appworld run --connections configs/connections.local.example.json \
-  --root runs/scoped-main --gpus local:0,local:1,local:2,local:3
+  --root runs/retrieval-main --gpus local:0,local:1,local:2,local:3,local:4,local:5 \
+  --cuda-graph --paired-selection-from-batch 1 --confirmation-scoring two_repeats_only
 ```
 
-Use a new output directory to start from the original scoped H0. Each GPU serves two independent AppWorld sessions from one BF16 replica with vLLM's `--max-num-seqs 2`, starting with the first Train task and continuing through Dev and Test. Four GPUs can process up to eight independent tasks at once. Train candidates return to the parent's GPU when available. Sol uses the same workers for bounded previews. Each Test-N pair uses one worker with fresh simulator states for its two arms.
+Use a new output directory for H0 with state-based retrieval. The six BF16 replicas use decode-only CUDA Graphs and serve up to twelve independent AppWorld sessions with vLLM's `--max-num-seqs 2`. Train candidates return to the parent's GPU when available. Sol uses the same workers for bounded previews. Each Test-N pair uses one worker with fresh simulator states for its two arms.
 
 For one GPU, pass `--gpus local:0`. Resume with the same command and output directory. The runner reuses completed task records and the retained parent's Dev panel within that run. Existing experiment directories keep their saved configuration. Each Dev comparison records the session count for both sides in `checkpoints.json`. Generated tokens can vary with concurrent inference even with greedy decoding. Use one controller per output directory.
 
@@ -86,7 +87,8 @@ A model worker can take an `env` mapping in its connection entry. For a Python i
 
 ```bash
 jev-appworld run --connections configs/connections.ssh.example.json \
-  --root runs/scoped-main --max-gpus 4
+  --root runs/retrieval-main --max-gpus 6 --cuda-graph \
+  --paired-selection-from-batch 1 --confirmation-scoring two_repeats_only
 ```
 
 Automatic allocation checks at most once per minute while capacity remains. It selects A800 devices with at least 58,000 MiB free and utilization of 30% or less. Use `--gpu-name` for a different device name or `--gpus` for explicit devices.

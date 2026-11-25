@@ -15,6 +15,16 @@ def is_scoped(library):
     return library.get("menu_format") == "scoped"
 
 
+def retrieval_library(library):
+    from .retrieval import MODE
+    result = scoped_library(library)
+    result["menu_retrieval"] = MODE
+    result["skills"]["assembly"] = result["skills"]["assembly"].replace(
+        "NONE asks the program to show all executable operations.",
+        "Choose NONE if this set does not cover the next step. The program can retrieve other relevant operations.")
+    return result
+
+
 def specific_use(card):
     if card.get("applies_to"):
         return card["applies_to"]

@@ -57,6 +57,8 @@ class SharedStudy(PhaseOneStudy):
         self.lanes_per_gpu = self.width_for("train", len(completed) + 1)
         self.decode_mode = "eager"
         self.preferred_devices = ()
+        if settings.get("cuda_graph_from_start"):
+            self.enable_cuda_graph()
         after = settings.get("cuda_graph_after")
         if after is not None:
             previous = self.root / "controller.json"
@@ -74,7 +76,7 @@ class SharedStudy(PhaseOneStudy):
             self.status("switching_decode_mode", decode_mode="cuda_graph")
             self.close_devices()
         self.connections = {**self.connections, "model_nodes": {
-            node: {**spec, "args": [*spec.get("args", []), "--cuda-graph"]}
+            node: {**spec, "args": [*spec.get("args", []), "--cuda-graph"]} if "--cuda-graph" not in spec.get("args", []) else spec
             for node, spec in self.connections["model_nodes"].items()}}
         self.decode_mode = "cuda_graph"
         self.last_scan = float("-inf")
