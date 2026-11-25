@@ -114,7 +114,11 @@ SOLVED_REVIEW = """
 Read historical_choice for each tested patch. The program checks one successful earlier Train recording per
 distinct task and stops at its first difference. Compare each listed choice change with the old goal and
 grounded action. Consider changed tool arguments, handoffs and generation inputs as possible interference.
-An equal choice establishes only that page's result. An unaligned prefix or missing reply is unknown.
+An equal choice establishes only that page's result. At a comparable recorded decision, a drifted parent
+menu still receives a check of the candidate against the successful recording's bound action. Inspect
+recording_comparison.candidate_menu_matches_parent: when true the tested menu was already in the parent.
+When false, a differing choice identifies a risk on the candidate menu; the live parent choice may be unknown.
+An earlier incompatible action, missing grounding or missing reply leaves the subsequent outcome unknown.
 Use read/find on the details document for any task, including a task folded into the counts. Use this
 evidence to decide whether to retain, revise or submit the patch. Whole-task outcomes require execution."""
 
@@ -399,7 +403,8 @@ class BatchRevisionWorkbench(TrainEvidence):
         if choice_mode == SOLVED_FIRST_CHANGE:
             packet["historical_choice_preview"] = (
                 "The program checks the first change on each previously solved earlier Train task for both "
-                "the draft and any revision. Comparable changed Jev menus receive a real selection. Matching "
+                "the draft and any revision. Compare old actions against the candidate menu even when the parent "
+                "already differs at that recorded decision. The report identifies menus shared with the parent. Matching "
                 "inputs share a response. Historical failures are available for diagnosis in the Train catalogue.")
         elif choice_mode:
             packet["historical_choice_preview"] = (

@@ -125,7 +125,8 @@ def compare_train_paths(bench, proposal, candidate, *, solved_ballots=None):
         if task in current:
             continue
         if solved_mode:
-            path, ballot = solved_train_preview.first_change(events,ref,candidate,bench.study.functions,bench.study.execution)
+            path, ballot = solved_train_preview.first_change(events,ref,candidate,bench.study.functions,bench.study.execution,
+                                                            source_library=lambda: solved_train_preview.recorded_library(bench,doc))
             old[task] = {"trace":doc, **path}
             if ballot and solved_ballots is not None:
                 solved_ballots[task] = ballot

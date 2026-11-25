@@ -9,7 +9,7 @@ from phase1_run import offline_optimizer_costs
 from jev_harness.fragment_assembly import FragmentAssembly
 from jev_harness.runtime import Trace
 from jev_harness.semantic_assembly import SemanticAssembly
-from jev_harness.solved_train_preview import SolvedReference, first_change, review_solved, solved_documents
+from jev_harness.solved_train_preview import SolvedReference, first_change, recorded_library, review_solved, solved_documents
 from jev_harness.transport import WorkerUnavailable
 
 
@@ -54,7 +54,7 @@ class SolvedPreviewTests(TestCase):
         replay.start()
         self.addCleanup(replay.stop)
 
-    def add_path(self, task, parent_steps, child_steps, *, recording=None):
+    def add_path(self, task, parent_steps, child_steps, *, recording=None, source_library=None):
         original = SemanticAssembly(Mock(request=first_option), None)
         original.trace = Trace()
         original.seed = 7
@@ -62,7 +62,7 @@ class SolvedPreviewTests(TestCase):
         original.execute_task(parent_steps if recording is None else recording)
         events = [{**self.task_event,"task_id":task}, *original.trace.events, {"event":"summary","success":True}]
         parent = SolvedReference(events,parent_steps,[],{})
-        path, ballot = first_change(events,parent,child_steps,[],{})
+        path, ballot = first_change(events,parent,child_steps,[],{},source_library=source_library)
         doc = "b01r02/"+task
         self.bench.archived.append(doc)
         self.bench.reference_paths[task] = (doc,events,parent)
@@ -134,6 +134,49 @@ class SolvedPreviewTests(TestCase):
         self.assertEqual(out["counts"],{"changed_request":1,"unaligned":1,"equal_on_record":1})
         self.assertEqual(out["exceptions"][0]["first_change"]["parent"],"generate")
         self.model.request.assert_not_called()
+
+    def test_changed_menu_at_recorded_state_is_asked_even_if_inherited(self):
+        old = ("decide",menu(("Read pending","pending")))
+        extended = ("decide",menu(("Read pending","pending"),("Read history","history")))
+        reordered = ("decide",menu(("Read history","history"),("Read pending","pending")))
+        for task, page in (("inherited",extended),("edited",reordered),("restored",old)):
+            self.add_path(task,[extended],[page,("generate","later change")],recording=[old])
+        result = self.review()
+        self.assertEqual(result["counts"],{"same_first_choice":2,"changed_choice":1})
+        self.assertEqual((result["model_calls"],result["compared_to_recorded_menu"]),(2,3))
+        rows = {r["task"]:r for r in read(self.folder/"trial_draft/historical_choice.json")["tasks"]}
+        self.assertTrue(rows["inherited"]["recording_comparison"]["candidate_menu_matches_parent"])
+        changed = rows["edited"]
+        self.assertFalse(changed["recording_comparison"]["candidate_menu_matches_parent"])
+        self.assertTrue(changed["recorded_choice_offered"])
+        self.assertNotIn("parent_choice", changed)
+        self.assertEqual((changed["recorded_choice"]["value"],changed["candidate_choice"]["value"]),("pending","history"))
+        self.assertEqual(rows["restored"]["source"], "recorded_index")
+        self.assertEqual(self.review("revised")["model_calls"],0)
+
+    def test_drifted_paged_menu_uses_archived_actions_and_keeps_missing_bindings_unknown(self):
+        archive = [("paged",menu(*[(f"Row {i}",100+i) for i in range(18)]))]
+        new = [("paged",menu(("New",900), *[(f"Row {i}",100+i) for i in range(18)]))]
+        self.add_path("with_snapshot",new,new,recording=archive,source_library=lambda:archive)
+        self.add_path("without_snapshot",new,new,recording=archive)
+        out = self.review()
+        self.assertEqual(out["counts"], {"changed_choice":1,"unaligned":1})
+        self.assertEqual(out["model_calls"],1)
+        row = next(r for r in out["exceptions"] if r["task"] == "with_snapshot")
+        self.assertEqual((row["recorded_choice"]["value"],row["candidate_choice"]["value"]),(100,900))
+
+    def test_recorded_version_uses_confirmation_arm_and_scored_entry(self):
+        self.bench.study.root = self.root
+        self.bench.study.settings = {}
+        self.bench.previous = [{"parent":"v1","candidate":"v2","paired_selection":{"repeats":{
+            "b":[{"arm":"parent","trace_path":"runs/confirm_parent/b/attempt_1/trace.jsonl"},
+                 {"arm":"candidate","trace_path":"runs/confirm_candidate/b/attempt_1/trace.jsonl"}]}}}]
+        save(self.root/"checkpoints.json",[{"batch":1,"visit":"b01","entry_version":"v0"}])
+        save(self.root/"batches/b01/entry.json",{"train_traces":["runs/entry/a/attempt_1/trace.jsonl"]})
+        for version in ("v0","v1","v2"):
+            save(self.root/"versions"/(version+".json"), {"version":version})
+        for doc,version in (("entry/a","v0"),("confirm_parent/b","v1"),("confirm_candidate/b","v2")):
+            self.assertEqual(recorded_library(self.bench,doc),{"version":version})
 
     def test_unchanged_model_input_with_a_new_grounded_value_reuses_the_recorded_index(self):
         for count,kind in ((2,"decide"),(18,"paged")):

@@ -78,7 +78,7 @@ class ParentPath:
 
 
 def compare_path(events, parent_path, candidate, functions, settings, *, inspect_change=None,
-                 executor_type=SemanticAssembly, compare_menu=None):
+                 executor_type=SemanticAssembly, compare_menu=None, inspect_boundary=None):
     position = 0
     difference = None
 
@@ -88,6 +88,8 @@ def compare_path(events, parent_path, candidate, functions, settings, *, inspect
     class Candidate:
         def request(self, op, **args):
             nonlocal position, difference
+            if inspect_boundary and position == parent_path.matched and op == "decide":
+                inspect_boundary(args, self.menu)
             if position == len(parent_path.requests):
                 difference = change(None, "stop", op, [])
                 raise Boundary

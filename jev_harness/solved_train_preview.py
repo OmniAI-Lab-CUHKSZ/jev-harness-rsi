@@ -17,17 +17,46 @@ MODE = "first_change_per_solved_task"
 USAGE = ("model_calls", "backend_requests", "input_tokens", "output_tokens", "reasoning_tokens", "seconds")
 
 
+def trace_document(path):
+    return "/".join(Path(str(path).replace("\\", "/")).parts[-4:-2])
+
+
+def recorded_library(bench, doc):
+    """Resolve the harness that bound a historical page's local indices to real actions."""
+    if not hasattr(bench, "trace_versions"):
+        versions = {}
+        checkpoints = bench.study.root/"checkpoints.json"
+        if checkpoints.is_file():
+            from phase1_run import completed_train_entries
+            for checkpoint in read(checkpoints):
+                visit = checkpoint.get("visit", f"b{checkpoint['batch']:02d}")
+                for path in completed_train_entries(bench.study.root, visit, checkpoint, bench.study.settings):
+                    versions[trace_document(path)] = checkpoint["entry_version"]
+        for revision in bench.previous:
+            for arm, field in (("parent","parent_traces"), ("candidate","train_traces")):
+                if revision.get(arm):
+                    for path in revision.get(field, ()):
+                        versions.setdefault(trace_document(path), revision[arm])
+            for pair in revision.get("paired_selection", {}).get("repeats", {}).values():
+                for row in pair:
+                    if version := revision.get(row["arm"]):
+                        versions.setdefault(trace_document(row["trace_path"]), version)
+        bench.trace_versions = versions
+    version = bench.trace_versions.get(doc)
+    if version:
+        file = bench.study.root/"versions"/(version+".json")
+        if file.is_file():
+            return read(file)
+
+
 def solved_documents(bench):
     """Use scored Train provenance, including confirmations. Reusing a parent is not a new run."""
     records = bench.precedents.records
     eligible = {doc for doc in bench.archived if records[doc]["task_success"] is True
                 and records[doc]["task"] not in bench.tasks}
     visits = {}
-    def document(path):
-        return "/".join(Path(str(path).replace("\\", "/")).parts[-4:-2])
-
     for path in getattr(bench.study, "prior_train_entries", ()):
-        stage = document(path).split("/",1)[0]
+        stage = trace_document(path).split("/",1)[0]
         label = re.match(r"^b\d+(?:_revisit\d+)?", stage)
         visits.setdefault(label.group() if label else stage, []).append(path)
     for revision in bench.previous:
@@ -37,7 +66,7 @@ def solved_documents(bench):
         paths.extend(revision.get("train_traces", ()))
         for pair in revision.get("paired_selection", {}).get("repeats", {}).values():
             paths.extend(row["trace_path"] for row in pair)
-    ordered = (document(p) for paths in visits.values() for p in paths)
+    ordered = (trace_document(p) for paths in visits.values() for p in paths)
     result = {records[doc]["task"]:doc for doc in sorted(eligible)}
     for doc in dict.fromkeys(ordered):
         if doc in eligible:
@@ -74,19 +103,81 @@ class SolvedReference(ParentPath):
 
     def request(self, op, **args):
         position = self.matched
+        if op == "decide" and position < len(self.tape):
+            before = recorded_decision(self.events, self.tape[position][0]) if self.tape[position][1] == "decide" else None
+            self.menus[position] = (self.menu, before)
         result = super().request(op, **args)
         if op == "decide":
-            before = recorded_decision(self.events, self.tape[position][0])
+            _, before = self.menus[position]
             if before and (before["node"] != self.menu["node"] or
                            values(before["candidates"][:-1]) != values(self.menu["raw"])):
                 self.matched = position
                 self.reason = "parent decision bindings differ from recording"
                 raise Boundary
-            self.menus[position] = (self.menu, before)
         return result
 
 
-def first_change(events, parent, candidate, functions, settings):
+def menu_ballot(before, old_choices, old_request, page, request, settings):
+    none = before["candidates"][-1]
+    choices = [*page["choices"], none]
+    if [str(c["label"]) for c in choices] != request.get("options"):
+        return {}
+    selected = before.get("selected")
+    if type(selected) is not int or not 0 <= selected <= len(old_choices):
+        return {}
+    prior = [*old_choices, none][selected]
+    old_values, new_values = values(old_choices), values(page["choices"])
+    ballot = dict(node=page["node"], question=request["question"], parent_choice=prior,
+                  parent_offered=values([prior])[0] in values(choices), choices=choices, page=page,
+                  added_values=[c["value"] for c,v in zip(page["choices"],new_values) if v not in old_values][:4],
+                  added_options=[s for s in request["options"] if s not in old_request["options"]],
+                  removed_options=[s for s in old_request["options"] if s not in request["options"]])
+    if different_fields(old_request, request):
+        ballot["request"] = official_request(page, request, settings)
+    else:
+        ballot["recorded"] = dict(candidate_choice=choices[selected], same_choice=values([choices[selected]])==values([prior]))
+    return ballot
+
+
+def recording_boundary_ballot(events, parent, page, request, functions, settings, source_library):
+    """All requests before this position matched. Compare at this position without supplying its old response."""
+    position = parent.matched
+    if position >= len(parent.tape):
+        return {}
+    event, op, old_request, _ = parent.tape[position]
+    if op != "decide" or not (before := recorded_decision(events, event)):
+        return {}
+    if page["node"] != before["node"]:
+        return {}
+    old_choices = before["candidates"][:-1]
+    # Paged decisions record indices instead of the underlying rows. Recover those
+    # rows with their originating harness. A coincident index cannot identify an action.
+    if old_choices and [c["value"] for c in old_choices] == list(range(len(old_choices))):
+        original = source_library() if source_library is not None else None
+        if original is None:
+            return {}
+        archive = SolvedReference(events, original, functions, settings)
+        if archive.matched <= position:
+            return {}
+        old_choices = archive.menus[position][0]["choices"]
+    ballot = menu_ballot(before, old_choices, old_request, page, request, settings)
+    if not ballot:
+        return {}
+    parent_page = parent.menus.get(position, (None,None))[0]
+    matches = False
+    if parent_page and parent_page["node"] == page["node"]:
+        parent_request = parent.requests[position][2]
+        matches = (parent_request == request and values(parent_page["choices"]) == values(page["choices"])
+                   and all(parent_page[k] == page[k] for k in ("review","widen","minimum"))
+                   and official_request(dict(parent_page),parent_request,settings) == official_request(dict(page),request,settings))
+    fields = different_fields(old_request, request)
+    if values(old_choices) != values(page["choices"]):
+        fields.append("option_values")
+    ballot["recording_comparison"] = {"event":event, "fields":fields, "candidate_menu_matches_parent":matches}
+    return ballot
+
+
+def first_change(events, parent, candidate, functions, settings, *, source_library=None):
     ballot = {}
     request_detail = {}
 
@@ -113,26 +204,18 @@ def first_change(events, parent, candidate, functions, settings):
             extra.append("option_values")
         if not (fields or extra) or not before or not same_node:
             return fields + extra
-        none = before["candidates"][-1]
-        choices = [*menu["choices"], none]
-        index = before["selected"]
-        prior = [*previous["choices"], none][index]
-        ballot.update(node=menu["node"], question=args["question"], parent_choice=prior,
-                      parent_offered=values([prior])[0] in values(choices), choices=choices, page=menu,
-                      added_values=[c["value"] for c,v in zip(menu["choices"],new_values) if v not in old_values][:4],
-                      added_options=[s for s in args["options"] if s not in parent.requests[position][2]["options"]],
-                      removed_options=[s for s in parent.requests[position][2]["options"] if s not in args["options"]])
-        if fields:
-            ballot["request"] = official_request(menu, args, settings)
-        else:
-            # Same visible input and recorded decision. Bind that exact index in the new menu.
-            ballot["recorded"] = dict(candidate_choice=choices[index], same_choice=values([choices[index]])==values([prior]))
+        ballot.update(menu_ballot(before, previous["choices"], parent.requests[position][2], menu, args, settings))
         return fields + extra
 
-    path = compare_path(events, parent, candidate, functions, settings,
-                        executor_type=MenuReplay, compare_menu=compare_menu, inspect_change=locate)
+    def inspect_boundary(request, page):
+        ballot.update(recording_boundary_ballot(events, parent, page, request, functions, settings, source_library))
+
+    path = compare_path(events, parent, candidate, functions, settings, executor_type=MenuReplay,
+                        compare_menu=compare_menu, inspect_change=locate, inspect_boundary=inspect_boundary)
     if request_detail:
         path["first_change"].update(request_detail)
+    if "recording_comparison" in ballot:
+        path["recording_comparison"] = ballot["recording_comparison"]
     return path, ballot
 
 
@@ -173,20 +256,24 @@ def task_observation(task, path, reference, ballot, cache):
     change = path["first_change"]
     if change:
         row["first_change"] = change
-    if not parent.complete and path["matched"] >= parent.matched:
+    recording = ballot.get("recording_comparison")
+    if recording:
+        row["recording_comparison"] = recording
+    elif not parent.complete and path["matched"] >= parent.matched:
         if parent.matched < len(parent.requests):
             row["alignment_event"] = parent.requests[parent.matched][0]
         return {**row, "status":"unaligned", "reason":path["parent_coverage"]}
-    if not change:
+    elif not change:
         if path["status"] == "unresolved":
             return {**row, "status":"unaligned", "reason":path["parent_coverage"]}
         return {**row, "status":path["status"]}
-    if change["parent"] != "decide" or change["candidate"] != "decide":
+    elif change["parent"] != "decide" or change["candidate"] != "decide":
         return {**row, "status":"changed_request"}
     if not ballot.get("request") and "recorded" not in ballot:
         return {**row, "status":"unaligned", "reason":"no comparable final Jev decision at the first change"}
+    row["recorded_choice" if recording else "parent_choice"] = public_choice(ballot["parent_choice"])
+    row["recorded_choice_offered" if recording else "parent_offered"] = ballot["parent_offered"]
     row.update(node=ballot["node"], question=cleaned_text(ballot["question"])[:320],
-               parent_choice=public_choice(ballot["parent_choice"]), parent_offered=ballot["parent_offered"],
                added_values=[public_value(v) for v in ballot["added_values"]],
                added_options=[cleaned_text(s)[:220] for s in ballot["added_options"][:4]],
                removed_options=[cleaned_text(s)[:220] for s in ballot["removed_options"][:4]])
@@ -229,6 +316,8 @@ def review_solved(bench, old, ballots, folder):
                 for task,path in sorted(old.items())]
         summary = {"mode":MODE, "previous_train_tasks":len({s.split("/",1)[1] for s in bench.archived}),
                    "previously_solved_tasks":len(rows), "counts":dict(Counter(r["status"] for r in rows)),
+                   "compared_to_recorded_menu":sum("recording_comparison" in r and r["status"] in
+                                                   ("same_first_choice","changed_choice","policy_abstained") for r in rows),
                    "distinct_requests":len(needed), **{k:sum(x.get(k,0) for x in current) for k in USAGE},
                    "unconfirmed_calls":sum(x["model_calls"] for x in current if x["status"]=="outcome_unconfirmed"),
                    "details":document, "exceptions":[{k:v for k,v in r.items() if k not in
