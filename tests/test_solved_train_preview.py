@@ -167,6 +167,19 @@ class SolvedPreviewTests(TestCase):
         self.assertEqual((row["previous_operation"],row["candidate_choice"]["value"]),("generate","contacts"))
         self.assertNotIn("parent_choice",row)
 
+    def test_empty_retrieved_menu_reports_generation_even_when_parent_already_drifted(self):
+        def run(engine, library):
+            execute_recorded_steps(engine,library["steps"])
+        old = {"menu_retrieval":"state","steps":[("decide",menu(("Read notes","notes")))]}
+        empty = {"menu_retrieval":"state","steps":[("generate","continue")]}
+        with patch.object(SemanticAssembly,"execute_task",run):
+            self.add_path("new_route",old,empty)
+            self.add_path("inherited_route",empty,empty,recording=old)
+        report = self.review()
+        self.assertEqual((report["counts"],report["model_calls"]),({"decision_bypassed":2},0))
+        for row in report["exceptions"]:
+            self.assertEqual((row["next_operation"],row["old_choice_label"]),("generate","Read notes"))
+
     def test_drifted_paged_menu_uses_archived_actions_and_keeps_missing_bindings_unknown(self):
         archive = [("paged",menu(*[(f"Row {i}",100+i) for i in range(18)]))]
         new = [("paged",menu(("New",900), *[(f"Row {i}",100+i) for i in range(18)]))]

@@ -236,6 +236,7 @@ def first_change(events, parent, candidate, functions, settings, *, source_libra
     ballot = {}
     request_detail = {}
     retrieval = isinstance(candidate, dict) and bool(candidate.get("menu_retrieval"))
+    boundary_op = None
 
     def locate(before, old, after, new):
         if before == after == "call":
@@ -276,9 +277,25 @@ def first_change(events, parent, candidate, functions, settings, *, source_libra
     def inspect_route(op, request, page):
         ballot.update(new_route_ballot(op,page,request,settings))
 
+    def inspect_nondecision(op):
+        nonlocal boundary_op
+        boundary_op = op
+
     path = compare_path(events, parent, candidate, functions, settings, executor_type=MenuReplay,
                         compare_menu=compare_menu, inspect_change=locate, inspect_boundary=inspect_boundary,
-                        inspect_route=inspect_route if retrieval else None)
+                        inspect_route=inspect_route if retrieval else None,
+                        inspect_nondecision=inspect_nondecision if retrieval else None)
+    change = path["first_change"] or {}
+    next_op = change.get("candidate", boundary_op)
+    pos = path["matched"]
+    if retrieval and not ballot and next_op and next_op != "decide" and pos < len(parent.tape):
+        event, op, _, _ = parent.tape[pos]
+        before = recorded_decision(events,event) if op=="decide" else None
+        if before:
+            # The same public prefix led directly to a different route. There is no candidate ballot to dispatch.
+            chosen = before["candidates"][before["selected"]]
+            ballot["bypassed"] = {"node":before["node"], "old_choice_label":cleaned_text(str(chosen["label"]))[:320],
+                                  "recorded_event":event, "next_operation":next_op}
     if request_detail:
         path["first_change"].update(request_detail)
     if "recording_comparison" in ballot:
@@ -323,6 +340,8 @@ def task_observation(task, path, reference, ballot, cache):
     change = path["first_change"]
     if change:
         row["first_change"] = change
+    if "bypassed" in ballot:
+        return {**row, **ballot["bypassed"], "status":"decision_bypassed", "source":"recorded_route"}
     recording = ballot.get("recording_comparison")
     if "route_from" in ballot:
         row.update(previous_operation=ballot["route_from"], previous_node=ballot["previous_node"], node=ballot["node"])
