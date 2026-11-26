@@ -10,13 +10,17 @@ from jev_harness import native_formal, native_replay
 from jev_harness.native_revision import EditRound, TrainSample, evidence, evidence_page, revise
 
 
-def test_ordered_dev_cold_start_two_rounds_and_dev_rollback(tmp_path, monkeypatch):
+@pytest.mark.parametrize("composed", [False, True])
+def test_ordered_dev_cold_start_two_rounds_and_dev_rollback(tmp_path, monkeypatch, composed):
     # These synthetic identifiers never go to AppWorld or a model service.
     tasks = lambda scenario: [f"{scenario}_{i}" for i in (1, 2, 3)]
     manifest = {"dev_tasks": tasks("dev"), "normal_holdout_tasks": tasks("heldout"),
                 "train_batches": [{"batch": i, "tasks": tasks(f"train{i}")} for i in (1, 2, 3)]}
     study = Mock(root=tmp_path, seed=42, execution={}, test_started=False,
                  settings={"optimizer": {"rounds": 2}, "confirmation_scoring": "two_repeats_only"})
+    if composed:
+        study.settings["execution_arm"] = "composed_cards"
+    h0 = native_formal.initial_library(composed)
     worker = SimpleNamespace(gpu="fake:0")
     study.execute_preferred.side_effect = lambda jobs, run, pref: [run(job, worker) for job in jobs]
     episodes, edits = [], []
@@ -29,9 +33,10 @@ def test_ordered_dev_cold_start_two_rounds_and_dev_rollback(tmp_path, monkeypatc
         assert variant == ("A" if stage in ("dev_react", "test_react") else "B")
         if stage.startswith("test_"):
             assert study.test_started and study.close_account.called
-        if stage in ("dev_react", "dev_h00"):
+        if variant == "A":
             assert library == native_formal.blank_library()
-            assert variant == ("A" if stage == "dev_react" else "B")
+        if stage == "dev_h00":
+            assert library == h0
         passed = stage not in {"b01r01", "dev_b02r01"}
         trace = directory / "attempt_1" / "trace.jsonl"
         trace.parent.mkdir(parents=True)
@@ -45,7 +50,8 @@ def test_ordered_dev_cold_start_two_rounds_and_dev_rollback(tmp_path, monkeypatc
 
     study.run_task.side_effect = run_one
 
-    def edit(study, ids, *, current):
+    def edit(study, ids, *, current, composed=False):
+        assert composed == bool(h0["fragment"])
         name = current.folder.name
         assert all(sample.row["task_id"].startswith("train") for sample in current.samples.values())
         assert all(sample.row["variant"] == "B" for sample in current.samples.values())
@@ -56,7 +62,7 @@ def test_ordered_dev_cold_start_two_rounds_and_dev_rollback(tmp_path, monkeypatc
         edits.append(name)
         if name in ("b01r01", "b01r02"):
             assert not current.solved and not any(k.startswith("history/") for k in current.samples)
-            assert current.parent == native_formal.blank_library()
+            assert current.parent == h0
         if name == "b01r02":
             assert current.previous_round["outcome"] == "rejected"
             assert all(f"previous_candidate/{t}" in current.samples for t in ids)
@@ -66,7 +72,7 @@ def test_ordered_dev_cold_start_two_rounds_and_dev_rollback(tmp_path, monkeypatc
             assert all(f"previous_parent/{t}" in current.samples for t in ids)
             assert all(current.samples[f"h0_decision/{t}"].trace.parents[2].name == "b02r01" for t in ids)
         if name == "b03r01":
-            assert set(current.parent["decision"]) == {"b01r02"}
+            assert set(current.parent["decision"]) == h0["decision"].keys() | {"b01r02"}
             assert set(current.solved) == set(tasks("train1") + tasks("train2"))
         child = deepcopy(current.parent)
         objects = []
@@ -117,31 +123,41 @@ def test_editor_can_mine_and_open_local_generation_with_only_the_parent_trace(tm
     current = EditRound(tmp_path / "offline/b01r01", library, {label: TrainSample(trace, row, library)}, {})
     study = Mock(root=tmp_path)
     sol = study.solver.return_value
-    sol.turn.side_effect = [json.dumps({"read": {"doc": label, "start": 1, "count": 1}}),
-                            json.dumps({"objects": [], "reason": "Synthetic example"})]
+    read_request = json.dumps({"read": {"doc": label, "start": 1, "count": 1}})
+    sol.turn.side_effect = [read_request] * 11 + [json.dumps({"objects": [], "reason": "Synthetic example"})]
     assert revise(study, [task], current=current) == library
-    prompt, page = [json.loads(c.args[1]) for c in sol.turn.call_args_list]
+    calls = sol.turn.call_args_list
+    assert len(calls) == 12
+    assert calls[-1].args[2].name == "turn_12"
+    assert "Final response: submit a proposal now" in calls[-1].args[1]
+    prompt, page = [json.loads(c.args[1]) for c in calls[:2]]
     assert set(prompt["Train evidence"]) == {label} and set(prompt["trace roles"]) == {"h0_decision"}
     assert prompt["Train evidence"][label]["open_sites"] == [[1, "G_binding", "example__send", 37]]
     assert "G_binding" in str(page) and "example__send" in str(page)
     study.start_workers.assert_not_called()
 
 
-def test_sampling_change_reuses_dev_only_and_separates_prior_train(tmp_path, monkeypatch):
+@pytest.mark.parametrize("composed", [False, True])
+def test_sampling_change_reuses_dev_only_and_separates_prior_train(tmp_path, monkeypatch, composed):
     from jev_harness.cli import RESOURCES
 
     shared = read(RESOURCES / "experiment.json")
-    previous = native_formal.configuration(shared)
+    previous = native_formal.configuration(shared, composed=composed)
     previous.pop("train_sampling")
+    previous["optimizer"].pop("draft_reply_limit")
     connections = {"model_nodes": {"fake": {"args": ["--model", previous["model_path"]]}}}
     study_factory = Mock()
     monkeypatch.setattr(native_formal, "FormalNativeStudy", study_factory)
     monkeypatch.setattr(native_formal, "run_formal", Mock())
-    args = SimpleNamespace(root=tmp_path, max_gpus=6, through="h0-dev")
+    args = SimpleNamespace(root=tmp_path, max_gpus=6, through="h0-dev", composed=composed)
     save(tmp_path / "configuration.json", previous)
     save(tmp_path / "runs/dev_react/t/record.json", {"saved": True})
     native_formal.launch(args, shared, connections)
-    assert read(tmp_path / "configuration.json")["train_sampling"] == "entry_harness_only"
+    settings = read(tmp_path / "configuration.json")
+    assert settings["train_sampling"] == "entry_harness_only"
+    assert settings["optimizer"]["draft_reply_limit"] == 12
+    if composed:
+        assert study_factory.return_value.compiled_executor is native_formal.ComposedAssembly
     assert read(tmp_path / "runs/dev_react/t/record.json") == {"saved": True}
     save(tmp_path / "configuration.json", previous)
     save(tmp_path / "runs/b01_react/t/record.json", {"saved": True})

@@ -28,6 +28,7 @@ class RecordedChoices:
         self.model.menu_node = kwargs.get("node")
         self.model.fragment_question = fragment_question(self.model.menu_node, self.model.offered, evidence)
         self.model.calculations = self.transforms
+        self.model.dynamic_offers = getattr(self, "dynamic_offers", {})
         return super().decision(question, evidence, candidates, *args, **kwargs)
 
     def session_token(self, app):
@@ -43,7 +44,8 @@ class RecordedGeneration(RecordedNative):
     generation_only = True
 
 
-def first_change(events, candidate, functions, execution, model=None, *, generation_only=False, executor_type=None):
+def first_change(events, candidate, functions, execution, model=None, *, generation_only=False, executor_type=None,
+                 continue_after_choice=False):
     apps = [name.split("__", 1)[0] for name in catalog(functions) if name.endswith("__login")]
     tape = [
         (i, op, request, response)
@@ -104,6 +106,10 @@ def first_change(events, candidate, functions, execution, model=None, *, generat
                     else:
                         replayed["value"] = {"access_token": "<session>"}
                 return replayed
+            if "continuation" in report:
+                report["continuation"].update(status="changed", event=i, before=expected, after=op,
+                                               changed_fields=changed, matched_requests=position)
+                raise Boundary
             report = {"event": i, "before": expected, "after": op, "changed_fields": changed}
             if op == "decide":
                 previous_node, new_node = recorded_nodes.get(i), self.menu_node
@@ -150,6 +156,22 @@ def first_change(events, candidate, functions, execution, model=None, *, generat
                                 if event["event"] == "native_observation" and event["scope"] == old[1]:
                                     report["same_local_result"] = event["value"] == self.calculations[new[1]]
                                     break
+                    selected = self.offered[result["index"]]
+                    if continue_after_choice:
+                        is_card = isinstance(selected, (tuple, list)) and selected[0] == "dynamic"
+                        same_choice = report.get("same_semantic_choice")
+                        returning = selected == "standard" and previous.get("question") != args.get("question")
+                        if is_card:
+                            report["proposed_reads"] = [
+                                {"result": plan["result"], "choices": plan["choices"],
+                                 "sources": [read["source"] for read in plan["reads"].values()]}
+                                for plan in self.dynamic_offers.get(selected[1], ())
+                            ]
+                        if same_choice or is_card or returning:
+                            report["continuation"] = {"status": "replaying", "first_choice_matched": bool(same_choice)}
+                            if same_choice:
+                                position += 1
+                            return result
             else:
                 report["status"] = "changed_" + op
             raise Boundary
@@ -164,6 +186,9 @@ def first_change(events, candidate, functions, execution, model=None, *, generat
     stop = run_on_tape(events, candidate, functions, execution, Client(), executor)
     if not report:
         report = {"status": "unchanged" if position == len(tape) else "unresolved", "stop": stop}
+    if report.get("continuation", {}).get("status") == "replaying":
+        report["continuation"].update(status="unchanged" if position == len(tape) else "unresolved",
+                                       matched_requests=position, stop=stop)
     report["matched_requests"] = position
     return report
 
@@ -181,13 +206,15 @@ def historical_preview(study, candidate, history):
     return solved_preview(study, candidate, opened)
 
 
-def solved_preview(study, candidate, opened, *, budget=24, executor_type=None):
+def solved_preview(study, candidate, opened, *, budget=24, executor_type=None, continue_after_choice=False):
     results = {}
     used = 0
     for task, (trace, catalogue, execution) in opened.items():
         events = read_events(trace)
         functions = read(catalogue)
         runtime = {"executor_type": executor_type} if executor_type is not None else {}
+        if continue_after_choice:
+            runtime["continue_after_choice"] = True
         outcome = first_change(events, candidate, functions, execution, **runtime)
         if outcome["status"] == "needs_real_choice" and used < budget:
             study.start_workers()

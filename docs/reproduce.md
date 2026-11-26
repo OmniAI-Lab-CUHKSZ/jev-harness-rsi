@@ -166,7 +166,25 @@ The measured saved library passed the playlist-follow, request-denial and commen
 
 The composed executor checks known read parameters before building the menu. When a read requires upstream data, it checks those parameters again after that data is available. Its field projections consume complete object sets and use the same official API validation and receipts as direct actions. When several sets can supply a selected write, Jev chooses the set. [Composed executor](../jev_harness/composed_assembly.py) · [Sol prompt and patch format](../jev_harness/native_revision.py)
 
-Use `native-run` for the earlier native-tool formal protocol. The composed executor is available through the pilot entry point.
+### Parameterized fragments and Train evidence
+
+A composed patch can declare a dynamic fragment with an input planner, named slots, and typed results. The planner returns concrete official read arguments or references to complete observations. The executor shows the fragment alongside the usual actions when its inputs are available and its result supports a useful next step. Known slot values are bound directly. Jev chooses among the remaining alternatives. A declined fragment leaves a diagnostic event outside the standard model context.
+
+The Venmo example reuses one contact-email filter for received payments, sent payments and pending requests. Different result types connect to the relevant official operations. Payment results retain the amount so the same filter can support an aggregate answer. The example is an editor patch for the mechanism comparison. Apply it with `apply_edits(parent, proposal, catalog(public_functions), composed=True)` to score it as a candidate. [Example patch](../configs/dynamic_venmo_example.json) · [Dynamic executor](../jev_harness/dynamic_cards.py)
+
+On a composed revision, the editor receives related computations retrieved from available historical Train traces. The report links reads, field paths, calculation sites and recorded consumers back to events. It distinguishes inspected generated code from a recorded result with an accepted consumer. The report is saved as `calculation_evidence.json` beside the proposal. An impact check can reuse the old trace past a changed menu after one actual Jev reselection, and records the next request that diverges. [Evidence extractor](../jev_harness/calculation_evidence.py) · [Train replay](../jev_harness/native_replay.py)
+
+### Formal composed experiment
+
+Inspect the composed task split, initial library and model settings with `jev-appworld native-plan --composed`. Start the complete experiment in a fresh run directory.
+
+```bash
+jev-appworld native-run --composed \
+  --connections configs/connections.ssh.example.json \
+  --root runs/composed-formal --max-gpus 6 --through test
+```
+
+The runner measures ReAct and composed H0 on Dev in that order. It then runs two Sol revisions per Train batch, selects the version to carry forward on Dev, and evaluates the retained version against ReAct on Test-N. Sol can give up to 12 draft-stage replies per round, including evidence reads and the final proposal. Draft review has a separate allowance of up to two replies. Resume with the same command and run directory.
 
 ## Code map
 

@@ -15,6 +15,9 @@ from .schema_tools import MANAGED, available, catalog, is_read
 from .train_evidence import read_page, visible_event
 
 
+DRAFT_REPLY_LIMIT = 12
+
+
 EDITOR = """Improve this shared AppWorld harness for the fixed 27B. Preserve or raise whole-task success, then
 reduce online output including reasoning. Only official Train trajectories have been opened. Start with the
 current parent harness's own runs. Follow Jev choices and abstentions, local generation, public tool calls and
@@ -113,6 +116,31 @@ completion when the user clearly requests multiple effects. Update "decision"/"a
 ballot, or a tool-specific cue to clarify that tool only. "handoff"/"residual" applies when remaining work must
 run in Python; tool-specific handoff cues are selected by the unresolved operation. Do not accumulate multiple
 ways to do the same work. Reuse a card when its public inputs and output already fit.
+
+For a reusable operation with several possible input sources or scopes, a fragment can declare "dynamic"
+instead of "reads" and record choices. Use it when variants share the same calculation. Keep the public
+"sources" list and the pure "program". The dynamic object has three keys:
+1. "plan": a pure policy with state['goal'], state['instruction'], state['datetime'], state['inputs'],
+   state['remaining_effects'] and state['answer_question']. Return one or more plans or [] when the task
+   cannot use this result. Each plan has "result" (a declared result name), "choices" (a slot name to a
+   readable label), "reads" (a port name to {"source":"app__read","arguments":[{...}]} or to
+   {"source":"declared source","ref":"r1"}), and optional "parameters" for the transform. The requested
+   entity, operation and scope must make sense together. An app mention alone does not support a card.
+   calendar_windows(state['goal'], state['datetime']) returns inclusive (start, end) choices. It returns
+   [(None,None)] with no date requirement and [] when the date is outside its supported forms.
+2. "slots": ordered slot names to {"question":"...","skill":"..."}. A singleton is bound by the program.
+   Omit a slot that does not apply. If several executable plans disagree on a slot, Jev chooses the label.
+   Give each distinct plan meaningful choices. A returned plan must have all its public reads bindable.
+3. "results": result names to {"fields":{"id":"integer","amount":"number"}, "calculations":{"count":true,
+   "sum":"amount"}, "writes":{"app__effect":{"fields":{"id":"id"},"arguments":"return {...}"}}}.
+   Fields must match the read records or values the pure transform actually computes. Calculations and
+   writes are optional. Writes describe separate consumers whose required literals can be grounded from the
+   current goal. Only a requested operation is offered, and Jev chooses it after the records are available.
+   An optional "equivalent" list names existing fragments that perform the same calculation for the same
+   write scope. The executor keeps the existing one only when its concrete reads and requested effects match.
+The transform receives state['reads'] by port and state['parameters'] and returns a list of result rows.
+Use different result types for genuinely different records, and keep the fields needed by other consumers.
+Put a search cue or a local decision or handoff instruction under the dynamic fragment's name if needed.
 """
 
 
@@ -136,12 +164,17 @@ def apply_edits(parent, proposal, tools, *, composed=False):
         raise ValueError("A patch can change up to three named items")
     lib = deepcopy(parent)
     touched = set()
+    dynamic_names = {name for name, spec in lib["fragment"].items() if "dynamic" in spec}
+    if composed:
+        dynamic_names.update(edit["name"] for edit in objects if edit.get("kind") == "fragment"
+                             and isinstance(edit.get("value"), dict) and "dynamic" in edit["value"])
     for edit in objects:
         kind, name, value = edit["kind"], edit["name"], edit["value"]
         if kind not in lib or not isinstance(name, str) or not name.isidentifier() or (kind, name) in touched:
             raise ValueError("Unknown, duplicate or invalid component")
         touched.add((kind, name))
-        special = composed and (kind, name) in {("decision", "action"), ("handoff", "residual")}
+        special = composed and ((kind, name) in {("decision", "action"), ("handoff", "residual")}
+                                or (name in dynamic_names and kind in {"retrieval", "decision", "handoff"}))
         if kind in {"retrieval", "decision", "binding", "handoff"} and not special and (
             name not in tools or not (available(name) or name == FINISH)
         ):
@@ -159,7 +192,7 @@ def apply_edits(parent, proposal, tools, *, composed=False):
                 optional.update(("choice", "choices", "goal_terms"))
             if composed:
                 optional.update({
-                    "fragment": {"reads", "produces"},
+                    "fragment": {"reads", "produces", "dynamic"},
                     "binding": {"covers", "fields"},
                     "state": {"intent"},
                 }.get(kind, set()))
@@ -198,6 +231,10 @@ def apply_edits(parent, proposal, tools, *, composed=False):
                 validate_projection(spec["fields"], tools[name], spec["sources"], lib["fragment"])
             if group != "fragment":
                 continue
+            if "dynamic" in spec:
+                from .dynamic_cards import validate_dynamic
+
+                validate_dynamic(spec, tools)
             if "reads" in spec:
                 if not isinstance(spec["reads"], dict):
                     raise ValueError("Card reads map public endpoints to pure planners")
@@ -424,10 +461,24 @@ def revise(study, train, history=(), *, current=None, composed=False):
     roles = {"h0_decision": "This round's parent harness, including its Jev choices and local generation."}
     if any(label.startswith("h0_generation/") for label in panel):
         roles["h0_generation"] = "Pilot comparison that generates each action. Use it to identify work to compile into the harness."
+    reuse = {}
+    if composed and study.settings.get("calculation_reuse_evidence", True):
+        from .calculation_evidence import related_calculations
+
+        comparisons = related_calculations(current.samples, train)
+        save(folder / "calculation_evidence.json", comparisons)
+        reuse = {"Cross-task calculation evidence": {
+            "comparisons": comparisons,
+            "use": "Verify the shared computation, the task-specific inputs and scope, and the result fields that "
+                   "may support another consumer. The matching fields only locate related evidence. Check the "
+                   "indexed events when a code inference or tool effect is uncertain. Extend an existing card "
+                   "when it fits. When there is no historical match, use the current observed evidence.",
+        }}
     prompt = json.dumps(
         {
             "current_library": parent,
             "Train evidence": panel,
+            **reuse,
             "trace roles": roles,
             "previous round on this batch": current.previous_round,
             "catalogue": (
@@ -440,15 +491,16 @@ def revise(study, train, history=(), *, current=None, composed=False):
     docs["tools"] = [json.dumps(t, ensure_ascii=False) for t in tools.values()]
     if composed:
         docs.update({f"tool/{name}": [json.dumps(tool, ensure_ascii=False)] for name, tool in tools.items()})
-    for attempt in range(8):
-        if attempt == 7:
+    for turn in range(1, DRAFT_REPLY_LIMIT + 1):
+        final_draft_turn = turn == DRAFT_REPLY_LIMIT
+        if final_draft_turn:
             prompt += "\nFinal response: submit a proposal now using the verified evidence."
-        answer = account.turn(thread, prompt, folder / "sol" / f"turn_{attempt + 1}")
+        answer = account.turn(thread, prompt, folder / "sol" / f"turn_{turn}")
         try:
             from .runtime import parse_json
 
             proposal = parse_json(answer)
-            if "read" in proposal and attempt < 7:
+            if "read" in proposal and not final_draft_turn:
                 req = proposal["read"]
                 response = evidence_page(docs, req)
                 prompt = json.dumps(response, ensure_ascii=False)
@@ -464,7 +516,7 @@ def revise(study, train, history=(), *, current=None, composed=False):
             impact = {}
             used_current = False
             checks_used = 0
-            runtime = {"executor_type": study.compiled_executor} if composed else {}
+            runtime = {"executor_type": study.compiled_executor, "continue_after_choice": True} if composed else {}
             for task in train:
                 events = read_events(current.samples["h0_decision/" + task].trace)
                 result = first_change(events, lib, list(tools.values()), study.execution, **runtime)
@@ -499,6 +551,8 @@ def revise(study, train, history=(), *, current=None, composed=False):
                 thread,
                 "These first-change checks replay the draft on actual Train prefixes. "
                 "The reselected ballot used the real 27B. A changed generation request was not executed. "
+                "Continuation describes what the harness reached after a changed decision. Proposed reads are "
+                "executable plans, and accepted uses in a fresh trace are the evidence of execution. "
                 "The whole_current_train_trial, when present, is an actual fresh episode on the draft. Read its "
                 "accepted payloads and fragment_flow, including unused output, before attributing benefit. "
                 "A cheaper pass may send the wrong content. Check against evidence and the public instruction. "

@@ -2,7 +2,7 @@
 
 本文对应 `appworld_native_tools_v2` 的正式入口 `native-run` 和 Train 小样本入口 `native-pilot`。实验首先检验固定的 27B 通过选择官方工具、对象与参数能完成哪些任务，再检验 Sol 从 Train 轨迹提炼的共享改动能否提高后续整题成功率并减少在线输出。每道题都有自己独立的 AppWorld 世界。任务之间传递的是公共 harness，账号会话、工具回显、对象 ID 和上道题的环境状态都随任务结束。
 
-组合卡片版通过 `native-pilot --composed` 运行。读取计划检查、卡片输出字段映射及四题复测库见[组合版复现说明](reproduce.md#composed-card-pilot)。
+组合卡片版通过 `native-pilot --composed` 试跑，通过 `native-run --composed` 启动正式实验。草案阶段每轮最多 12 次 Sol 回复，含查阅证据和最终提案。草案审阅另有最多 2 次回复。[组合版复现说明](reproduce.md#formal-composed-experiment)
 
 ## 正式实验的启动顺序和选版
 

@@ -1147,6 +1147,62 @@ def test_composed_editor_accepts_typed_acquisition_and_blocks_writes_from_read_p
         apply_edits(blank_library(), edit, tools, composed=True)
 
 
+def test_dynamic_editor_and_menu_ground_a_single_plan_without_extra_model_questions():
+    from jev_harness.composed_assembly import ComposedAssembly
+
+    spec = {
+        "label": "Read order for the requested item",
+        "sources": ["store__show_orders"],
+        "program": 'return state["reads"]["orders"]',
+        "dynamic": {
+            "plan": ('return [{"result":"item", "choices":{"scope":"ordered items"}, '
+                     '"reads":{"orders":{"source":"store__show_orders", "arguments":[{}]}}}]'),
+            "slots": {"scope": {"question": "Which items?"}},
+            "results": {"item": {"fields": {"item_id": "integer"}, "writes": {
+                "store__send_item": {"fields": {"item_id": "item_id"},
+                                     "arguments": 'return {"message":"Enjoy your order!"}'}
+            }}},
+        },
+    }
+    proposal = {"objects": [
+        {"kind": "fragment", "name": "order_items", "value": spec},
+        {"kind": "decision", "name": "order_items", "value": "Use actual orders."},
+        {"kind": "state", "name": "send_intent", "value": {
+            "label": "Requested item delivery", "sources": [], "intent": True,
+            "program": 'return ["store__send_item"] if "send" in state["goal"] else []',
+        }},
+    ]}
+    tools = {t["name"]: t for t in TOOLS}
+    library = apply_edits(blank_library(), proposal, tools, composed=True)
+    engine = ComposedAssembly(Mock(), World())
+    engine.trace, engine.done = Trace(), False
+    engine.context = {"task": {"functions": TOOLS, "instruction": "Send the item from the order"}, "history": []}
+    engine.initialize_native(library)
+    assert any("Use actual orders." in label for _, _, label, _ in engine.card_plans())
+    engine.ask = Mock(side_effect=AssertionError("There is only one scope to bind"))
+    engine.observe("store__show_orders", [{"item_id": 12}], "Published orders", arguments=[{}])
+    engine.execute_card(("dynamic", "order_items"))
+    (endpoint, batch, _, source), = engine.compiled_bindings("store__send_item")
+    assert endpoint == "store__send_item"
+    assert batch == [{"item_id": 12, "message": "Enjoy your order!"}]
+    assert source == {"r2": {"fields": {"item_id": "item_id"}}}
+    engine.ask.assert_not_called()
+
+    engine.context["task"]["instruction"] = "Review the order's phone number"
+    engine.initialize_native(library)
+    assert not engine.card_plans()
+
+
+def test_calendar_scope_distinguishes_no_restriction_from_unsupported_dates():
+    from jev_harness.policy_programs import calendar_windows
+
+    when = "2023-06-01 12:00:00"
+    assert calendar_windows("Approve all pending requests", when) == [(None, None)]
+    assert calendar_windows("Payments in the last 7 days, including today", when) == [("2023-05-26", "2023-06-01")]
+    assert calendar_windows("Payments since 1st Feb of this year", when) == [("2023-02-01", "2023-06-01")]
+    assert calendar_windows("Payments after the last company outing", when) == []
+
+
 
 @pytest.mark.parametrize("planner", ['return None', 'return [{"contact_id": "invalid"}]'])
 def test_composed_prechecks_a_companion_before_showing_the_card(planner):

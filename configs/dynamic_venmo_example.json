@@ -1,0 +1,89 @@
+{
+  "reason": "Reuse the counterparty-to-contact email match with runtime source, date and consumer bindings.",
+  "objects": [
+    {
+      "kind": "fragment",
+      "name": "venmo_records_by_contact_group",
+      "value": {
+        "label": "Select Venmo payments or pending requests for the requested phone contact group and time range",
+        "sources": [
+          "phone__search_contacts",
+          "venmo__show_transactions",
+          "venmo__show_received_payment_requests"
+        ],
+        "goal_terms": [
+          "venmo"
+        ],
+        "program": "reads = state[\"reads\"]\nparams = state[\"parameters\"]\ncontacts = reads[\"people\"]\nif params[\"groups\"] > 1:\n    contacts = [row for group in contacts for row in group]\nidentities = set()\nfor person in contacts:\n    email = person.get(\"email\")\n    if not isinstance(email, str) or not email.strip():\n        return None\n    identities.add(email.strip().casefold())\nselected = {}\nfor port, actor in params[\"actors\"].items():\n    for row in reads[port]:\n        person = row.get(actor, {})\n        email = person.get(\"email\") if isinstance(person, dict) else None\n        if not isinstance(email, str) or not email.strip():\n            return None\n        if params[\"start\"]:\n            created = row.get(\"created_at\")\n            if not isinstance(created, str):\n                return None\n            if created[:10] < params[\"start\"] or created[:10] > params[\"end\"]:\n                continue\n        if email.strip().casefold() in identities:\n            selected[row[params[\"id\"]]] = row\nreturn list(selected.values())",
+        "dynamic": {
+          "plan": "goal = state[\"goal\"]\nif not regex(r\"\\bvenmo\\b\", goal) or regex(r\"\\bsocial feed\\b\", goal):\n    return []\nif state[\"answer_question\"] and not regex(r\"\\bhow (?:much|many)\\b\", goal):\n    return []\naliases = {\"friend\":\"friends?\", \"coworker\":\"co[- ]?workers?|colleagues?\", \"roommate\":\"roommates?|housemates?\", \"sibling\":\"siblings?\", \"manager\":\"managers?\"}\npeople = [group for group, alias in aliases.items() if regex(r\"\\b(?:\" + alias + r\")\\b\", goal)]\nif not people or regex(r\"\\b(?:except|excluding|unless)\\b\", goal):\n    return []\nwindows = calendar_windows(goal, state[\"datetime\"])\nif not windows:\n    return []\npending = regex(r\"\\bpending\\b\", goal) and regex(r\"\\bpayment requests?\\b\", goal)\nreceived = regex(r\"\\breceived\\b\", goal)\nsent = regex(r\"\\bsent\\b\", goal)\ndirections = [[\"received\"]]\nif pending:\n    directions = [[\"pending\"]]\nelif received and sent:\n    directions = [[\"received\", \"sent\"]]\n    if regex(r\"\\bor\\b\", goal):\n        directions.extend([[\"received\"], [\"sent\"]])\nelif sent:\n    directions = [[\"sent\"]]\nelif not received and state[\"answer_question\"]:\n    return []\nplans = []\nfor direction in directions:\n    for start, end in windows:\n        actors = {}\n        choices = {\"records\": \" and \".join(direction), \"contacts\": \", \".join(people)}\n        if start:\n            choices[\"date\"] = start + \" through \" + end + \" inclusive\"\n        reads = {\"people\": {\"source\": \"phone__search_contacts\", \"arguments\": [{\"relationship\": g} for g in people]}}\n        for source in direction:\n            if source == \"pending\":\n                reads[source] = {\"source\": \"venmo__show_received_payment_requests\", \"arguments\": [{\"status\": \"pending\"}]}\n            else:\n                args = {\"direction\": source}\n                if start:\n                    args[\"min_created_at\"] = start\n                reads[source] = {\"source\": \"venmo__show_transactions\", \"arguments\": [args]}\n            actors[source] = \"receiver\" if source == \"sent\" else \"sender\"\n        result = \"requests\" if pending else \"payments\"\n        plans.append({\"result\": result, \"choices\": choices, \"reads\": reads, \"parameters\": {\n            \"actors\": actors, \"id\": \"payment_request_id\" if pending else \"transaction_id\",\n            \"groups\": len(people), \"start\": start, \"end\": end}})\nreturn plans",
+          "slots": {
+            "records": {
+              "question": "Which directions cover the requested payments?",
+              "skill": "Use both directions when the user asks for either sent or received payments as a combined total."
+            },
+            "contacts": {
+              "question": "Which phone contact groups define the counterparties?"
+            },
+            "date": {
+              "question": "Which inclusive date scope matches the user?",
+              "skill": "Use the task date and wording."
+            }
+          },
+          "results": {
+            "payments": {
+              "fields": {
+                "transaction_id": "integer",
+                "amount": "number"
+              },
+              "calculations": {
+                "sum": "amount",
+                "count": true
+              },
+              "writes": {
+                "venmo__create_transaction_comment": {
+                  "fields": {
+                    "transaction_id": "transaction_id"
+                  },
+                  "arguments": "text = captures(r'[\"“]([^\"”]+)[\"”]', state[\"instruction\"])\nreturn {\"comment\": text[0]} if len(text) == 1 else None"
+                },
+                "venmo__like_transaction": {
+                  "fields": {
+                    "transaction_id": "transaction_id"
+                  }
+                }
+              },
+              "equivalent": [
+                "received_payments_by_phone_group"
+              ]
+            },
+            "requests": {
+              "fields": {
+                "payment_request_id": "integer",
+                "amount": "number"
+              },
+              "calculations": {
+                "count": true
+              },
+              "writes": {
+                "venmo__approve_payment_request": {
+                  "fields": {
+                    "payment_request_id": "payment_request_id"
+                  }
+                },
+                "venmo__deny_payment_request": {
+                  "fields": {
+                    "payment_request_id": "payment_request_id"
+                  }
+                }
+              },
+              "equivalent": [
+                "pending_requests_by_contact_group"
+              ]
+            }
+          }
+        }
+      }
+    }
+  ]
+}

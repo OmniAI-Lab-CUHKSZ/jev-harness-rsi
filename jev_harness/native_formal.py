@@ -4,11 +4,12 @@ from pathlib import Path
 
 from formal_run import final_report, read, save
 from phase1_run import design_manifest, paired_rollouts, review_versions
+from .composed_assembly import ComposedAssembly, initial_library as composed_library
 from .formal_v2 import include_retries
 from .metrics import aggregate
 from .native_assembly import PROTOCOL, blank_library
 from .native_pilot import NativeStudy
-from .native_revision import EditRound, TrainSample, revise
+from .native_revision import DRAFT_REPLY_LIMIT, EditRound, TrainSample, revise
 from .paired_selection import TWO_REPEATS_ONLY
 
 
@@ -17,12 +18,20 @@ class FormalNativeStudy(NativeStudy):
         return not self.test_started and stage.startswith("b")
 
 
-def configuration(shared):
-    return {**{k: shared[k] for k in ("executor", "model_path", "seed", "execution")},
-            "protocol": PROTOCOL, "cuda_graph_from_start": True, "lanes_per_gpu": 2,
-            "train_sampling": "entry_harness_only",
-            "optimizer": {k: shared["optimizer"][k] for k in ("model", "reasoning_effort", "rounds", "max_objects")},
-            "confirmation_scoring": TWO_REPEATS_ONLY}
+def configuration(shared, *, composed=False):
+    optimizer = {k: shared["optimizer"][k] for k in ("model", "reasoning_effort", "rounds", "max_objects")}
+    optimizer["draft_reply_limit"] = DRAFT_REPLY_LIMIT
+    settings = {**{k: shared[k] for k in ("executor", "model_path", "seed", "execution")},
+                "protocol": PROTOCOL, "cuda_graph_from_start": True, "lanes_per_gpu": 2,
+                "train_sampling": "entry_harness_only", "optimizer": optimizer,
+                "confirmation_scoring": TWO_REPEATS_ONLY}
+    if composed:
+        settings["execution_arm"] = "composed_cards"
+    return settings
+
+
+def initial_library(composed):
+    return composed_library() if composed else blank_library()
 
 
 def measure(study, ids, stage, arm, library, reference=()):
@@ -88,12 +97,15 @@ def optimization_costs(root, reviews):
 
 def run_formal(study, manifest, through):
     root = study.root
-    h0 = blank_library()
-    save(root / "versions/h00.json", h0)
+    composed = study.settings.get("execution_arm") == "composed_cards"
+    h0_path = root / "versions/h00.json"
+    h0 = read(h0_path) if h0_path.is_file() else initial_library(composed)
+    save(h0_path, h0)
+    react_library = blank_library()
     save(root / "task_split.json", manifest)
     dev = manifest["dev_tasks"]
     study.status("dev_react")
-    react = measure(study, dev, "dev_react", "A", h0)
+    react = measure(study, dev, "dev_react", "A", react_library)
     if through == "react-dev":
         study.status("react_dev_complete", tasks=len(react))
         return
@@ -129,7 +141,7 @@ def run_formal(study, manifest, through):
                        **train_samples(root, rows, library, "h0_decision")}
             current = EditRound(root / "offline" / name, library, samples, past_solved, name + "_",
                                 outcomes[-1] if outcomes else {})
-            child = revise(study, ids, current=current)
+            child = revise(study, ids, current=current, composed=composed)
             proposal = read(current.folder / "proposal.json")
             result = {"round": rnd, "parent": version, "reason": proposal.get("reason", ""),
                       "objects": [[edit["kind"], edit["name"]] for edit in proposal["objects"]]}
@@ -187,7 +199,7 @@ def run_formal(study, manifest, through):
         study.status("test_normal", version=version)
         arms = {"A": "test_react", "B": "test_" + version}
         a, b = paired_rollouts(study, manifest["normal_holdout_tasks"], arms, {"A": "A", "B": "B"},
-                               {"A": h0, "B": library})
+                               {"A": react_library, "B": library})
         report = final_report(a, b, study.seed)
         report.update(version=version, arms={"A": "all-generation native-tool ReAct", "B": "retained Jev harness"},
                       optimization_costs=costs,
@@ -201,6 +213,7 @@ def run_formal(study, manifest, through):
 def configure(parser):
     parser.add_argument("--connections", required=True, type=Path)
     parser.add_argument("--root", required=True, type=Path)
+    parser.add_argument("--composed", action="store_true", help="Start from the composed card library")
     parser.add_argument("--max-gpus", type=int, choices=range(1, 7), default=6)
     parser.add_argument("--through", choices=("react-dev", "h0-dev", "train", "test"), default="test",
                         help="Finish the named stage, including preceding stages in order")
@@ -208,7 +221,8 @@ def configure(parser):
 
 def launch(args, shared, connections):
     root = args.root.resolve()
-    settings = configuration(shared)
+    composed = getattr(args, "composed", False)
+    settings = configuration(shared, composed=composed)
     model_args = next(iter(connections["model_nodes"].values()))["args"]
     settings["model_path"] = model_args[model_args.index("--model") + 1]
     path = root / "configuration.json"
@@ -217,6 +231,8 @@ def launch(args, shared, connections):
         if "train_sampling" not in previous and not any((root / "runs").glob("b[0-9][0-9]*")):
             # Initial Dev scores have the same meaning under both Train sampling schedules.
             previous["train_sampling"] = settings["train_sampling"]
+        if "optimizer" in previous:
+            previous["optimizer"].setdefault("draft_reply_limit", DRAFT_REPLY_LIMIT)
         incompatible = previous != settings
     else:
         incompatible = (root / "runs").exists() or (root / "pilot_plan.json").exists()
@@ -224,6 +240,8 @@ def launch(args, shared, connections):
         raise ValueError("Use a fresh output directory or resume the same native experiment")
     save(path, settings)
     study = FormalNativeStudy(root, settings, connections, max_gpus=args.max_gpus, lanes_per_gpu=2)
+    if composed:
+        study.compiled_executor = ComposedAssembly
     try:
         study.start_workers()
         study.paired_model_info()

@@ -14,7 +14,9 @@ def _brief(value, limit=185):
 
 
 def _fragment(choice):
-    return isinstance(choice, (list, tuple)) and len(choice) >= 3 and choice[0] == "fragment"
+    return isinstance(choice, (list, tuple)) and (
+        len(choice) >= 3 and choice[0] == "fragment" or len(choice) == 2 and choice[0] == "dynamic"
+    )
 
 
 def fragment_evidence(events, library):
@@ -63,7 +65,8 @@ def fragment_evidence(events, library):
                 else:
                     if len(entry["bypassed_for"]) < 6:
                         entry["bypassed_for"].append({"event": index, "choice": chosen["label"][:150]})
-                    skipped.append((name, tuple(refs)))
+                    if refs:
+                        skipped.append((name, tuple(refs)))
         elif kind == "native_fragment_choice":
             record(e["name"]).setdefault("internal_choices", []).append(
                 {"event": index, **{k: e[k] for k in ("status", "role", "source", "ref", "row", "using", "reason") if k in e}}

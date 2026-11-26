@@ -124,7 +124,8 @@ def main(argv=None):
     configure(commands.add_parser("native-pilot", help="Pilot schema-driven tools and a Train-only Sol revision"))
     from . import native_formal
     native_formal.configure(commands.add_parser("native-run", help="Run or resume the cold-start native-tool experiment"))
-    commands.add_parser("native-plan", help="Print the cold-start native split, settings and H0 without starting workers")
+    native_plan = commands.add_parser("native-plan", help="Print the native split, settings and H0 without starting workers")
+    native_plan.add_argument("--composed", action="store_true", help="Show the composed card experiment")
     for command, help_text in (("smoke", "Run one H0 Train task with the real model and simulator"),
                                ("run", "Run or resume the ten-batch experiment and paired Test-N evaluation")):
         sub = commands.add_parser(command, help=help_text)
@@ -152,10 +153,11 @@ def main(argv=None):
     args = parser.parse_args(argv)
     settings = read(RESOURCES / "experiment.json")
     if args.command == "native-plan":
-        print(json.dumps({"configuration": native_formal.configuration(settings),
+        print(json.dumps({"configuration": native_formal.configuration(settings, composed=args.composed),
                           "sequence": ["react-dev", "h0-dev", "train with per-batch dev selection", "test-normal"],
                           "default_allocation": {"gpu": "A800", "max_gpus": 6, "lanes_per_gpu": 2},
-                          "split": design_manifest(native_formal.PROTOCOL), "h0": native_formal.blank_library()},
+                          "split": design_manifest(native_formal.PROTOCOL),
+                          "h0": native_formal.initial_library(args.composed)},
                          ensure_ascii=False, indent=2))
         return
     if args.command == "native-run":

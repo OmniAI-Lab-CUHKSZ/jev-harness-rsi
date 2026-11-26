@@ -61,7 +61,7 @@ Add `--composed` to try the latest card executor. The program checks read plans 
 
 On a four-task Train pilot, this executor solved three tasks. It fixed two earlier failures by following exactly the five artists from the requested playlist genre and denying exactly the 14 matching Venmo requests. Both tasks finished with zero open-generation calls. [Run the composed pilot](docs/reproduce.md#composed-card-pilot) · [Starting cards](jev_harness/resources/composed_h0.json) · [Evaluated library](configs/composed_pilot_library.json)
 
-`native-run` serves the earlier native-tool protocol. It starts with all-generation ReAct and a fresh H0 on Dev, then alternates Train revisions and Dev selection before paired Test-N evaluation. Use `native-plan` to inspect that protocol's split and initial components. [Native-tool protocol](docs/native_protocol.zh.md)
+`native-run --composed` starts with all-generation ReAct and a fresh composed H0 on Dev. It then alternates Train revisions and Dev selection before paired Test-N evaluation. Use `native-plan --composed` to inspect the task split, budgets and starting cards. [Run the composed experiment](docs/reproduce.md#formal-composed-experiment)
 
 ## What Sol can change
 

@@ -1,5 +1,6 @@
 """Small pure-Python policies that Sol can replace inside a versioned harness."""
 import ast
+from calendar import month_abbr, month_name
 from copy import deepcopy
 from datetime import date, timedelta
 from functools import lru_cache
@@ -21,10 +22,39 @@ def first_calendar_day(when, days):
     return (date.fromisoformat(when[:10]) - timedelta(days=days - 1)).isoformat()
 
 
+def calendar_windows(goal, when):
+    """Resolve public dates, distinguishing a missing restriction from an unsupported one."""
+    text = goal.casefold()
+    temporal = r"\b(?:since|yesterday|today|last|past|before|after|between|recently)\b"
+    if not re.search(temporal, text):
+        return [(None, None)]
+    today = date.fromisoformat(when[:10])
+    months = {name.casefold(): i for names in (month_abbr, month_name) for i, name in enumerate(names) if name}
+    explicit = re.search(r"\bsince\s+(\d{1,2})(?:st|nd|rd|th)?\s+([a-z]+)(?:\s+(\d{4}))?", text)
+    if explicit and explicit[2] in months:
+        start = date(int(explicit[3] or today.year), months[explicit[2]], int(explicit[1]))
+        return [(start.isoformat(), today.isoformat())] if start <= today else []
+    days = re.search(r"\b(?:last|past)\s+([1-9]\d*)\s+(?:calendar\s+)?days?\b", text)
+    if days:
+        count = int(days[1])
+        included = (first_calendar_day(when, count), today.isoformat())
+        if re.search(r"\b(?:including|counting)\s+today\b|\btoday\s+included\b", text):
+            return [included]
+        yesterday = today - timedelta(days=1)
+        excluded = ((today - timedelta(days=count)).isoformat(), yesterday.isoformat())
+        return [excluded] if re.search(r"\bexcluding\s+today\b", text) else [included, excluded]
+    yesterday = (today - timedelta(days=1)).isoformat()
+    if re.search(r"\byesterday or today\b|\btoday or yesterday\b", text):
+        return [(yesterday, today.isoformat())]
+    if re.search(r"\byesterday\b", text):
+        return [(yesterday, yesterday)]
+    return []
+
+
 FUNCTIONS = {"len":len,"any":any,"all":all,"sorted":sorted,"min":min,"max":max,"sum":sum,
              "enumerate":enumerate,"zip":zip,"str":str,"int":int,"float":float,"list":list,
              "dict":dict,"set":set,"isinstance":isinstance,"regex":regex,"captures":captures,
-             "first_calendar_day":first_calendar_day}
+             "first_calendar_day":first_calendar_day,"calendar_windows":calendar_windows}
 METHODS = {"get","keys","items","values","startswith","endswith","lower","casefold","strip","split","replace",
            "join","append","extend","add","count"}
 NODES = (ast.Module,ast.FunctionDef,ast.arguments,ast.arg,ast.Return,ast.For,ast.If,ast.IfExp,ast.Break,

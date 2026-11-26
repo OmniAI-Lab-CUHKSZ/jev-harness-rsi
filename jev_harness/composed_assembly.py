@@ -5,6 +5,7 @@ from pathlib import Path
 import json
 import re
 
+from .dynamic_cards import already_covered, dynamic_answers, dynamic_label, dynamic_plans, dynamic_writes, execute_dynamic
 from .expressions import path_get
 from .formal_optimizer import cleaned_text
 from .native_assembly import ACTION_SKILL, FINISH, NativeAssembly, blank_library, observed_input, preview
@@ -58,6 +59,9 @@ class ComposedAssembly(NativeAssembly):
         self.trace.add("native_composition")
         self.chosen_effects = set()
         self.plan_bindings = {}
+        self.dynamic_offers = {}
+        self.dynamic_results = {}
+        self.used_dynamic_plans = set()
         self.goal = re.sub(r'["“][^"”]*["”]', "", self.instruction).casefold()
         self.answer_question = bool(re.search(
             r"\b(what|which|how many|how much|tell me|give me the (?:title|number|name))\b", self.goal
@@ -99,7 +103,10 @@ class ComposedAssembly(NativeAssembly):
                 "verified_effects": sorted(self.chosen_effects)}
 
     def perform(self, endpoint, batch, scope, sources=None):
-        if not batch and endpoint in self.required and "fields" in self.lib["binding"].get(endpoint, {}):
+        projected = "fields" in self.lib["binding"].get(endpoint, {}) or any(
+            endpoint in self.dynamic_results.get(ref, {}).get("writes", {}) for ref in sources or {}
+        )
+        if not batch and endpoint in self.required and projected:
             self.trace.add("native_empty_scope", tool=endpoint, sources=sources or {})
         else:
             super().perform(endpoint, batch, scope, sources)
@@ -166,16 +173,24 @@ class ComposedAssembly(NativeAssembly):
         plans = []
         library = self.lib["fragment"]
         scores = {name: relevance(spec, self.goal) for name, spec in library.items()}
+        for name, spec in library.items():
+            if "dynamic" in spec and (hint := self.lib["retrieval"].get(name)):
+                scores[name] = max(scores[name], len(goal_words(hint) & goal_words(self.goal)))
         # Relevance can reach a required producer with no live result yet. Primary sources
         # listed as alternatives keep their own goal/scope evidence.
         observed = {o.source for o in self.observed if o.complete}
         for _ in range(len(library)):
             for name, spec in library.items():
+                if "dynamic" in spec:
+                    continue
                 producers = spec.get("inputs", []) + (spec["sources"] if len(spec["sources"]) == 1 else [])
                 for source in set(producers) - observed:
                     if source in scores:
                         scores[source] = max(scores[source], scores[name] - 1)
+        self.dynamic_offers.clear()
         for name, spec in library.items():
+            if "dynamic" in spec:
+                continue
             for primary in spec["sources"]:
                 ports = tuple(self.sources_for(spec, primary))
                 if None in ports:
@@ -190,6 +205,22 @@ class ComposedAssembly(NativeAssembly):
                 if spec.get("produces"):
                     label += " | yields " + ", ".join(spec["produces"])
                 plans.append((score, ready, label, action))
+        existing = [plan for plan in plans if plan[0] > 0]
+        for name, spec in library.items():
+            if "dynamic" not in spec or scores[name] <= 0:
+                continue
+            downstream = any(scores[other] > 0 and name in [*consumer["sources"], *consumer.get("inputs", ())]
+                             for other, consumer in library.items() if other != name)
+            found = dynamic_plans(self, name, spec, downstream=downstream)
+            choices = [plan for plan in found if not already_covered(self, spec, plan, existing)]
+            if found and not choices:
+                self.trace.add("native_dynamic_reuse_existing", name=name)
+            if choices:
+                self.dynamic_offers[name] = choices
+                label = dynamic_label(self, spec, choices)
+                if cue := self.lib["decision"].get(name):
+                    label += f" | {cue}"
+                plans.append((scores[name], 0, label, ("dynamic", name)))
         return sorted(plans, key=lambda row: (-row[0], -row[1]))
 
     def fragments(self):
@@ -197,8 +228,11 @@ class ComposedAssembly(NativeAssembly):
         return [(label, action) for _, _, label, action in self.card_plans()]
 
     def execute_card(self, action):
-        _, name, *ports = action
+        kind, name, *ports = action
         spec = self.lib["fragment"][name]
+        if kind == "dynamic":
+            execute_dynamic(self, name, spec, self.dynamic_offers[name])
+            return
         by_ref = {o.ref: o for o in self.observed}
         loaded = []
         for port in ports:
@@ -239,13 +273,15 @@ class ComposedAssembly(NativeAssembly):
 
     def compiled_bindings(self, endpoint):
         rule = self.lib["binding"].get(endpoint, {})
+        resolved = dynamic_writes(self, endpoint)
         if not rule.get("covers"):
-            return []
+            return resolved
         tool = self.tools[endpoint]
-        plans = {}
+        plans = {key(sorted(batch, key=key)): (tool_name, batch, label, sources)
+                 for tool_name, batch, label, sources in resolved}
         for obs in [o for o in reversed(self.observed) if o.complete and o.source in rule["sources"]] or [None]:
             if obs is None and rule["sources"]:
-                return []
+                return resolved
             if "fields" in rule:
                 try:
                     batch = project_batch(tool, obs, rule["fields"])
@@ -287,7 +323,7 @@ class ComposedAssembly(NativeAssembly):
         for cue, choices in fields.items():
             if cue in terms(self.goal):
                 wanted.update(choices)
-        result = []
+        result = dynamic_answers(self)
         for obs in reversed(self.observed):
             if not obs.complete or obs.source not in {*self.lib["fragment"], "calculation"}:
                 continue
@@ -313,19 +349,21 @@ class ComposedAssembly(NativeAssembly):
         outstanding = self.outstanding()
         answers = self.answer_bindings()
         plans = self.card_plans()
-        cards = [(label, action) for score, _, label, action in plans if score > 0][:3]
+        cards = [(label, action) for score, _, label, action in plans if score > 0 and action[0] == "fragment"][:3]
         if answers:
             cards = []
-        self.trace.add("native_fragment_retrieval", eligible=[p[3] for p in plans], page=[a for _, a in cards])
         actions = list(cards)
         self.plan_bindings = {}
         if self.ready_to_finish():
             prompt = answers[0][0] if len(answers) == 1 else "all requested work has been done"
+            if len(answers) > 1 and self.dynamic_results:
+                prompt = "a calculation from the verified records"
             actions.insert(0, (f"Complete the task with {prompt}", FINISH))
         for name in sorted(outstanding):
             projected = "fields" in self.lib["binding"].get(name, {})
             operations = self.compiled_bindings(name)
-            if operations and (projected or len(operations) == 1):
+            dynamic = any(ref in self.dynamic_results for _, _, _, sources in operations for ref in sources)
+            if operations and (projected or dynamic or len(operations) == 1):
                 self.plan_bindings[name] = operations
                 if len(operations) == 1:
                     _, batch, label, _ = operations[0]
@@ -356,6 +394,13 @@ class ComposedAssembly(NativeAssembly):
             actions.append((title, name))
         if not cards and not answers and (not outstanding or not self.set_request):
             actions = self.calculation_options()[:2] + actions
+        capacity = 14 if allow_discovery else 15
+        room = min(3, max(0, capacity - len(actions)))
+        dynamic_cards = ([(label, action) for _, _, label, action in plans if action[0] == "dynamic"][:room]
+                         if not answers else [])
+        actions[:0] = dynamic_cards
+        self.trace.add("native_fragment_retrieval", eligible=[p[3] for p in plans],
+                       page=[a for _, a in [*dynamic_cards, *cards]])
         if allow_discovery:
             actions = actions[:14] + [("Look for another relevant public operation", "@discover")]
         else:
@@ -446,8 +491,9 @@ class ComposedAssembly(NativeAssembly):
             "remaining_official_operations": sorted(self.outstanding()),
             "unresolved": reason,
         }
+        active_cards = [o.source for o in reversed(self.observed) if o.ref in self.dynamic_results]
         advice = [self.lib["handoff"][name] for name in
-                  list(dict.fromkeys([endpoint, *sorted(self.outstanding()), "residual"]))
+                  list(dict.fromkeys([endpoint, *sorted(self.outstanding()), *active_cards, "residual"]))
                   if name in self.lib["handoff"]][:2]
         try:
             self.agent(
@@ -470,7 +516,8 @@ class ComposedAssembly(NativeAssembly):
                 continue
             try:
                 if isinstance(action, tuple):
-                    self.used_transforms.add(action)
+                    if action[0] != "dynamic":
+                        self.used_transforms.add(action)
                     if action[0] == "calculate":
                         label = action[1]
                         self.used_transforms.add(label)
@@ -484,6 +531,11 @@ class ComposedAssembly(NativeAssembly):
                         self.perform(*operation)
             except (TypeError, ValueError, Uncovered) as exc:
                 reason = str(exc)[:350]
+                if isinstance(action, tuple) and action[0] == "dynamic":
+                    name = action[1]
+                    self.used_dynamic_plans.update((name, key(plan)) for plan in self.dynamic_offers[name])
+                    self.trace.add("native_dynamic_exit", name=name, reason=reason)
+                    continue
                 self.notices.append(reason)
                 self.trace.add("native_feedback", reason=reason)
                 if isinstance(action, str):
