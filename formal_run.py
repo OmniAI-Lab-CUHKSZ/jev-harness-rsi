@@ -84,6 +84,7 @@ class ExecutionWorkers:
 
 class Study:
     compiled_executor = FragmentExecutor
+    generation_executor = FormalExecutor
 
     def __init__(self, root, settings, connections, gpus=()):
         self.root = Path(root).resolve()
@@ -170,7 +171,7 @@ class Study:
                     executor = SolDemonstrator(self.solver(), env, folder=part/"model", **self.execution)
                 else:
                     model = workers.worker("model")
-                    executor_type = (compiled_executor or self.compiled_executor) if variant == "B" else FormalExecutor
+                    executor_type = (compiled_executor or self.compiled_executor) if variant == "B" else self.generation_executor
                     executor = executor_type(model, env, **self.execution)
                 run_name = re.sub(r"[^A-Za-z0-9_]", "_", self.root.name+"_"+stage+f"_{attempt}")
                 trace = part/"trace.jsonl"
@@ -317,7 +318,8 @@ def final_report(a, b, seed, labels=None):
                 "input_tokens": sum(r["input_tokens"] for r in rows),
                 "tasks_with_fragments": sum(bool(r.get("fragments")) for r in rows),
                 "tasks_with_native_decision": sum(bool(r["model_calls"].get("D")) for r in rows),
-                "tasks_with_generation": sum(any(n for m,n in r["model_calls"].items()
+                "tasks_with_generation": sum(bool(r["open_calls"]) if "open_calls" in r else
+                                             any(n for m,n in r["model_calls"].items()
                                                  if m.startswith("G") or m=="R") for r in rows),
                 "tasks_with_task_fallback": sum(bool(r.get("fallback")) for r in rows),
                 "local_recoveries": sum(r.get("local_recoveries", 0) for r in rows),

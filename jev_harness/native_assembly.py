@@ -1,0 +1,948 @@
+"""One public tool or one read-only transformation per turn, with local generation."""
+
+from copy import deepcopy
+from itertools import product
+import json
+import re
+
+from .formal_runtime import FormalExecutor, bounded
+from .expressions import path_get
+from .policy_programs import load_program
+from .runtime import MAX_REAL_OPTIONS, Uncovered, parse_json
+from .retrieval import terms
+from .schema_tools import (
+    FINISH,
+    MANAGED,
+    Observation,
+    available,
+    calculations,
+    catalog,
+    check_args,
+    checklist_plans,
+    effect_view,
+    expand_binding,
+    has_update,
+    is_read,
+    key,
+    leaf_fields,
+    literal_plans,
+    normalize_action,
+    public_calculation,
+    public_value,
+    ranked_tools,
+    record_plans,
+    update_fields,
+)
+
+
+PROTOCOL = "appworld_native_tools_v2"
+DISCOVER = "@discover"
+MORE_FRAGMENTS = "@fragments"
+FRAGMENT_COMMON_WORDS = terms("find select match matching other relevant named source observed row field value "
+                              "available result need needed using given return from this these those its their "
+                              "there one only if can has have do about information")
+ACTION_SKILL = (
+    "Choose one step that advances the user's outstanding request. Read the relevant source first "
+    "when a target or value is unknown. A matching object alone does not authorize a write. "
+    "Check the direction of the action, scope and real receipts before completing."
+)
+BIND_SKILL = (
+    "Choose a binding only if its source, filters and affected records match the instruction. "
+    "For a set action choose all and only the requested objects. NONE asks for a local binding."
+)
+BIND_FORMAT = (
+    'Return one JSON object. Put public keyword values in "arguments". The runtime supplies '
+    "authentication. Omit both page_index and page_limit to collect all pages. "
+    "If either is supplied, read just that public API page, with official defaults for omitted fields. "
+    "To apply an operation to observed rows, optionally set "
+    '"source":"r1", "where":{"nested.field":"exact value"}, "order_by":"field", '
+    '"take":"first" or "last" (omit for all); {"field":"nested.field"} copies a field into one '
+    'argument from that same row. To inspect a visible source return {"inspect":{"source":"r1",'
+    '"row":0,"field":"nested.field","offset":0}}. A text excerpt is 500 characters. Do not write code. If a prerequisite is missing return '
+    '{"search":"short description of the needed read"}.'
+)
+EDIT_FORMAT = (
+    "For a record update, bind the target and the new content or attribute. An identifier alone "
+    "does not change the record. To change part of an observed text field, give a source and use "
+    '{"replace_text":{"field":"content","old":"exact unique excerpt","new":"replacement"}} '
+    "as its argument value. This preserves the rest of the text."
+)
+
+
+def blank_library():
+    return {group: {} for group in ("retrieval", "decision", "binding", "fragment", "state", "handoff")}
+
+
+def fragment_goal_score(spec, goal):
+    """Score goal evidence only. An input endpoint or an agent-supplied search is not a goal."""
+    source_words = terms(" ".join([*spec["sources"], *spec.get("inputs", [])]))
+    if {"text", "message"} <= source_words:
+        source_words = source_words | {"sms"}
+
+    def specific(words):
+        return {w for w in words - source_words - FRAGMENT_COMMON_WORDS if len(w) > 1 and not w.isdecimal()}
+
+    if "goal_terms" in spec:
+        cues = (terms(phrase) for phrase in spec["goal_terms"])
+        return max((len(specific(cue)) for cue in cues if cue <= goal), default=0)
+    return len(specific(terms(spec["label"]) & goal))
+
+
+def preview(value, chars=2000):
+    return bounded(value, chars)
+
+
+def tool_error(text):
+    # AppWorld's traceback includes the call expression, which may contain the live token.
+    if "Response status code is " in text:
+        return "Execution failed. " + text.rsplit("Response status code is ", 1)[1][:340]
+    return "Execution failed. " + (text.strip().splitlines() or ["unknown error"])[-1][:240]
+
+
+def requests_fragment_choice(definition, result):
+    has_questions = "choice" in definition or "choices" in definition
+    return has_questions and isinstance(result, dict) and result.keys() == {"$choose"}
+
+
+def fragment_record(source, index, fields):
+    if source is None:
+        raise ValueError("The declared record source is missing from this fragment call")
+    if type(index) is not int or not 0 <= index < len(source.rows):
+        raise ValueError("A proposed record index is outside the observation")
+    evidence = {k: preview(path_get(source.rows[index], k), 500) for k in fields}
+    if all(value is None for value in evidence.values()):
+        raise ValueError(f"No declared field is visible in {source.ref}[{index}]")
+    return {"source": source.source, "ref": source.ref, "row": index}, evidence
+
+
+def fragment_record_options(source, indices, fields):
+    if not isinstance(indices, list) or not 1 <= len(indices) <= MAX_REAL_OPTIONS:
+        raise ValueError(f"A fragment ballot needs 1 to {MAX_REAL_OPTIONS} observed rows")
+    options = []
+    for index in indices:
+        record, evidence = fragment_record(source, index, fields)
+        label = f"{source.ref}[{index}] " + json.dumps(evidence, ensure_ascii=False)
+        options.append({"label": label, "value": record})
+    if len(set(indices)) != len(indices):
+        raise ValueError("The proposed record indices contain duplicates")
+    return options
+
+
+def fragment_ballot(name, spec, request, sources, instruction):
+    # A list selects the original single template. Named templates allow independent and dependent roles.
+    if isinstance(request, list) and "choice" in spec:
+        role, slot, rows, using = None, spec["choice"], request, {}
+    else:
+        if (
+            not isinstance(request, dict) or not {"role", "rows"} <= request.keys()
+            or request.keys() - {"role", "rows", "using"}
+        ):
+            raise ValueError("Choose a declared question role and its observed rows")
+        role, rows, using = request["role"], request["rows"], request.get("using", {})
+        slots = spec.get("choices", {})
+        if not isinstance(role, str) or role not in slots:
+            raise ValueError("The question role is missing from the fragment definition")
+        if not isinstance(using, dict) or using.keys() - slots.keys():
+            raise ValueError("Use declared roles when referring to other observed records")
+        slot = slots[role]
+    source = sources.get(slot["source"])
+    options = fragment_record_options(source, rows, slot["fields"])
+    # A search query or an operation label expresses the agent's hypothesis. Only show public records.
+    evidence = {"instruction": instruction, "source": source.source, "source_complete": source.complete}
+    references = []
+    for anchor in sorted(using):
+        template = spec["choices"][anchor]
+        record, fields = fragment_record(sources.get(template["source"]), using[anchor], template["fields"])
+        references.append({**record, "fields": fields})
+    if references:
+        evidence["reference_records"] = references
+    if role is not None:
+        for option in options:
+            option["value"].update(fragment=name, role=role)
+    return role, slot["question"], source, options, evidence
+
+
+def observed_input(obs):
+    value = {"ref": obs.ref, "rows": deepcopy(obs.rows), "scope": obs.scope, "complete": obs.complete}
+    if obs.arguments is not None:
+        value["arguments"] = deepcopy(obs.arguments)
+    return value
+
+
+def run_program(definition, instruction, when, obs, companions=(), *, selected=None, selections=()):
+    context = {
+        "instruction": instruction,
+        "datetime": when,
+        "source": obs.source,
+        **observed_input(obs),
+    }
+    context["inputs"] = {o.source: observed_input(o) for o in companions}
+    if selected is not None:
+        context["selected"] = deepcopy(selected)
+    if selections:
+        context["selections"] = deepcopy(selections)
+    result = load_program(definition["program"])(context)
+    return json.loads(json.dumps(result, allow_nan=False))
+
+
+class NativeAssembly(FormalExecutor):
+    review_nodes = ("native/action", "native/binding", "native/app", "native/fragment_choice")
+    generation_only = False
+
+    def initialize_native(self, library):
+        self.lib = {**blank_library(), **library}
+        self.tools = catalog(self.context["task"]["functions"])
+        self.instruction = self.context["task"]["instruction"]
+        self.observed, self.receipts, self.notices = [], [], []
+        self.tokens, self.partial = {}, {}
+        self.accounts = None
+        self.lookup = ""
+        self.last_read = {}
+        self.state_views = {}
+        self.used_transforms = set()
+        self.transforms = {}
+        self.calculation_refs = {}
+        self.binding_sources = {}
+        self.last_update = {}
+        self.trace.add("native_protocol", version=PROTOCOL)
+
+    def recorded_tool_io(self, params, response):
+        data = {k: v for k, v in response.items() if k not in ("output", "value")}
+        val = response.get("value", response.get("output"))
+        if params.get("api") in {"login", "show_account_passwords"}:
+            data["value"] = {"session_data_received": isinstance(val, (list, dict)) and bool(val)}
+        else:
+            data["value"] = (
+                tool_error(val)
+                if isinstance(val, str) and val.startswith("Execution failed.")
+                else public_value(val)
+            )
+        public = public_value(params)
+        public.get("arguments", {}).pop("raise_on_failure", None)
+        return public, data
+
+    def call(self, app, api, arguments, node=None):
+        # AppWorld otherwise returns the same {"message": ...} shape for successful writes and HTTP errors.
+        try:
+            return super().call(app, api, {**arguments, "raise_on_failure": True}, node)
+        except Uncovered as exc:
+            if "Execution failed." in str(exc) or "Response status code is " in str(exc):
+                raise Uncovered(tool_error(str(exc))) from None
+            raise
+
+    def session_token(self, app):
+        if app not in self.tokens:
+            login = self.tools.get(f"{app}__login", {})
+            fields = login.get("parameters", {}).get("properties", {})
+            if "username" not in fields or "password" not in fields:
+                raise Uncovered(f"No supported public login for {app}")
+            field = "phone_number" if "phone" in fields["username"]["description"].lower() else "email"
+            if self.accounts is None:
+                self.accounts = self.call("supervisor", "show_account_passwords", {}, "session")
+            if not isinstance(self.accounts, list):
+                raise Uncovered("The credential provider did not return account rows")
+            credentials = [r for r in self.accounts if r.get("account_name") == app]
+            identity = self.context["task"]["supervisor"].get(field)
+            if len(credentials) != 1 or not identity:
+                raise Uncovered(f"Cannot bind the public {app} identity")
+            result = self.call(
+                app, "login", {"username": identity, "password": credentials[0]["password"]}, "session"
+            )
+            if not isinstance(result, dict) or not result.get("access_token"):
+                raise Uncovered(f"The public {app} login did not produce a session")
+            self.tokens[app] = result["access_token"]
+        return self.tokens[app]
+
+    def facts(self):
+        observations = []
+        for obs in self.observed[-6:]:
+            view = obs.view(self.instruction)
+            view["sample"] = [preview(row, 650) for row in view["sample"]]
+            if obs.rows and isinstance(obs.rows[0], dict):
+                view["fields"] = [field for field, _ in leaf_fields(obs.rows[0])][:35]
+            observations.append(view)
+        facts = {
+            "instruction": self.instruction,
+            "datetime": self.context["task"].get("datetime"),
+            "observations": observations,
+            "tool_receipts": self.receipts[-6:],
+            "recent_feedback": self.notices[-2:],
+        }
+        if self.lookup:
+            facts["looking_for"] = self.lookup
+        if self.state_views:
+            facts["derived_evidence"] = self.state_views
+        return facts
+
+    def companion_sets(self, spec):
+        sources = spec.get("inputs", [])
+        return product(*([o for o in reversed(self.observed) if o.source == source] for source in sources))
+
+    def program(self, group, name, obs, companions=(), *, selected=None, selections=()):
+        definition = self.lib[group][name]
+        try:
+            return run_program(
+                definition, self.instruction, self.context["task"].get("datetime"), obs, companions,
+                selected=selected, selections=selections,
+            )
+        except (
+            ValueError,
+            TypeError,
+            IndexError,
+            KeyError,
+            ArithmeticError,
+            AttributeError,
+            re.error,
+        ) as exc:
+            self.trace.add("program_error", component=group, name=name, error=str(exc)[:240])
+            return None
+
+    def resolve_fragment(self, name, obs, companions=()):
+        spec = self.lib["fragment"][name]
+        sources = {item.source: item for item in (obs, *companions)}
+        selections, asked = [], []
+        result = self.program("fragment", name, obs, companions)
+        while requests_fragment_choice(spec, result):
+            try:
+                role, question, source, options, evidence = fragment_ballot(
+                    name, spec, result["$choose"], sources, self.instruction
+                )
+            except ValueError as exc:
+                self.trace.add("native_fragment_choice", name=name, status="unavailable", reason=str(exc))
+                return None
+            detail = {"ref": source.ref}
+            if role is not None:
+                detail["role"] = role
+            refs = evidence.get("reference_records", [])
+            if refs:
+                detail["using"] = [[r["ref"], r["row"]] for r in refs]
+            identity = (role, source.ref, sorted(o["value"]["row"] for o in options), refs)
+            if identity in asked:
+                self.trace.add("native_fragment_choice", name=name, status="repeated", **detail,
+                               reason="This question already has an answer for these records")
+                return None
+            asked.append(identity)
+            try:
+                selection = self.decision(
+                    question, evidence, options,
+                    "Use the public record that fills the requested role. Choose NONE if none fits or the evidence leaves a tie.",
+                    node="native/fragment_choice", review_step=self.requests + 1 < self.max_calls,
+                )
+            except Uncovered as exc:
+                self.trace.add("native_fragment_choice", name=name, status="unbound", **detail, reason=str(exc))
+                return None
+            index = selection["row"]
+            bound = {"source": source.source, "ref": source.ref, "row": index, "value": source.rows[index]}
+            selections.append({**bound, "role": role})
+            result = self.program("fragment", name, obs, companions, selected=bound, selections=selections)
+            status = "resolved" if result is not None and result != [] else "no_result"
+            if requests_fragment_choice(spec, result):
+                status = "continued"
+            self.trace.add("native_fragment_choice", name=name, row=index, status=status, **detail)
+        return result
+
+    def ask(self, node, question, options, skill, **extra):
+        view = {**self.facts(), **extra}
+        try:
+            return self.decision(
+                question,
+                view,
+                [{"label": label, "value": v} for label, v in options],
+                skill,
+                node=node,
+                review_step=self.requests + 1 < self.max_calls,
+            )
+        except Uncovered:
+            return None
+
+    def generate_one(self, instruction, data, purpose):
+        messages = [
+            {"role": "system", "content": instruction},
+            {"role": "user", "content": json.dumps(data, ensure_ascii=False)},
+        ]
+        response = self._model(
+            "generate",
+            messages=messages,
+            thinking=self.generation_thinking,
+            purpose=purpose,
+            max_tokens=min(640, self.generation_tokens),
+        )
+        if response.get("truncated"):
+            raise ValueError("Local JSON completion was truncated")
+        result = parse_json(response["text"])
+        if not isinstance(result, dict):
+            raise ValueError("Expected a single structured action")
+        return result
+
+    def candidates(self, app=None, query=None):
+        return ranked_tools(
+            self.tools,
+            self.instruction,
+            self.observed,
+            self.lib["retrieval"],
+            app,
+            self.lookup if query is None else query,
+        )
+
+    def fragments(self):
+        options = []
+        for obs in reversed(self.observed):
+            for name, spec in self.lib["fragment"].items():
+                if obs.source not in spec["sources"]:
+                    continue
+                for others in self.companion_sets(spec):
+                    refs = [obs.ref, *(o.ref for o in others)]
+                    marker = f"{name}({','.join(refs)})"
+                    if marker not in self.used_transforms:
+                        inputs = ", ".join(f"{o.ref} ({o.source})" for o in (obs, *others))
+                        options.append((f"{spec['label']} | input {inputs}", ("fragment", name, *refs)))
+        options.sort(key=lambda o: -len(terms(o[0]) & terms(self.instruction)))
+        return options
+
+    def calculation_options(self):
+        self.transforms = {}
+        self.calculation_refs = {}
+        for obs in reversed(self.observed[-4:]):
+            if obs.source == "calculation" or not is_read(obs.source):
+                continue
+            for label, result in calculations(obs, self.instruction):
+                if label not in self.used_transforms:
+                    self.transforms[label] = result
+                    self.calculation_refs[label] = obs.ref
+        return [(label, ("calculate", label)) for label in self.transforms]
+
+    def tool_label(self, name):
+        tool = self.tools[name]
+        desc = tool["description"].split("\n")[0][:160]
+        hint = self.lib["decision"].get(name)
+        return f"{name}: {desc}" + (f" {hint}" if hint else "")
+
+    def action_page(self, names, *, allow_discovery=True):
+        eligible = self.fragments()
+        goal = terms(self.instruction)
+        names_with_inputs = {value[1] for label, value in eligible}
+        scores = {name: fragment_goal_score(self.lib["fragment"][name], goal) for name in names_with_inputs}
+        matches = [(label, value) for label, value in eligible if scores[value[1]] > 0]
+        fragments = sorted(matches, key=lambda option: scores[option[1][1]], reverse=True)[:2]
+        if eligible:
+            self.trace.add(
+                "native_fragment_retrieval",
+                eligible=[v for _, v in eligible],
+                page=[v for _, v in fragments],
+            )
+        available_slots = (
+            15
+            - len(names)
+            - len(fragments)
+            - int(bool(self.observed or self.receipts))
+            - int(allow_discovery)
+        )
+        derived = self.calculation_options()[: max(0, min(4, available_slots))]
+        actions = fragments + derived + [(self.tool_label(n), n) for n in names]
+        if self.observed or self.receipts:
+            actions.append(
+                (
+                    "Complete the task now (return the requested answer or finish after all requested effects)",
+                    FINISH,
+                )
+            )
+        if allow_discovery:
+            actions.append(("Browse additional public tools or learned operations", DISCOVER))
+        return self.ask(
+            "native/action",
+            "Which NEXT operation is supported by the request and current progress?",
+            actions,
+            ACTION_SKILL,
+        )
+
+    def next_action(self):
+        ranked = self.candidates()
+        action = self.action_page(ranked[:8])
+        if action is None:
+            action = self.action_page(ranked[8:16])
+        if action != DISCOVER:
+            return action
+        apps = sorted({n.split("__")[0] for n in ranked})
+        sections = [(a, a) for a in apps]
+        if self.fragments():
+            sections.append(("Browse learned operations whose inputs are available", MORE_FRAGMENTS))
+        app = self.ask(
+            "native/app",
+            "Where should we look for the missing operation?",
+            sections,
+            "Choose by the required source or effect.",
+        )
+        if app == MORE_FRAGMENTS:
+            return self.fragment_pages()
+        if app is None:
+            return None
+        expanded = self.candidates(app=app)
+        for i in range(0, len(expanded), 10):
+            choice = self.action_page(expanded[i : i + 10], allow_discovery=False)
+            if choice is not None:
+                return choice
+        return None
+
+    def fragment_pages(self):
+        options = self.fragments()
+        for pos in range(0, len(options), 12):
+            choice = self.ask(
+                "native/action",
+                "Which operation applies to these sources and the current goal?",
+                options[pos : pos + 12],
+                ACTION_SKILL,
+            )
+            if choice is not None:
+                return choice
+        return None
+
+    def local_action(self, endpoint=None):
+        view = self.facts()
+        if endpoint is not None:
+            view["selected_tool"] = self.tools[endpoint]
+            if endpoint in self.lib["handoff"]:
+                view["guidance"] = self.lib["handoff"][endpoint]
+            prompt = "Supply only the missing arguments for the selected public tool. " + BIND_FORMAT
+            if update_fields(self.tools[endpoint]):
+                prompt += " " + EDIT_FORMAT
+                view["editable_fields"] = sorted(update_fields(self.tools[endpoint])[1])
+            spec = self.generate_one(prompt, view, "G_binding")
+        else:
+            # This catalogue view is independent of learned fragment/decision descriptions.
+            names = ranked_tools(self.tools, self.instruction, self.observed, query=self.lookup)[:12]
+            view["public_tools"] = [self.tools[n] for n in names + [FINISH]]
+            prompt = (
+                'Take exactly one useful AppWorld action. Set "tool" to a public tool name, or use '
+                '{"search":"keywords"} to inspect another part of the public catalogue. '
+                'To compute a value from public data you may instead return {"calculate":{"op":"sum",'
+                '"source":"r1","field":"amount"}}. Supported ops: count, sum, mean, argmin, argmax, project, '
+                "distinct, group and join. You may include where (exact field/value pairs) or separator for join. "
+                "Call supervisor__complete_task when all requested work is complete. " + BIND_FORMAT
+            )
+            if any(update_fields(self.tools[n]) for n in names):
+                prompt += " " + EDIT_FORMAT
+            spec = self.generate_one(prompt, view, "G_tool")
+        if set(spec) == {"inspect"}:
+            request = spec["inspect"]
+            if not isinstance(request, dict):
+                raise ValueError("Inspect requires an observed source")
+            obs = next((o for o in self.observed if o.ref == request.get("source")), None)
+            row, offset = request.get("row", 0), request.get("offset", 0)
+            if (
+                obs is None
+                or type(row) is not int
+                or not 0 <= row < len(obs.rows)
+                or type(offset) is not int
+                or offset < 0
+            ):
+                raise ValueError("Invalid source, row or text offset")
+            value = path_get(obs.rows[row], request.get("field", ""))
+            if value is None:
+                raise ValueError("Unknown observation field")
+            self.observe(
+                "inspection",
+                value[offset : offset + 500] if isinstance(value, str) else value,
+                f"excerpt of {obs.ref}: " + key(request),
+                complete=False,
+                sources={obs.ref: {"fields": {"excerpt": request.get("field", "")}}},
+            )
+            return None
+        if endpoint is None and set(spec) == {"calculate"}:
+            operation = spec["calculate"]
+            result = public_calculation(operation, self.observed)
+            self.observe(
+                "calculation",
+                result,
+                "generated operation " + key(operation),
+                sources={operation["source"]: {"calculation": operation["op"]}},
+            )
+            return None
+        if "search" in spec:
+            if not isinstance(spec["search"], str) or not spec["search"].strip():
+                raise ValueError("A discovery query needs text")
+            self.lookup = spec["search"][:240]
+            self.trace.add("native_discovery", query=self.lookup)
+            return None
+        spec = normalize_action(spec, endpoint, self.tools)
+        selected = spec.get("tool", endpoint)
+        if (
+            selected not in self.tools
+            or (endpoint is not None and selected != endpoint)
+            or (selected != FINISH and not available(selected))
+        ):
+            raise ValueError("Choose one available public operation")
+        unknown = set(spec) - {"tool", "arguments", "source", "where", "order_by", "take"}
+        if unknown:
+            raise ValueError("Unexpected action fields: " + ", ".join(sorted(unknown)))
+        if ({"where", "order_by", "take"} & spec.keys() and "source" not in spec) or spec.get("take") not in (
+            None,
+            "first",
+            "last",
+        ):
+            raise ValueError("A row selector requires a source and a supported take value")
+        batch = expand_binding(spec, self.observed)
+        self.trace.add("native_generated_binding", tool=selected, spec=spec)
+        sources = {}
+        if "source" in spec:
+            fields = {}
+            edits = []
+            for arg, expr in spec.get("arguments", {}).items():
+                if isinstance(expr, dict) and set(expr) == {"field"}:
+                    fields[arg] = expr["field"]
+                if isinstance(expr, dict) and set(expr) == {"replace_text"}:
+                    fields[arg] = expr["replace_text"]["field"]
+                    edits.append(arg)
+            sources[spec["source"]] = {"fields": fields} if fields else {"scope_only": True}
+            if edits:
+                sources[spec["source"]]["edited"] = edits
+        return (
+            selected,
+            batch,
+            "generated binding" + (f" from {spec['source']}" if "source" in spec else ""),
+            sources,
+        )
+
+    def argument_plans(self, endpoint):
+        tool = self.tools[endpoint]
+        plans = []
+        self.binding_sources = {}
+        rule = self.lib["binding"].get(endpoint)
+        if rule and "program" in rule:
+            for obs in reversed(self.observed):
+                if obs.source not in rule["sources"]:
+                    continue
+                for others in self.companion_sets(rule):
+                    batch = self.program("binding", endpoint, obs, others)
+                    if isinstance(batch, list) and batch:
+                        try:
+                            for args in batch:
+                                check_args(tool, args)
+                        except ValueError as exc:
+                            self.trace.add(
+                                "program_error", component="binding", name=endpoint, error=str(exc)
+                            )
+                        else:
+                            refs = ", ".join(o.ref for o in (obs, *others))
+                            plans.append(
+                                (
+                                    f"{rule['label']} from {refs}",
+                                    batch,
+                                    {o.ref: {"program_input": endpoint} for o in (obs, *others)},
+                                )
+                            )
+        plans.extend(checklist_plans(tool, self.instruction, self.observed))
+        plans.extend(record_plans(tool, self.instruction, self.observed))
+        plans.extend(
+            (
+                f"Use {key(args)}" if args else "Use official defaults, no additional filters or arguments",
+                [args],
+                {},
+            )
+            for args in literal_plans(tool, self.instruction)
+        )
+        if endpoint == FINISH:
+            for obs in reversed(self.observed):
+                if not isinstance(obs.data, (list, dict)):
+                    plans.insert(
+                        0,
+                        (
+                            f"Return result {obs.ref} ({obs.source})",
+                            [{"answer": obs.data}],
+                            {obs.ref: {"fields": {"answer": ""}}},
+                        ),
+                    )
+                elif isinstance(obs.data, dict):
+                    for field, value in leaf_fields(obs.data):
+                        if type(value) in (str, int, float):
+                            plans.append(
+                                (
+                                    f"Return {field} from {obs.ref} ({obs.source})",
+                                    [{"answer": value}],
+                                    {obs.ref: {"fields": {"answer": field}}},
+                                )
+                            )
+        seen = set()
+        choices = []
+        for label, batch, sources in plans:
+            if not batch or not all(
+                has_update(tool, args) and self.current_text_edit(tool, args, sources) for args in batch
+            ):
+                continue
+            signature = key(batch)
+            if signature not in seen:
+                seen.add(signature)
+                self.binding_sources[label] = sources
+                choices.append((label, batch))
+        return choices
+
+    def binding(self, endpoint):
+        plans = self.argument_plans(endpoint)
+        schema = self.tools[endpoint]["parameters"]
+        relevant = set(schema["properties"]) - MANAGED
+        if (not relevant and plans) or (len(plans) == 1 and plans[0][1] == [{}] and is_read(endpoint)):
+            return endpoint, plans[0][1], plans[0][0]
+        if (
+            endpoint == FINISH
+            and self.receipts
+            and not re.search(
+                r"\b(what|how many|how much|what is|tell me|name the|give me the number)\b",
+                self.instruction,
+                re.I,
+            )
+        ):
+            # The action ballot already requested completion. The official default is the action receipt.
+            return endpoint, [{}], "finish requested state changes"
+        for i in range(0, len(plans), 12):
+            page = plans[i : i + 12]
+            opts = []
+            for label, batch in page:
+                display = label if label.startswith("Use ") else f"{label} | e.g. {preview(batch[0], 220)}"
+                if update_fields(self.tools[endpoint]):
+                    display = f"{label} | effect on first of {len(batch)}: " + key(
+                        effect_view(self.tools[endpoint], batch[0], self.observed)
+                    )
+                opts.append((display, {"tool": endpoint, "arguments": batch, "scope": label}))
+            selected = self.ask(
+                "native/binding",
+                f"Which arguments and scope for {endpoint} match the user's request?",
+                opts,
+                BIND_SKILL,
+                parameters={
+                    k: v.get("description", "")[:160]
+                    for k, v in schema["properties"].items()
+                    if k not in MANAGED
+                },
+            )
+            if selected is not None:
+                return (
+                    endpoint,
+                    selected["arguments"],
+                    selected["scope"],
+                    self.binding_sources[selected["scope"]],
+                )
+        if update_fields(self.tools[endpoint]):
+            self.trace.add(
+                "native_update_fallback",
+                tool=endpoint,
+                applicable_bindings=len(plans),
+                reason="no selected binding supplies a target and change",
+            )
+        return self.local_action(endpoint)
+
+    def observe(self, source, data, scope, *, complete=True, sources=None, arguments=None):
+        obs = Observation(f"r{len(self.observed) + 1}", source, public_value(data), scope, complete,
+                          public_value(arguments))
+        self.observed.append(obs)
+        for name, spec in self.lib["state"].items():
+            if obs.source in spec["sources"]:
+                value = self.program("state", name, obs)
+                if value is not None:
+                    self.state_views[name] = {
+                        "from": obs.ref,
+                        "meaning": spec["label"],
+                        "value": preview(value, 600),
+                    }
+        self.trace.add(
+            "native_observation",
+            ref=obs.ref,
+            source=source,
+            scope=scope,
+            count=len(obs.rows),
+            value=obs.data,
+            complete=obs.complete,
+            sources=sources or {},
+            **({"arguments": obs.arguments} if obs.arguments is not None else {}),
+        )
+
+    def current_text_edit(self, tool, args, sources):
+        fields = update_fields(tool)
+        if fields and sources:
+            target = key({k: args.get(k) for k in sorted(fields[0])})
+            for ref, detail in sources.items():
+                for field in detail.get("edited", []):
+                    if int(ref[1:]) <= self.last_update.get((tool["name"], target, field), -1):
+                        return False
+        return True
+
+    def perform(self, endpoint, batch, scope, sources=None):
+        tool = self.tools[endpoint]
+        for args in batch:
+            check_args(tool, args)
+            if not has_update(tool, args):
+                raise ValueError(
+                    f"{endpoint} needs at least one editable value for the requested change: "
+                    + ", ".join(sorted(update_fields(tool)[1]))
+                )
+            if not self.current_text_edit(tool, args, sources):
+                raise ValueError(
+                    "A newer update changed this field. Read the object again before editing its text."
+                )
+        if not batch or (endpoint == FINISH and len(batch) != 1):
+            raise ValueError("An action needs a nonempty binding and at most one task completion")
+        app, api = endpoint.split("__", 1)
+        props = tool["parameters"]["properties"]
+        read = is_read(endpoint)
+        packet = (endpoint, key(batch))
+        if read and all((endpoint, key(args)) in self.last_read for args in batch):
+            raise Uncovered(
+                f"{endpoint} with these arguments was already read. Use the existing observation or select a different scope."
+            )
+        self.trace.add(
+            "native_operation",
+            tool=endpoint,
+            scope=scope,
+            count=len(batch),
+            arguments=public_value(batch),
+            sources=sources or {},
+        )
+        earlier = self.partial.get(packet, [])
+        outputs = list(earlier)
+        for i, args in enumerate(batch):
+            if not read and i < len(earlier):
+                continue
+            if read and (endpoint, key(args)) in self.last_read:
+                outputs.append(self.last_read[(endpoint, key(args))])
+                continue
+            bound = dict(args)
+            if "access_token" in props:
+                bound["access_token"] = self.session_token(app)
+            if {"page_index", "page_limit"} <= props.keys():
+                result = []
+                single_page = "page_index" in bound or "page_limit" in bound
+                size = (
+                    bound.get("page_limit", props["page_limit"].get("default", 5))
+                    if single_page
+                    else min(20, props["page_limit"].get("maximum", 20))
+                )
+                page = bound.get("page_index", props["page_index"].get("default", 0))
+                while True:
+                    chunk = self.call(app, api, {**bound, "page_index": page, "page_limit": size}, endpoint)
+                    if not isinstance(chunk, list):
+                        raise Uncovered(
+                            f"{endpoint} did not return a page of records: {preview(public_value(chunk), 240)}"
+                        )
+                    result.extend(chunk)
+                    if len(chunk) < size or single_page:
+                        break
+                    page += 1
+            else:
+                result = self.call(app, api, bound, endpoint)
+            outputs.append(result)
+            if read:
+                self.last_read[(endpoint, key(args))] = result
+            else:
+                effect = effect_view(tool, args, self.observed)
+                self.trace.add(
+                    "native_effect",
+                    tool=endpoint,
+                    batch_index=i,
+                    count=len(batch),
+                    effect=effect,
+                    sources=sources or {},
+                    response=preview(public_value(result), 300),
+                )
+                if endpoint != FINISH:
+                    self.partial[packet] = list(outputs)
+                    self.last_read.clear()
+                    receipt = {
+                        "tool": endpoint,
+                        "arguments": public_value(args),
+                        "response": preview(public_value(result), 300),
+                    }
+                    if update_fields(tool):
+                        receipt = {
+                            "tool": endpoint,
+                            "requested_update": effect,
+                            "response": receipt["response"],
+                        }
+                        targets, editable = update_fields(tool)
+                        target = key({k: args.get(k) for k in sorted(targets)})
+                        for field in editable & args.keys():
+                            self.last_update[(endpoint, target, field)] = len(self.observed)
+                    self.receipts.append(receipt)
+        self.partial.pop(packet, None)
+        if endpoint != FINISH:
+            value = outputs[0] if len(outputs) == 1 else outputs
+            # Single-page requests retain their explicit scope. The caller can ask for the next page.
+            complete = all(
+                not ({"page_index", "page_limit"} & a.keys())
+                or (
+                    a.get("page_index", props.get("page_index", {}).get("default", 0)) == 0
+                    and isinstance(v, list)
+                    and len(v) < a.get("page_limit", props.get("page_limit", {}).get("default", 5))
+                )
+                for a, v in zip(batch, outputs)
+            )
+            self.observe(
+                endpoint,
+                value,
+                scope + " | " + str(preview(batch if len(batch) < 3 else batch[:2], 350)),
+                complete=complete,
+                sources=sources,
+                arguments=batch if read else None,
+            )
+        self.lookup = ""
+
+    def execute_task(self, library):
+        self.initialize_native(library)
+        while not self.done:
+            try:
+                if self.generation_only:
+                    operation = self.local_action()
+                else:
+                    action = self.next_action()
+                    if isinstance(action, tuple):
+                        if action[0] == "calculate":
+                            label = action[1]
+                            self.used_transforms.add(label)
+                            self.observe(
+                                "calculation",
+                                self.transforms[label],
+                                label,
+                                sources={self.calculation_refs[label]: {"calculation": label}},
+                            )
+                            continue
+                        _, name, ref, *rest = action
+                        marker = f"{name}({','.join([ref, *rest])})"
+                        self.used_transforms.add(marker)
+                        obs = next(o for o in self.observed if o.ref == ref)
+                        by_ref = {o.ref: o for o in self.observed}
+                        result = self.resolve_fragment(name, obs, [by_ref[r] for r in rest])
+                        if result is None or result == []:
+                            raise Uncovered(f"{name} found no supported result in {ref}")
+                        self.observe(
+                            name, result, marker, sources={r: {"program_input": name} for r in [ref, *rest]}
+                        )
+                        continue
+                    operation = self.binding(action) if action is not None else self.local_action()
+                if operation:
+                    self.perform(*operation)
+            except (ValueError, TypeError, Uncovered) as exc:
+                self.notices.append(str(exc)[:350])
+                self.trace.add("native_feedback", reason=self.notices[-1])
+
+    def summarize(self, *args):
+        result = super().summarize(*args)
+        events = self.trace.events
+        result.update(
+            protocol=PROTOCOL,
+            fragments=sorted({e["source"] for e in events if e["event"] == "native_observation"
+                              and e["source"] in getattr(self, "lib", {}).get("fragment", {})}),
+            open_calls=sum(e["event"] == "model" and e["operation"] == "generate" for e in events),
+            native_ballots=sum(e["event"] == "decision" for e in events),
+            open_output_tokens=sum(
+                e["response"].get("output_tokens", 0)
+                for e in events
+                if e["event"] == "model" and e["operation"] == "generate"
+            ),
+            decision_output_tokens=sum(
+                e["response"].get("output_tokens", 0)
+                for e in events
+                if e["event"] == "model" and e["operation"] == "decide"
+            ),
+        )
+        return result
+
+
+class NativeGeneration(NativeAssembly):
+    generation_only = True

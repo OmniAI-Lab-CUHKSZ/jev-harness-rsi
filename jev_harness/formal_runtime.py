@@ -85,16 +85,19 @@ class FormalExecutor(Executor):
             raise WorkerUnavailable(f"Environment {op} failed: {exc}") from exc
         self.api_total = response.get("api_total", self.api_total + response.get("api_calls", int(op == "call")))
         self.done = bool(response.get("done"))
-        public_params = dict(params)
-        self.trace.add(event, node=node, **public_params, response=response)
+        public_params, public_response = self.recorded_tool_io(params, response)
+        self.trace.add(event, node=node, **public_params, response=public_response)
         if event == "tool_batch":
             # Keep called endpoint/argument provenance alongside the batch's compact stdout.
             start = self.api_total - response.get("api_calls", 0)
-            for index, action in enumerate(response.get("actions", []), start=start):
+            for index, action in enumerate(public_response.get("actions", []), start=start):
                 self.trace.add("api_action", node=node, request_index=index + 1, **action)
-        observation = {**public_params, "response": {"output": bounded(response.get("value", response.get("output")), 8000)}}
+        observation = {**public_params, "response": {"output": bounded(public_response.get("value", public_response.get("output")), 8000)}}
         self.context["history"].append(observation)
         return response
+
+    def recorded_tool_io(self, params, response):
+        return dict(params), response
 
     def call(self, app, api, arguments, node=None):
         if f"{app}__{api}" not in self.known_apis():

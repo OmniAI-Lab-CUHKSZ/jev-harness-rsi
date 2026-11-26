@@ -120,6 +120,11 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("plan", help="Print the exact protocol, H0 and task IDs without loading a model")
+    from .native_pilot import configure, run_pilot
+    configure(commands.add_parser("native-pilot", help="Pilot schema-driven tools and a Train-only Sol revision"))
+    from . import native_formal
+    native_formal.configure(commands.add_parser("native-run", help="Run or resume the cold-start native-tool experiment"))
+    commands.add_parser("native-plan", help="Print the cold-start native split, settings and H0 without starting workers")
     for command, help_text in (("smoke", "Run one H0 Train task with the real model and simulator"),
                                ("run", "Run or resume the ten-batch experiment and paired Test-N evaluation")):
         sub = commands.add_parser(command, help=help_text)
@@ -146,6 +151,17 @@ def main(argv=None):
         sub.add_argument("--cuda-graph", action="store_true", help="Use CUDA Graph from the first model request")
     args = parser.parse_args(argv)
     settings = read(RESOURCES / "experiment.json")
+    if args.command == "native-plan":
+        print(json.dumps({"configuration": native_formal.configuration(settings),
+                          "sequence": ["react-dev", "h0-dev", "train with per-batch dev selection", "test-normal"],
+                          "default_allocation": {"gpu": "A800", "max_gpus": 6, "lanes_per_gpu": 2},
+                          "split": design_manifest(native_formal.PROTOCOL), "h0": native_formal.blank_library()},
+                         ensure_ascii=False, indent=2))
+        return
+    if args.command == "native-run":
+        return native_formal.launch(args, settings, load_connections(args.connections))
+    if args.command == "native-pilot":
+        return run_pilot(args,settings,load_connections(args.connections))
     manifest = design_manifest()
     if args.command == "plan":
         print(json.dumps({"configuration": settings, "split": manifest, "h0": initial_harness(settings)},

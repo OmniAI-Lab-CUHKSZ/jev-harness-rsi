@@ -1,6 +1,7 @@
 """Small pure-Python policies that Sol can replace inside a versioned harness."""
 import ast
 from copy import deepcopy
+from datetime import date, timedelta
 from functools import lru_cache
 import re
 
@@ -13,9 +14,17 @@ def captures(pattern, text):
     return re.findall(pattern, text, re.I)
 
 
+def first_calendar_day(when, days):
+    """Lower date for an inclusive window ending on the task's public date."""
+    if type(days) is not int or days < 1:
+        raise ValueError("Use a positive number of calendar days")
+    return (date.fromisoformat(when[:10]) - timedelta(days=days - 1)).isoformat()
+
+
 FUNCTIONS = {"len":len,"any":any,"all":all,"sorted":sorted,"min":min,"max":max,"sum":sum,
              "enumerate":enumerate,"zip":zip,"str":str,"int":int,"float":float,"list":list,
-             "dict":dict,"set":set,"isinstance":isinstance,"regex":regex,"captures":captures}
+             "dict":dict,"set":set,"isinstance":isinstance,"regex":regex,"captures":captures,
+             "first_calendar_day":first_calendar_day}
 METHODS = {"get","keys","items","values","startswith","endswith","lower","casefold","strip","split","replace",
            "join","append","extend","add","count"}
 NODES = (ast.Module,ast.FunctionDef,ast.arguments,ast.arg,ast.Return,ast.For,ast.If,ast.IfExp,ast.Break,

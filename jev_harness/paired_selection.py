@@ -12,9 +12,12 @@ TWO_REPEATS_ONLY = "two_repeats_only"
 
 
 def _actions(events):
+    native = False
     for event in events:
         kind = event["event"]
-        if kind == "model":
+        if kind == "native_protocol":
+            native = True
+        elif kind == "model":
             request, response = event["request"], event["response"]
             if event["operation"] == "generate":
                 yield "generate", request, response["text"]
@@ -33,6 +36,14 @@ def _actions(events):
             yield "tool", (event["node"], event["code"], response.get("output"), response.get("done"))
         elif kind == "api_action":
             yield "api", (event.get("node"), event["method"], event["url"], event.get("data"))
+        elif native and kind == "api":
+            response = event["response"]
+            yield "public_api", (event["app"], event["api"], event["arguments"],
+                                 response.get("value", response.get("output")), response.get("done"),
+                                 response.get("api_total"), response.get("api_budget_hit"))
+        elif native and kind in {"native_operation", "native_observation", "native_effect", "native_feedback",
+                                 "native_discovery", "native_fragment_choice"}:
+            yield kind, event
 
 
 def first_fork(parent_events, candidate_events):

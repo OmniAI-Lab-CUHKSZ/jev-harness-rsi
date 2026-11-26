@@ -23,6 +23,20 @@ def choice(options, index):
 
 
 class PairedSelectionTests(TestCase):
+    def test_native_read_result_and_local_effect_must_match_before_stochastic_fork(self):
+        start = {"event": "native_protocol"}
+        call = {"event": "api", "app": "store", "api": "show", "arguments": {},
+                "response": {"value": [{"id": 2}], "done": False, "api_total": 1}}
+        effect = {"event": "native_effect", "tool": "store__send", "effect": {"id": 2}}
+        left = [start, call, effect, generation("q", "one")]
+        right = [start, call, effect, generation("q", "two")]
+        self.assertEqual(first_fork(left, right), "generation_1")
+        right[1] = {**call, "response": {**call["response"], "value": [{"id": 4}]}}
+        self.assertIsNone(first_fork(left, right))
+        right[1] = call
+        right[2] = {**effect, "effect": {"id": 4}}
+        self.assertIsNone(first_fork(left, right))
+
     def test_late_generation_matches_actual_choices_and_the_entire_request(self):
         x = [choice(["A","B"],0), generation("q","one"), generation("r","two")]
         y = [choice(["X","A"],1), generation("q","one"), generation("r","three")]

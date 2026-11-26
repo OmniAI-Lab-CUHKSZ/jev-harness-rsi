@@ -1,0 +1,229 @@
+{
+  "retrieval": {
+    "venmo__show_transactions": "actual completed payments sent or received, distinct from requests for payment",
+    "phone__search_contacts": "personal contact book relationship coworker colleague roommate housemate friend",
+    "venmo__search_friends": "friends registered in Venmo, distinct from contact book relationship"
+  },
+  "decision": {
+    "venmo__show_transactions": "Use for actual payments received or sent. A payment-request identifier is a different entity.",
+    "venmo__like_transaction": "Like the actual payment, using transaction_id. This does not like its comment."
+  },
+  "binding": {
+    "venmo__show_transactions": {
+      "sources": [],
+      "covers": true,
+      "label": "Read actual payments in the requested direction and calendar window",
+      "program": "goal = state[\"instruction\"]\nreceived = regex(r\"\\b(?:payments?|transactions?)\\b.{0,40}\\b(?:received|incoming)\\b|\\breceived\\b.{0,30}\\b(?:payments?|transactions?)\\b\", goal)\nsent = regex(r\"\\b(?:payments?|transactions?)\\b.{0,40}\\b(?:sent|outgoing)\\b|\\bsent\\b.{0,30}\\b(?:payments?|transactions?)\\b\", goal)\nif received == sent:\n    return None\nargs = {\"direction\": \"received\" if received else \"sent\"}\ndays = captures(r\"\\b(?:last|past)\\s+(\\d+)\\s+days?\\b\", state[\"instruction\"])\nif len(days) == 1 and regex(r\"\\bincluding today\\b\", state[\"instruction\"]):\n    args[\"min_created_at\"] = first_calendar_day(state[\"datetime\"], int(days[0]))\nreturn [args]"
+    },
+    "phone__search_contacts": {
+      "sources": [],
+      "covers": true,
+      "label": "Read phone contacts for an explicit relationship",
+      "program": "groups = captures(r\"\\b(coworkers?|colleagues?|roommates?|housemates?|friends?|managers?|siblings?)\\b\", state[\"instruction\"])\nlabels = {\"colleague\": \"coworker\", \"housemate\": \"roommate\"}\nroles = set()\nfor group in groups:\n    name = group.lower()\n    singular = name[:-1] if name.endswith(\"s\") else name\n    roles.add(labels.get(singular, singular))\nif len(roles) != 1:\n    return None\nreturn [{\"relationship\": list(roles)[0]}]"
+    },
+    "spotify__follow_artist": {
+      "sources": [
+        "playlist_genre_follow_targets"
+      ],
+      "covers": true,
+      "label": "Follow the scoped genre artists not already followed",
+      "fields": {
+        "artist_id": "artist_id"
+      }
+    },
+    "venmo__deny_payment_request": {
+      "sources": [
+        "pending_requests_by_contact_group"
+      ],
+      "covers": true,
+      "label": "Reject exactly the pending requests from the matched contacts",
+      "fields": {
+        "payment_request_id": "payment_request_id"
+      }
+    },
+    "venmo__approve_payment_request": {
+      "sources": [
+        "pending_requests_by_contact_group"
+      ],
+      "covers": true,
+      "label": "Approve exactly the pending requests from the matched contacts",
+      "fields": {
+        "payment_request_id": "payment_request_id"
+      }
+    },
+    "venmo__create_transaction_comment": {
+      "sources": [
+        "received_payments_from_contact_group"
+      ],
+      "covers": true,
+      "label": "Post the exact requested comment once on each payment in the selected contact cohort",
+      "program": "if not state['complete'] or not state['rows']:\n    return None\nparts = captures(r'\\b(?:add|post|leave|write)\\s+(?:a\\s+)?comment\\s*[:,]?\\s*(?:\"([^\"\\n]+)\"|“([^”\\n]+)”)\\s*,?\\s+(?:on|to|for)\\s+(?:all(?:\\s+of)?(?:\\s+the)?|each|every)\\s+venmo\\s+(?:payments?|transactions?)\\b', state['instruction'])\nif len(parts) != 1:\n    return None\ncomment = parts[0][0] or parts[0][1]\nif not comment.strip():\n    return None\nreturn [{'transaction_id': row['transaction_id'], 'comment': comment} for row in state['rows']]"
+    },
+    "venmo__like_transaction": {
+      "sources": [
+        "received_payments_from_contact_group"
+      ],
+      "covers": true,
+      "label": "Like each payment in the selected contact cohort, not its comment",
+      "program": "if not state['complete'] or not state['rows']:\n    return None\ngoal = state['instruction']\nfor quoted in captures(r'\"[^\"]*\"|“[^”]*”', goal):\n    goal = goal.replace(quoted, ' ')\ndirect = regex(r'\\blike\\s+(?:all(?:\\s+of)?(?:\\s+the)?|each|every)\\s+venmo\\s+(?:payments?|transactions?)\\b', goal)\nreference = regex(r'\\b(?:and|then|also)\\s+(?:also\\s+)?like\\s+(?:all\\s+(?:of\\s+)?|each\\s+of\\s+)?(?:those|these|the)\\s+(?:payments?|transactions?)(?:\\s+(?:too|as\\s+well))?\\s*[.!?]?\\s*$', goal)\nif not (direct or reference):\n    return None\nreturn [{'transaction_id': row['transaction_id']} for row in state['rows']]"
+    }
+  },
+  "fragment": {
+    "playlist_song_ids": {
+      "label": "Get distinct song IDs from my Spotify playlists",
+      "sources": [
+        "spotify__show_playlist_library"
+      ],
+      "reads": {
+        "spotify__show_playlist_library": "return [{}] if regex(r\"\\bmy\\s+(?:Spotify\\s+)?playlists\\b|\\bplaylists\\s+I\\s+own\\b\", state[\"instruction\"]) else None"
+      },
+      "goal_terms": [
+        "song playlist",
+        "tracks playlists"
+      ],
+      "produces": {
+        "song_id": "integer"
+      },
+      "program": "if not all(isinstance(r.get(\"song_ids\"), list) for r in state[\"rows\"]):\n    return None\nreturn [{\"song_id\": song} for song in sorted({song for r in state[\"rows\"] for song in r[\"song_ids\"]})]"
+    },
+    "album_song_ids": {
+      "label": "Get distinct song IDs from my Spotify album library",
+      "sources": [
+        "spotify__show_album_library"
+      ],
+      "reads": {
+        "spotify__show_album_library": "return [{}] if regex(r\"\\bmy\\s+(?:Spotify\\s+)?album\\s+library\\b|\\balbums\\s+in\\s+my\\s+library\\b\", state[\"instruction\"]) else None"
+      },
+      "goal_terms": [
+        "song album library",
+        "tracks albums library"
+      ],
+      "produces": {
+        "song_id": "integer"
+      },
+      "program": "if not all(isinstance(r.get(\"song_ids\"), list) for r in state[\"rows\"]):\n    return None\nreturn [{\"song_id\": song} for song in sorted({song for r in state[\"rows\"] for song in r[\"song_ids\"]})]"
+    },
+    "rank_scoped_songs": {
+      "sources": [
+        "playlist_song_ids",
+        "album_song_ids",
+        "spotify__show_song_library"
+      ],
+      "inputs": [
+        "spotify__show_song"
+      ],
+      "reads": {
+        "spotify__show_song_library": "return [{}] if regex(r\"\\bmy\\s+(?:Spotify\\s+)?song\\s+library\\b\", state[\"instruction\"]) else None",
+        "spotify__show_song": "data = state[\"inputs\"]\nrows = data[\"playlist_song_ids\"][\"rows\"] if \"playlist_song_ids\" in data else data[\"album_song_ids\"][\"rows\"] if \"album_song_ids\" in data else data[\"spotify__show_song_library\"][\"rows\"]\nreturn [{\"song_id\": song} for song in sorted({r[\"song_id\"] for r in rows})]"
+      },
+      "label": "Select the most or least played or liked song within the indicated collection",
+      "goal_terms": [
+        "most played song",
+        "least played song",
+        "most liked song",
+        "least liked song"
+      ],
+      "produces": {
+        "song_id": "integer",
+        "title": "string"
+      },
+      "program": "rows = state[\"inputs\"][\"spotify__show_song\"][\"rows\"]\ngoal = state[\"instruction\"]\nplays = regex(r\"\\b(?:most|least)[ -](?:played|listened)\\b\", goal)\nlikes = regex(r\"\\b(?:most|least)[ -]liked\\b\", goal)\nif plays == likes or not rows:\n    return None\nfield = \"play_count\" if plays else \"like_count\"\nif not all(isinstance(row.get(field), int) for row in rows):\n    return None\nvalues = [row[field] for row in rows]\nbest = min(values) if regex(r\"\\bleast[ -]\", goal) else max(values)\nwinners = [row for row in rows if row[field] == best]\nif len(winners) != 1:\n    return None\nreturn {\"song_id\": winners[0][\"song_id\"], \"title\": winners[0][\"title\"], \"metric\": field, \"value\": best}"
+    },
+    "playlist_genre_follow_targets": {
+      "label": "Find the artists not yet followed who sing the requested genre of songs in my playlists",
+      "goal_terms": [
+        "follow genre song playlist artist",
+        "follow genre track playlist artist"
+      ],
+      "sources": [
+        "playlist_song_ids"
+      ],
+      "inputs": [
+        "spotify__show_song",
+        "spotify__show_following_artists"
+      ],
+      "reads": {
+        "spotify__show_song": {
+          "source": "playlist_song_ids",
+          "fields": {
+            "song_id": "song_id"
+          }
+        },
+        "spotify__show_following_artists": "return [{}]"
+      },
+      "produces": {
+        "artist_id": "integer"
+      },
+      "program": "genres = captures(r\"\\b([a-z0-9&-]+)[ -]genre\\s+(?:songs?|tracks?)\\b\", state[\"instruction\"])\nif len(genres) != 1 or not regex(r\"\\b(?:my\\s+(?:spotify\\s+)?playlists|playlists\\s+(?:that\\s+)?i\\s+own)\\b\", state[\"instruction\"]):\n    return None\nif regex(r\"\\b(?:except|unless|excluding|without|never)\\b\", state[\"instruction\"]):\n    return None\nwanted = genres[0].casefold()\ntracks = state[\"inputs\"][\"spotify__show_song\"][\"rows\"]\nfollowed = state[\"inputs\"][\"spotify__show_following_artists\"][\"rows\"]\ncurrent = set()\nfor row in followed:\n    artist_id = row.get(\"artist_id\", row.get(\"id\"))\n    if not isinstance(artist_id, int):\n        return None\n    current.add(artist_id)\ntargets = set()\nfor track in tracks:\n    if not isinstance(track.get(\"genre\"), str):\n        return None\n    if track[\"genre\"].casefold() != wanted:\n        continue\n    artists = track.get(\"artists\")\n    if not isinstance(artists, list):\n        return None\n    for artist in artists:\n        artist_id = artist.get(\"id\")\n        if not isinstance(artist_id, int):\n            return None\n        if artist_id not in current:\n            targets.add(artist_id)\nreturn [{\"artist_id\": artist_id} for artist_id in sorted(targets)]"
+    },
+    "pending_requests_by_contact_group": {
+      "label": "Select pending received Venmo payment requests from the requested phone contact groups",
+      "goal_terms": [
+        "pending payment requests"
+      ],
+      "sources": [
+        "phone__search_contacts"
+      ],
+      "inputs": [
+        "venmo__show_received_payment_requests"
+      ],
+      "reads": {
+        "phone__search_contacts": "goal = state[\"goal\"]\nif not regex(r\"\\bpending\\s+(?:venmo\\s+)?payment\\s+requests?\\b\", goal) or not regex(r\"\\bvenmo\\b\", goal):\n    return None\ngroups = captures(r\"\\bfrom\\s+(?:any\\s+of\\s+)?my\\s+([a-z, -]+?)[.!?]?\\s*$\", goal)\nif len(groups) != 1:\n    return None\naliases = {\"colleague\": \"coworker\", \"housemate\": \"roommate\"}\nknown = {\"coworker\", \"friend\", \"roommate\", \"sibling\", \"parent\", \"father\", \"mother\", \"manager\", \"brother\", \"sister\"}\nroles = set()\nfor word in groups[0].replace(\",\", \" \").replace(\"co-worker\", \"coworker\").split():\n    if word in (\"and\", \"or\"):\n        continue\n    singular = word[:-1] if word.endswith(\"s\") else word\n    role = aliases.get(singular, singular)\n    if role not in known:\n        return None\n    roles.add(role)\nreturn [{\"relationship\": role} for role in sorted(roles)]",
+        "venmo__show_received_payment_requests": "return [{\"status\": \"pending\"}]"
+      },
+      "produces": {
+        "payment_request_id": "integer"
+      },
+      "program": "queries = state[\"arguments\"]\ncontacts = state[\"rows\"] if len(queries) == 1 else [r for group in state[\"rows\"] for r in group]\nemails = set()\nfor row in contacts:\n    email = row.get(\"email\")\n    if not isinstance(email, str) or not email.strip():\n        return None\n    emails.add(email.strip().casefold())\npending = state[\"inputs\"][\"venmo__show_received_payment_requests\"]\nif pending.get(\"arguments\") != [{\"status\": \"pending\"}]:\n    return None\ntargets = set()\nfor row in pending[\"rows\"]:\n    sender = row.get(\"sender\", {}).get(\"email\")\n    request_id = row.get(\"payment_request_id\")\n    if not isinstance(sender, str) or not isinstance(request_id, int):\n        return None\n    if sender.strip().casefold() in emails:\n        targets.add(request_id)\nreturn [{\"payment_request_id\": request_id} for request_id in sorted(targets)]"
+    },
+    "received_payments_from_contact_group": {
+      "sources": [
+        "venmo__show_transactions"
+      ],
+      "inputs": [
+        "phone__search_contacts"
+      ],
+      "label": "Select received Venmo payments from the requested Phone contact relationship and calendar window",
+      "goal_terms": [
+        "venmo received coworkers",
+        "venmo received colleagues",
+        "venmo received friends",
+        "venmo received roommates",
+        "venmo received housemates"
+      ],
+      "produces": {
+        "transaction_id": "integer",
+        "amount": "number",
+        "created_at": "string"
+      },
+      "reads": {
+        "phone__search_contacts": "goal = state['instruction']\nfor quoted in captures(r'\"[^\"]*\"|“[^”]*”', goal):\n    goal = goal.replace(quoted, ' ')\ngroups = captures(r'\\breceived\\s+from\\s+my\\s+(co-?workers?|colleagues?|friends?|roommates?|housemates?)\\s+(?:in|over|within|during)\\s+(?:the\\s+)?(?:last|past)\\b', goal)\nif len(groups) != 1 or not regex(r'\\bvenmo\\b', goal):\n    return None\nrole = groups[0].casefold().replace('-', '')\nif role.endswith('s'):\n    role = role[:-1]\nreturn [{'relationship': {'colleague': 'coworker', 'housemate': 'roommate'}.get(role, role)}]"
+      },
+      "program": "goal = state['instruction']\nfor quoted in captures(r'\"[^\"]*\"|“[^”]*”', goal):\n    goal = goal.replace(quoted, ' ')\nintro = r'\\b(?:all(?:\\s+of)?(?:\\s+the)?|each|every)\\s+venmo\\s+(?:payments?|transactions?)\\b'\nif not state['complete'] or len(captures(intro, goal)) != 1 or regex(r\"\\b(?:not|don['’]t|never|except|excluding|unless)\\b\", goal):\n    return None\nmatches = captures(intro + r\"\\s+(?:(?:that|which)\\s+)?(?:(?:i(?:\\s+have)?|i['’]ve|were)\\s+)?received\\s+from\\s+my\\s+(co-?workers?|colleagues?|friends?|roommates?|housemates?)\\s+(?:in|over|within|during)\\s+(?:the\\s+)?(?:last|past)\\s+([1-9]\\d*)\\s+days?\\s*(?:\\(\\s*including\\s+today\\s*\\)|,?\\s*including\\s+today\\b)(?=\\s*(?:[.!?]?\\s*$|[,;]?\\s*(?:and|then|also)\\b))\", goal)\nif len(matches) != 1:\n    return None\nrole, days = matches[0]\nrole = role.casefold().replace('-', '')\nif role.endswith('s'):\n    role = role[:-1]\nrole = {'colleague': 'coworker', 'housemate': 'roommate'}.get(role, role)\nstart = first_calendar_day(state['datetime'], int(days))\ntoday = first_calendar_day(state['datetime'], 1)\nexpected = [{'direction': 'received', 'min_created_at': start}]\nif state.get('arguments') != expected:\n    return None\ncontacts = state['inputs'].get('phone__search_contacts')\nif not contacts or not contacts['complete']:\n    return None\nif contacts.get('arguments') != [{'relationship': role}]:\n    return None\nemails = set()\nfor row in contacts['rows']:\n    relationships = row.get('relationships')\n    email = row.get('email')\n    if not isinstance(relationships, list) or role not in relationships or not isinstance(email, str) or not email.strip():\n        return None\n    emails.add(email.strip().casefold())\nseen = set()\nresult = []\nfor row in state['rows']:\n    created = row.get('created_at')\n    if not isinstance(created, str):\n        return None\n    if not start <= created[:10] <= today:\n        continue\n    sender = row.get('sender')\n    if not isinstance(sender, dict) or not isinstance(sender.get('email'), str) or not sender['email'].strip():\n        return None\n    if sender['email'].strip().casefold() not in emails:\n        continue\n    transaction_id = row.get('transaction_id')\n    if not isinstance(transaction_id, int):\n        return None\n    if transaction_id not in seen:\n        seen.add(transaction_id)\n        result.append(row)\nreturn result"
+    }
+  },
+  "state": {
+    "explicit_effects": {
+      "intent": true,
+      "sources": [],
+      "label": "Track explicitly requested note edits, transaction comments and payment likes",
+      "program": "goal = state[\"instruction\"]\neffects = []\nif regex(r\"\\bsimple note\\b\", goal) and regex(r\"\\b(mark|update|edit|change)\\b\", goal):\n    effects.append(\"simple_note__update_note\")\nif regex(r\"\\bvenmo\\b\", goal) and regex(r\"\\b(payments?|transactions?)\\b\", goal):\n    if regex(r\"\\b(add|post|leave|write)\\s+(?:a\\s+)?comment\\b\", goal):\n        effects.append(\"venmo__create_transaction_comment\")\n    if regex(r\"\\blike\\s+(?:all\\s+)?(?:those|the|these|each)\\s+(?:payments?|transactions?)\\b\", goal):\n        effects.append(\"venmo__like_transaction\")\nreturn effects"
+    },
+    "playlist_genre_follow_intent": {
+      "label": "Track the requested follow of the complete genre-filtered playlist artist set",
+      "intent": true,
+      "sources": [],
+      "program": "goal = state[\"goal\"]\nif regex(r\"^\\s*(?:please\\s+)?follow\\s+(?:all|each|every)\\s+(?:the\\s+)?artists?\\b\", goal) and regex(r\"\\b(?:my\\s+(?:spotify\\s+)?playlists|playlists\\s+(?:that\\s+)?i\\s+own)\\b\", goal):\n    if len(captures(r\"\\b([a-z0-9&-]+)[ -]genre\\s+(?:songs?|tracks?)\\b\", goal)) == 1 and not regex(r\"\\b(?:except|unless|excluding|without|never)\\b\", goal):\n        return [\"spotify__follow_artist\"]\nreturn []"
+    },
+    "pending_request_group_intent": {
+      "label": "Track the requested decision over the whole pending request set",
+      "intent": true,
+      "sources": [],
+      "program": "goal = state[\"goal\"]\nif not regex(r\"\\bpending\\s+(?:venmo\\s+)?payment\\s+requests?\\b\", goal) or not regex(r\"\\bvenmo\\b.*\\bfrom\\s+(?:any\\s+of\\s+)?my\\b\", goal):\n    return []\nif regex(r\"\\b(?:except|unless|excluding|without|never)\\b\", goal):\n    return []\nif regex(r\"^\\s*(?:please\\s+)?(?:reject|deny|decline)\\s+(?:all|each|every)\\b\", goal):\n    return [\"venmo__deny_payment_request\"]\nif regex(r\"^\\s*(?:please\\s+)?(?:accept|approve)\\s+(?:all|each|every)\\b\", goal):\n    return [\"venmo__approve_payment_request\"]\nreturn []"
+    }
+  },
+  "handoff": {
+    "venmo__create_transaction_comment": "A payment has transaction_id. Match received payment sender.email with the requested contacts; confirm the inclusive calendar window and use the requested comment text.",
+    "venmo__like_transaction": "Like the same set of transaction_id values as the verified payment scope. Use like_transaction on the payment itself."
+  }
+}

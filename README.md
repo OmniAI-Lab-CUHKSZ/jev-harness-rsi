@@ -51,6 +51,18 @@ jev-appworld smoke --connections configs/connections.local.example.json \
 
 Open `runs/spotify/smoke_result.json` for the score and token count. Its `trace_path` points to the menus, choices and actions for that attempt.
 
+### Pilot with public tool calls
+
+The `native-pilot` command evaluates a separate execution protocol. The program builds choices from the public AppWorld catalogue, instruction and observed records. Jev selects a tool, data operation or binding. When a value is missing, the same 27B can generate a single structured action or its arguments and then return to selection. The comparison arm generates structured actions through the same executor. [Pilot command, editable components and results format](docs/reproduce.md#public-tool-pilot)
+
+### Pilot with composed cards
+
+Add `--composed` to try the latest card executor. The program checks read plans before offering a card, then maps typed results to public API arguments. For example, one card finds pending Venmo requests from the selected contact groups. The same request IDs feed either the approve or the deny tool, depending on the action Jev selects. The runtime handles pagination, deduplication and accepted-write receipts.
+
+On a four-task Train pilot, this executor solved three tasks. It fixed two earlier failures by following exactly the five artists from the requested playlist genre and denying exactly the 14 matching Venmo requests. Both tasks finished with zero open-generation calls. [Run the composed pilot](docs/reproduce.md#composed-card-pilot) · [Starting cards](jev_harness/resources/composed_h0.json) · [Evaluated library](configs/composed_pilot_library.json)
+
+`native-run` serves the earlier native-tool protocol. It starts with all-generation ReAct and a fresh H0 on Dev, then alternates Train revisions and Dev selection before paired Test-N evaluation. Use `native-plan` to inspect that protocol's split and initial components. [Native-tool protocol](docs/native_protocol.zh.md)
+
 ## What Sol can change
 
 Sol reads the nine Train traces and picks a specific event that could explain a failed task or costly generation. It compares two explanations at that same event. It can retrieve earlier Train tasks that performed the same operation and inspect how their results were used. Sol then edits up to **three named objects** across six parts of the harness.

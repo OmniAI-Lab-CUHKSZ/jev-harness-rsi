@@ -70,6 +70,8 @@ class Trace:
 
 
 class Executor:
+    review_nodes = ("fragment/step",)
+
     def __init__(self, model, environment, max_calls=100, output_budget=65536, generation_tokens=1024,
                  generation_thinking=False, history_chars=None, step_review_threshold=None,
                  step_review_mode="generated_index", step_review_thinking_budget=None):
@@ -128,7 +130,7 @@ class Executor:
         if len(candidates) > MAX_REAL_OPTIONS:
             raise Uncovered("Candidate set needs an offline decomposition; no silent truncation")
         if getattr(self, "registry", {}).get("menu_retrieval"):
-            self.trace.add("decision_rules", review=bool(review_step and node == "fragment/step"),
+            self.trace.add("decision_rules", review=bool(review_step and node in self.review_nodes),
                            widen=bool(widen_on_none), minimum=policy.get("minimum_probability",0))
         choices = candidates + [{"label": "NONE: no listed option is supported by the evidence", "value": None}]
         labels = [str(item["label"]) for item in choices]
@@ -142,7 +144,7 @@ class Executor:
         else:
             request = dict(question=question, state=json.dumps(evidence, ensure_ascii=False, default=str),
                            options=labels, skill=skill)
-            step = review_step and node == "fragment/step" and self.step_review_threshold is not None
+            step = review_step and node in self.review_nodes and self.step_review_threshold is not None
             official = step and self.step_review_mode == "official_adaptive"
             response = native_response
             final_call = getattr(self, "requests", 0) + 1 >= self.max_calls

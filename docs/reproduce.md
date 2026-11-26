@@ -109,6 +109,65 @@ All paths in this table are relative to the directory given to `--root`. A recor
 
 Task traces can contain AppWorld session values. The repository ignores run directories, model files, simulator data and local connection settings.
 
+## Public tool pilot
+
+`native-pilot` runs independent AppWorld episodes on official Train. Give Sol optimization tasks with `--train` and reserve other Train IDs with `--check`. Each task runs with the generation-only interface, the entry decision harness, and the candidate produced by one offline Sol revision. A check from the same scenario tests a change of instance. Use a different scenario to test transfer.
+
+```bash
+jev-appworld native-pilot --connections configs/connections.local.example.json \
+  --root runs/native-pilot --max-gpus 2 \
+  --train 60d0b5b_1 07b42fd_1 29caf6f_1 --check 60d0b5b_2 e85d92a_1
+```
+
+The allocator uses two independent simulator sessions per GPU and CUDA Graph decoding. Task pairs prefer the same GPU. The execution settings come from `jev_harness/resources/experiment.json`, including the 40-request and 8,192-output-token budgets. One open JSON response is capped at 640 tokens. Official adaptive choice uses a 0.60 threshold and a 256-token reasoning limit when the remaining request budget permits it.
+
+The default `--phase all` runs the full pilot. `initial` measures the two entry arms, `revise` builds the candidate from optimization Train traces, and `evaluate` scores that candidate. To continue with an earlier native pilot, pass `--history-run <earlier-root>`. The last named candidate supplies the entry harness. Sol can inspect the specified runs' optimization tasks. On previously solved optimization tasks the editor can request a real Jev decision at the first altered ballot, up to 24 historical calls in total. A changed open request is reported without regenerating a task. The pilot reports whole-task scores and leaves version selection to the main experiment.
+
+Protocol v2 shows the target and proposed field changes for public update operations. The editor can inspect whether a recalled fragment reached an accepted write or answer. It can run one complete affected current Train task on the draft before final review. The three scored arms run in fresh environments. To evaluate saved libraries without an editor, use `--phase score --entry-library entry.json --candidate-library candidate.json` with a new run directory. The full protocol, worked examples, and commands for the measured task panel are in the [Chinese reproduction guide](native_protocol.zh.md).
+
+| File | Contents |
+|---|---|
+| `pilot_plan.json` | Optimization and check IDs, novel check scenarios, seed and limits |
+| `entry_harness.json` | Starting retrieval, choice guidance, bindings, transforms, state views and local generation guidance |
+| `runs/{h0_generation,h0_decision,candidate}/<task>/` | Official score, costs and a trace of visible menus, selected sources, calls and receipts |
+| `offline/sol/` | Editor requests, responses and offline usage |
+| `offline/proposal.json`, `offline/candidate.json` | Named edits against the parent and the executable library |
+| `offline/draft_preview.json` | The draft and the first changed request on each optimization trace. The editor can inspect one fresh 27B choice on the current panel before the whole-task rerun. |
+| `pilot_results.json` | One row per measured task and arm, including open output and decision-reasoning output |
+
+Sol can change a search cue, a choice cue, an argument binding, a read-only fragment, an evidence view, or guidance for a selected tool's open binding. A fragment may name companion sources for a join. The program enumerates combinations of observed sources and Jev selects the one to use. Both arms can request a specific public page, inspect an observed field, or compute an aggregate before the next tool call. A write receipt is recorded after the simulator accepts the request.
+
+## Composed card pilot
+
+`native-pilot --composed` uses the composed executor in both arms. It starts with [the composed H0 library](../jev_harness/resources/composed_h0.json) and collects one entry-harness rollout per optimization task. Sol can edit up to three named objects, check changed decisions on Train recordings and try one affected task before the candidate is scored. The four-task follow-up also used [this saved library](../configs/composed_pilot_library.json), which adds a learned contact-cohort fragment and its comment and like bindings to H0.
+
+Start a new Sol revision with the following command. Replace the connection template with your configured file if the workers run on another machine.
+
+```bash
+jev-appworld native-pilot --composed \
+  --connections configs/connections.local.example.json \
+  --root runs/composed-evolve --max-gpus 2 \
+  --train cf6abd2_1 82e2fac_1 afc0fce_1 \
+  --check cf6abd2_2 82e2fac_2 afc0fce_2
+```
+
+To evaluate the supplied libraries on the four-task follow-up panel, use fixed-library scoring. This starts two independent episodes per task and requires only the model and AppWorld workers.
+
+```bash
+jev-appworld native-pilot --composed --phase score \
+  --connections configs/connections.local.example.json \
+  --root runs/composed-score --max-gpus 2 \
+  --check b7a9ee9_1 6ea6792_2 d0b1f43_2 afc0fce_1 \
+  --entry-library jev_harness/resources/composed_h0.json \
+  --candidate-library configs/composed_pilot_library.json
+```
+
+The measured saved library passed the playlist-follow, request-denial and comment-and-like tasks with zero open-generation calls. The date-based amount query still required generation and failed. Read `pilot_results.json` and `comparison.json` for the new run. Per-task `fragment_flow.json` records whether a card was offered, was selected and supplied arguments to an accepted effect.
+
+The composed executor checks known read parameters before building the menu. When a read requires upstream data, it checks those parameters again after that data is available. Its field projections consume complete object sets and use the same official API validation and receipts as direct actions. When several sets can supply a selected write, Jev chooses the set. [Composed executor](../jev_harness/composed_assembly.py) · [Sol prompt and patch format](../jev_harness/native_revision.py)
+
+Use `native-run` for the earlier native-tool formal protocol. The composed executor is available through the pilot entry point.
+
 ## Code map
 
 | What to inspect | Implementation |
@@ -119,5 +178,6 @@ Task traces can contain AppWorld session values. The repository ignores run dire
 | Sol's prompts, component diagnosis and earlier Train evidence | [batch_revision.py](../jev_harness/batch_revision.py) · [revision_evidence.py](../jev_harness/revision_evidence.py) · [train_precedents.py](../jev_harness/train_precedents.py) |
 | Recorded paths and model previews | [trace_comparison.py](../jev_harness/trace_comparison.py) · [batch_revision_trials.py](../jev_harness/batch_revision_trials.py) · [contrast_probes.py](../jev_harness/contrast_probes.py) |
 | Model worker, AppWorld worker and GPU allocation | [official_model_worker.py](../jev_harness/official_model_worker.py) · [env_worker.py](../jev_harness/env_worker.py) · [allocation.py](../jev_harness/allocation.py) |
+| Composed pilot, card validation and Train replay | [native_pilot.py](../jev_harness/native_pilot.py) · [composed_assembly.py](../jev_harness/composed_assembly.py) · [native_revision.py](../jev_harness/native_revision.py) · [native_replay.py](../jev_harness/native_replay.py) |
 
 [Project overview](../README.md) · [Experiment design](experiment.md)
