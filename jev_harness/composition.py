@@ -160,7 +160,7 @@ def bind_inputs(engine, alternatives):
     for port, entry in alternatives.items():
         source = entry["source"]
         if "read" not in entry:
-            existing = next((o for o in reversed(engine.observed) if o.source == source and o.complete), None)
+            existing = engine.read_ready(source)
             if existing is None:
                 return None
             reads[port] = {"source": source, "ref": existing.ref}
@@ -368,25 +368,46 @@ def request_scope(engine, plans, name):
     return plans[0]
 
 
+def input_read(engine, read, loaded):
+    if "ref" in read:
+        obs = engine.observed[int(read["ref"][1:]) - 1]
+        if not engine.current_input(obs):
+            raise Uncovered(f"{obs.source} needs a fresh observation")
+        return obs, None
+    source = read["source"]
+    args = read["arguments"] if "arguments" in read else read_arguments(engine, source, read["read"], loaded)
+    return engine.read_ready(source, args), args
+
+
+def card_input_refs(engine, plan):
+    """Find relevant evidence without making any of the planned reads."""
+    loaded = {}
+    for index, (port, read) in enumerate(plan["reads"].items()):
+        if "arguments" not in read and isinstance(read.get("read"), str) and len(loaded) < index:
+            continue
+        try:
+            obs, _ = input_read(engine, read, loaded)
+        except (KeyError, ValueError, Uncovered):
+            continue
+        if obs is not None:
+            loaded[port] = obs
+    return tuple((port, obs.ref) for port, obs in loaded.items())
+
+
 def acquire_inputs(engine, name, plan, label):
     loaded = {}
-    by_ref = {obs.ref: obs for obs in engine.observed}
     for port, read in plan["reads"].items():
         source = read["source"]
-        if "ref" in read:
-            obs = by_ref[read["ref"]]
-        else:
-            args = read["arguments"] if "arguments" in read else read_arguments(engine, source, read["read"], loaded)
-            obs = engine.read_ready(source, args)
-            if obs is None:
-                rule = read.get("read")
-                sources = ({loaded[rule["input"]].ref: {"fields": rule["fields"]}} if isinstance(rule, dict)
-                           else {o.ref: {"program_input": name} for o in loaded.values()} if rule else {})
-                if args:
-                    engine.perform(source, args, label, sources)
-                else:
-                    engine.observe(source, [], "Empty selected input", sources=sources, arguments=[])
-                obs = engine.observed[-1]
+        obs, args = input_read(engine, read, loaded)
+        if obs is None:
+            rule = read.get("read")
+            sources = ({loaded[rule["input"]].ref: {"fields": rule["fields"]}} if isinstance(rule, dict)
+                       else {o.ref: {"program_input": name} for o in loaded.values()} if rule else {})
+            if args:
+                engine.perform(source, args, label, sources)
+            else:
+                engine.observe(source, [], "Empty selected input", sources=sources, arguments=[])
+            obs = engine.observed[-1]
         if not obs.complete:
             raise Uncovered(f"{source} is only a partial observation")
         loaded[port] = obs

@@ -1058,6 +1058,111 @@ def test_composed_read_delegation_resumes_and_preserves_existing_observations():
     assert executor.trace.events[-1]["event"] == "native_residual_reentry"
 
 
+def test_composed_reconsiders_a_declined_card_only_with_relevant_read_evidence():
+    endpoint = "store__show_orders"
+    read = [{"status": "open"}]
+    model = Mock(request=lambda op, **req: choose(len(req["options"]) - 1, len(req["options"])))
+    e = ComposedAssembly(model, Mock())
+    e.prepare_options()
+    e.trace, e.done = Trace(), False
+    e.context = {"task": {"instruction": "Filter open orders", "functions": [
+        tool(endpoint, "List orders by status.", {"status": STRING}),
+        tool("notes__show_items", "Show notes."),
+    ]}, "history": []}
+    library = blank_library()
+    library["fragment"]["open_orders"] = card(
+        "Filter open orders", 'return state["inputs"]["orders"]["rows"]',
+        {"orders": [{"source": endpoint, "read": read}]}, subset="orders",
+    )
+    e.initialize_native(library)
+    assert e.action_page([], allow_discovery=False) is None
+    assert not e.card_plans()
+    e.observe("notes__show_items", [], "unrelated notes")
+    e.observe(endpoint, [{"order_id": 3}], "closed orders", arguments=[{"status": "closed"}])
+    e.observe(endpoint, [{"order_id": 5}], "partial open orders", complete=False, arguments=read)
+    assert not e.card_plans()
+
+    e.observe(endpoint, [{"order_id": 5}], "complete open orders", arguments=read)
+    e.execute_card(e.card_plans()[0][3])
+    assert e.observed[-1].data == [{"order_id": 5}]
+    assert not e.card_plans()
+    assert not e.environment.request.called
+
+
+def test_composed_card_exit_accounts_for_reads_acquired_during_the_attempt():
+    e = ComposedAssembly(Mock(), Mock())
+    e.trace = Trace()
+    e.context = {"task": {"instruction": "Inspect order details", "functions": [
+        *TOOLS, tool("store__show_order", "Read one order.", {"order_id": INTEGER}, ["order_id"]),
+    ]}}
+    library = blank_library()
+    library["fragment"]["inspect_order"] = card(
+        "Inspect order details", "return None",
+        {"orders": [{"source": "store__show_orders", "read": [{}]}],
+         "details": [{"source": "store__show_order", "read": {"input": "orders", "fields": {"order_id": "order_id"}}}]},
+        fields={"order_id": "integer"},
+    )
+    e.initialize_native(library)
+    e.call = Mock(side_effect=[[{"order_id": 1}], {"order_id": 1, "status": "pending"}])
+    action = e.card_plans()[0][3]
+    with pytest.raises(Uncovered, match="could not establish"):
+        e.execute_card(action)
+    e.decline_card(action, "No supported result")
+    assert not e.card_plans()
+    assert [o.source for o in e.observed] == ["store__show_orders", "store__show_order"]
+    assert e.call.call_count == 2 and not e.model.request.called
+
+
+def test_composed_current_reads_refresh_after_an_accepted_write_and_keep_selected_targets():
+    orders, notes = "store__show_orders", "notes__show_items"
+    e = ComposedAssembly(Mock(), Mock())
+    e.trace = Trace()
+    e.context = {"task": {"instruction": "Refresh orders and request the selected item", "functions": [
+        *TOOLS, tool(notes, "Show unrelated notes."),
+    ]}}
+    library = blank_library()
+    library["fragment"]["refresh_orders"] = card(
+        "Refresh orders", 'return state["inputs"]["orders"]["rows"]',
+        {"orders": [{"source": orders, "read": [{}]}]}, subset="orders",
+    )
+    library["fragment"]["inspect_selected"] = card(
+        "Inspect selected rows", 'return state["inputs"]["selected"]["rows"]',
+        {"selected": "selected_orders"}, subset="selected",
+    )
+    library["binding"]["store__request_item"] = {
+        "label": "Use the selected item", "sources": ["selected_orders"], "covers": True,
+        "fields": {"item_id": "item_id"},
+    }
+    e.initialize_native(library)
+    e.call = Mock(side_effect=[
+        [{"item_id": 12}], [], Uncovered("Rejected"), {"status": "accepted"}, [{"item_id": 13}],
+    ])
+    e.perform(orders, [{}], "Current orders")
+    e.perform(notes, [{}], "Current notes")
+    e.observe("selected_orders", [{"item_id": 12}], "Selected before writing",
+              sources={"r1": {"fields": {"item_id": "item_id"}}})
+    assert e.read_ready(orders, [{}]).ref == "r1"
+    assert e.read_ready("selected_orders").ref == "r3"
+    with pytest.raises(Uncovered, match="Rejected"):
+        e.perform("store__send_item", [{"item_id": 12, "message": "Hi"}], "Rejected send")
+    assert e.read_ready(orders, [{}]).ref == "r1"
+
+    e.perform("store__send_item", [{"item_id": 12, "message": "Hi"}], "Accepted send",
+              sources={"r3": {"fields": {"item_id": "item_id"}}})
+    assert e.read_ready(orders, [{}]) is None
+    assert e.read_ready("selected_orders") is None
+    assert e.read_ready(notes, [{}]).ref == "r2"
+    assert e.read_ready("store__send_item").data == {"status": "accepted"}
+    assert e.compiled_binding("store__request_item")[1] == [{"item_id": 12}]
+    assert e.observed[2].data == [{"item_id": 12}]
+    actions = [row[3] for row in e.card_plans()]
+    assert [a[1] for a in actions] == ["refresh_orders"]
+    e.execute_card(actions[0])
+    assert e.read_ready(orders, [{}]).data == [{"item_id": 13}]
+    assert e.observed[-1].data == [{"item_id": 13}]
+    assert e.call.call_count == 5
+
+
 def test_composed_editor_accepts_typed_acquisition_and_blocks_writes_from_read_ports():
     tools = {t["name"]: t for t in TOOLS}
     spec = card("Read open orders", 'return state["inputs"]["orders"]["rows"]',

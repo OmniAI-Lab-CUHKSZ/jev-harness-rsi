@@ -6,7 +6,7 @@ import json
 import re
 
 from .composition import (
-    PROGRAM_ERRORS, acquire_inputs, already_covered, card_answers, card_plan_key, card_writes,
+    PROGRAM_ERRORS, acquire_inputs, already_covered, card_answers, card_input_refs, card_plan_key, card_writes,
     contact_plan_available, output_fields, project_batch, request_scope, resolve_card,
     source_plans, validate_output,
 )
@@ -50,6 +50,7 @@ class ComposedAssembly(NativeTools):
         self.card_offers = {}
         self.card_results = {}
         self.used_card_plans = set()
+        self.declined_card_plans = {}
         self.completed_card_plans = []
         self.goal = re.sub(r'["“][^"”]*["”]', "", self.instruction).casefold()
         self.answer_question = bool(re.search(
@@ -103,9 +104,24 @@ class ComposedAssembly(NativeTools):
             self.chosen_effects.add(endpoint)
             self.trace.add("native_goal_progress", completed=endpoint, remaining=sorted(self.outstanding()))
 
-    def read_ready(self, source, batch):
+    def current_input(self, observation):
+        if not self.last_write:
+            return True
+        if observation.source in self.tools:
+            app = observation.source.split("__", 1)[0]
+            return not is_read(observation.source) or int(observation.ref[1:]) > self.last_write.get(app, 0)
+        return all(self.current_input(self.observed[int(ref[1:]) - 1]) for ref in observation.input_refs)
+
+    def read_ready(self, source, batch=None):
         return next((o for o in reversed(self.observed) if o.source == source and o.complete
-                     and o.arguments == batch), None)
+                     and (batch is None or o.arguments == batch) and self.current_input(o)), None)
+
+    def card_plan_available(self, name, plan):
+        identity = name, card_plan_key(plan)
+        if identity in self.used_card_plans:
+            return False
+        declined = self.declined_card_plans.get(identity)
+        return not declined or card_input_refs(self, plan) not in declined
 
     def card_plans(self):
         library = self.lib["fragment"]
@@ -114,7 +130,7 @@ class ComposedAssembly(NativeTools):
             name: max(relevance(card, self.goal), len(goal & goal_words(self.lib["retrieval"].get(name, ""))))
             for name, card in library.items()
         }
-        observed = {o.source for o in self.observed if o.complete}
+        observed = {o.source for o in self.observed if o.complete and self.current_input(o)}
         # Propagate relevance through required producer ports. An alternative collection keeps its own scope.
         for _ in library:
             for name, card in library.items():
@@ -136,7 +152,7 @@ class ComposedAssembly(NativeTools):
                 continue
             yields = output_fields(card)
             for plan in source_plans(self, inputs):
-                if (name, card_plan_key(plan)) in self.used_card_plans:
+                if not self.card_plan_available(name, plan):
                     continue
                 ports = tuple(r.get("ref", r["source"]) for r in plan["reads"].values())
                 label = f"{card['label']} | scope: {preview(plan['scope'], 180)}"
@@ -154,7 +170,7 @@ class ComposedAssembly(NativeTools):
         for name, card in scoped_cards:
             candidates = [
                 plan for plan in contact_plans(self)
-                if (name, card_plan_key(plan)) not in self.used_card_plans and contact_plan_available(self, plan)
+                if self.card_plan_available(name, plan) and contact_plan_available(self, plan)
             ]
             plans = [plan for plan in candidates if not already_covered(self, name, card, plan, existing)]
             if candidates and not plans:
@@ -189,15 +205,17 @@ class ComposedAssembly(NativeTools):
         return self.preview_action_choices(actions)
 
     def decline_card(self, action, reason):
-        self.used_card_plans.update((action[1], card_plan_key(p)) for p in self.card_offers.get(action, ()))
-        self.trace.add("native_card_exit", name=action[1], reason=reason)
+        name = action[1]
+        for plan in self.card_offers.get(action, ()):
+            identity = name, card_plan_key(plan)
+            self.declined_card_plans.setdefault(identity, set()).add(card_input_refs(self, plan))
+        self.trace.add("native_card_exit", name=name, reason=reason)
 
     def execute_card(self, action):
         _, name, *_ = action
         card = self.lib["fragment"][name]
         plans = self.card_offers[action]
         plan = request_scope(self, plans, name)
-        self.used_card_plans.add((name, card_plan_key(plan)))
         scoped = "actors" in plan
         loaded = acquire_inputs(self, name, plan, card["label"] if scoped else f"Read for {name}")
         output = card["composition"]["output"]
@@ -213,6 +231,7 @@ class ComposedAssembly(NativeTools):
         sources = {obs.ref: {"program_input": name} for obs in loaded.values()}
         scope = plan["scope"] if scoped else ", ".join(f"{obs.ref} {obs.source}" for obs in loaded.values())
         self.observe(name, result, scope, sources=sources)
+        self.used_card_plans.add((name, card_plan_key(plan)))
         ref = self.observed[-1].ref
         self.card_results[ref] = {k: plan[k] for k in ("writes", "calculations") if k in plan}
         self.required.update(plan.get("requested", ()))

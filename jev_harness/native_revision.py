@@ -411,7 +411,13 @@ def revise(study, train, *, current):
                 save(folder / "review_error.json", {"error": str(exc), "used": "last valid draft"})
             preview["final_matches_draft"] = lib == draft_library
             save(folder / "draft_preview.json", preview)
-        save(folder / "proposal.json", proposal)
-        save(candidate, lib)
-        return lib
-    raise ValueError("Sol did not return an applicable native-tool revision; see the saved turns")
+        break
+    else:
+        lib = parent
+        proposal = {
+            "reason": f"Skipped after {DRAFT_REPLY_LIMIT} draft replies without a valid Sol proposal.",
+            "objects": [],
+        }
+    save(folder / "proposal.json", proposal)
+    save(candidate, lib)
+    return lib

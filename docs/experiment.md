@@ -28,6 +28,8 @@ Some applications have registered role bindings. For example, the contact filter
 
 **Execute.** Cards acquire public inputs and compute typed records, scalars or a verified subset. Lineage connects result fields to the reads and records that supplied them. Projected writes run after selection and add a receipt only on acceptance. A completion choice requires the necessary effects or a verified answer. If a card cannot establish its scope or the model chooses NONE, the executor returns to the available tool path with the observed facts and accepted receipts. Exit diagnostics stay in the trace.
 
+An unresolved card can return when a complete observation matches one of its input sources and read arguments. The executor remembers a card exit against the inputs available at that point, including any reads it acquired before exiting. After an accepted write, acquiring current input data refreshes earlier reads in that application and checks the lineage of derived inputs. Previously selected object sets and accepted receipts remain available to bind subsequent operations.
+
 **Generate where needed.** A selected official tool can use local generation for missing arguments. An uncovered step can use Python with the already compiled observations and receipts. A generated `yield_read(endpoint, arguments)` delegates a public read and can return control to the action loop. After possible writes in the Python session, the generator continues in that session so it can observe the result. The ReAct arm generates its tool and argument choices on the same official interface. [Execution loop](../jev_harness/composed_assembly.py) · [Tool execution](../jev_harness/native_assembly.py)
 
 ## Offline optimization
@@ -43,7 +45,7 @@ Sol starts each round from the current batch's parent trajectories. The next rou
 | State | Evidence summaries and outstanding effect rules |
 | Handoff | Local guidance for missing arguments or residual generation |
 
-Each candidate changes up to three named items. Sol gets up to twelve replies for the draft, including evidence requests, followed by draft review and one optional evidence read. The validator accepts the single card declaration described above. Programs are restricted to local computation and public data.
+Each candidate changes up to three named items. Sol gets up to twelve replies for the draft, including evidence requests, followed by draft review and one optional evidence read. If the draft window ends without a valid proposal, the controller records the reason and keeps the parent for that round. The next scheduled round still runs. The validator accepts the single card declaration described above. Programs are restricted to local computation and public data.
 
 The preview identifies the first changed request on each recorded prefix. It replays previously solved Train prefixes until the first difference. A changed ballot goes to real 27B within the 24-successful-case reselection budget. If a replay can proceed, it identifies the next affected request or proposed inputs. An additional current failed case can receive a real reselection. One affected current task can receive a fresh draft episode. Sol sees the draft feedback before returning its final proposal. [Editor and prompt](../jev_harness/native_revision.py) · [Replay and reselection](../jev_harness/native_replay.py)
 

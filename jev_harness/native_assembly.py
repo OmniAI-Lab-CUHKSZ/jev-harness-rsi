@@ -118,6 +118,7 @@ class NativeTools(FormalExecutor):
         self.calculation_refs = {}
         self.binding_sources = {}
         self.last_update = {}
+        self.last_write = {}
         self.trace.add("native_protocol", version=PROTOCOL)
 
     def recorded_tool_io(self, params, response):
@@ -547,7 +548,7 @@ class NativeTools(FormalExecutor):
 
     def observe(self, source, data, scope, *, complete=True, sources=None, arguments=None):
         obs = Observation(f"r{len(self.observed) + 1}", source, public_value(data), scope, complete,
-                          public_value(arguments))
+                          public_value(arguments), tuple(sources or ()))
         self.observed.append(obs)
         for name, spec in self.lib["state"].items():
             if obs.source in spec["sources"]:
@@ -660,6 +661,7 @@ class NativeTools(FormalExecutor):
                 if endpoint != FINISH:
                     self.partial[packet] = list(outputs)
                     self.last_read.clear()
+                    self.last_write[app] = len(self.observed)
                     receipt = {
                         "tool": endpoint,
                         "arguments": public_value(args),

@@ -180,6 +180,7 @@ class Observation:
     scope: str
     complete: bool = True
     arguments: list | None = None
+    input_refs: tuple[str, ...] = ()
 
     @property
     def rows(self):

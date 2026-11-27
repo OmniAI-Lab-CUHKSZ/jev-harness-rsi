@@ -101,7 +101,8 @@ def test_ordered_dev_cold_start_two_rounds_and_dev_rollback(tmp_path, monkeypatc
     assert sum(stage.startswith("test_") for stage, task in episodes) == 6
 
 
-def test_editor_can_mine_and_open_local_generation_with_only_the_parent_trace(tmp_path):
+@pytest.mark.parametrize("final_reply", ["empty_patch", "read", "invalid_patch", "invalid_program"])
+def test_editor_can_mine_and_open_local_generation_with_only_the_parent_trace(tmp_path, final_reply):
     from jev_harness.protocol import design_manifest
 
     task = design_manifest()["train_batches"][0]["tasks"][0]
@@ -120,7 +121,28 @@ def test_editor_can_mine_and_open_local_generation_with_only_the_parent_trace(tm
     study = Mock(root=tmp_path)
     sol = study.solver.return_value
     read_request = json.dumps({"read": {"doc": label, "start": 1, "count": 1}})
-    sol.turn.side_effect = [read_request] * 11 + [json.dumps({"objects": [], "reason": "Synthetic example"})]
+    replies = {
+        "empty_patch": json.dumps({"objects": [], "reason": "Synthetic example"}),
+        "read": read_request,
+        "invalid_patch": json.dumps({"objects": "invalid"}),
+        "invalid_program": json.dumps({"objects": [{
+            "kind": "fragment", "name": "broken", "value": {
+                "label": "Broken computation",
+                "program": "break",
+                "composition": {
+                    "inputs": {"data": {"sources": [{"source": "calculation"}]}},
+                    "output": {"value": "integer"},
+                },
+            },
+        }]}),
+    }
+    sol.turn.side_effect = [read_request] * 11 + [replies[final_reply]]
+    assert revise(study, [task], current=current) == library
+    assert read(current.folder / "candidate.json") == library
+    reason = "Synthetic example" if final_reply == "empty_patch" else (
+        "Skipped after 12 draft replies without a valid Sol proposal."
+    )
+    assert read(current.folder / "proposal.json") == {"objects": [], "reason": reason}
     assert revise(study, [task], current=current) == library
     calls = sol.turn.call_args_list
     assert len(calls) == 12

@@ -75,6 +75,7 @@ def load_program(source):
     text="def policy(state):\n"+ "\n".join("    "+line for line in source.splitlines())
     try:
         tree=ast.parse(text)
+        program=compile(tree,"<harness policy>","exec")
     except SyntaxError as exc:
         raise ValueError("Policy syntax: "+str(exc)) from exc
     entry=tree.body[0]
@@ -91,5 +92,5 @@ def load_program(source):
                                                or isinstance(node.func,ast.Attribute) and node.func.attr in METHODS):
             raise ValueError("Use built-in operations or the public pattern helpers")
     namespace={"__builtins__":{},**FUNCTIONS}
-    exec(compile(tree,"<harness policy>","exec"),namespace)
+    exec(program,namespace)
     return namespace["policy"]
