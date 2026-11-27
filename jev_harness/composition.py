@@ -2,12 +2,13 @@
 
 from copy import deepcopy
 from decimal import Decimal, DecimalException
-from itertools import product
+from itertools import groupby, product
 import json
 import re
 
 from .expressions import path_get
-from .policy_programs import load_program
+from .policy_programs import load_program, validate_program
+from .retrieval import terms
 from .runtime import MAX_REAL_OPTIONS, Uncovered
 from .schema_tools import MANAGED, Observation, accepts, available, check_args, has_update, is_read, key
 
@@ -42,15 +43,22 @@ def validate_card(card, tools, fragments):
     if "goal_terms" in card and (not isinstance(card["goal_terms"], list) or not card["goal_terms"] or
         not all(isinstance(term, str) and term.strip() for term in card["goal_terms"])):
         raise ValueError("goal_terms must be a nonempty list of goal phrases")
-    load_program(card["program"])
+    validate_program(card["program"], location="program")
     spec = card["composition"]
     if not isinstance(spec, dict) or not {"inputs", "output"} <= spec.keys() or (
-        spec.keys() - {"inputs", "output", "choices", "equivalent"}
+        spec.keys() - {"inputs", "output", "choices", "equivalent", "scope"}
     ):
         raise ValueError("Composition needs named inputs and one output")
     inputs, output = spec["inputs"], spec["output"]
     if not isinstance(inputs, dict) or not inputs or not all(isinstance(name, str) and name.isidentifier() for name in inputs):
         raise ValueError("Name each input of the composition")
+    if "scope" in spec:
+        scope = spec["scope"]
+        if (not isinstance(scope, dict) or set(scope) != {"noun", "ports"}
+                or not isinstance(scope["noun"], str) or not terms(scope["noun"])
+                or not isinstance(scope["ports"], dict) or not scope["ports"] or scope["ports"].keys() - inputs.keys()
+                or any(not isinstance(label, str) or not terms(label) for label in scope["ports"].values())):
+            raise ValueError("Scope needs a collection noun and labels for the selectable input ports")
     if not isinstance(output, dict) or set(output) not in ({"fields"}, {"value"}, {"subset"}, {"subset", "fields"}):
         raise ValueError("Declare output fields, a scalar type or a subset of a named input")
     if "fields" in output and (not isinstance(output["fields"], dict) or not output["fields"]
@@ -80,7 +88,7 @@ def validate_card(card, tools, fragments):
         from .record_composition import FILTER_INPUTS
 
         if roles != FILTER_INPUTS or inputs != {name: {"role": role} for name, role in roles.items()} or (
-            output.get("subset") != "rows" or choices
+            output.get("subset") != "rows" or choices or "scope" in spec
         ):
             raise ValueError("The contact adapter needs both supported roles and a subset of rows")
         return
@@ -89,7 +97,7 @@ def validate_card(card, tools, fragments):
         alternatives = part.get("sources") if isinstance(part, dict) and set(part) == {"sources"} else None
         if not isinstance(alternatives, list) or not alternatives:
             raise ValueError("An input needs public source alternatives")
-        for source in alternatives:
+        for index, source in enumerate(alternatives):
             if not isinstance(source, dict) or set(source) not in ({"source"}, {"source", "read"}):
                 raise ValueError("Declare a source and an optional read")
             endpoint = source["source"]
@@ -101,7 +109,7 @@ def validate_card(card, tools, fragments):
                 raise ValueError("A card read needs a published read endpoint")
             rule = source["read"]
             if isinstance(rule, str):
-                load_program(rule)
+                validate_program(rule, location=f"composition.inputs.{name}.sources[{index}].read")
             elif isinstance(rule, list) and rule:
                 for args in rule:
                     check_args(tools[endpoint], args)
@@ -169,6 +177,8 @@ def bind_inputs(engine, alternatives):
         if source not in engine.tools or not available(source) or not is_read(source):
             return None
         rule = entry["read"]
+        if isinstance(rule, dict) and rule["input"] not in alternatives:
+            return None
         deferred = rule["input"] in pending if isinstance(rule, dict) else isinstance(rule, str) and pending
         if deferred:
             reads[port] = entry
@@ -191,10 +201,41 @@ def bind_inputs(engine, alternatives):
     return {"reads": reads, "scope": scope}
 
 
-def source_plans(engine, inputs):
-    for combination in product(*(part["sources"] for part in inputs.values())):
-        plan = bind_inputs(engine, dict(zip(inputs, combination, strict=True)))
-        if plan is not None:
+def input_scopes(goal, scope):
+    """Use stated collection members, or offer distinct scopes when the wording is ambiguous."""
+    noun, ports = terms(scope["noun"]), scope["ports"]
+    labels = {port: terms(label) for port, label in ports.items()}
+    vocabulary = noun.union(*labels.values(), {"all", "and", "any", "my", "only", "or", "the", "your"})
+    phrases = re.split(r"[.;?!]|\b(?:across|among|from|in|within|of|with|that|which|were)\b", goal)
+    scopes = {}
+    if re.search(r"\bnot\s+(?:in|from|within|among|across)\b", goal):
+        return ()
+    for phrase in phrases:
+        if not noun <= terms(phrase):
+            continue
+        if re.search(r"\b(?:except|excluding|without|but not|neither)\b", phrase):
+            return ()
+        words = [next(iter(terms(word)), word) for word in re.findall(r"[^\W_]+", phrase)]
+        blocks = [set(values) for allowed, values in groupby(words, key=vocabulary.__contains__) if allowed]
+        named = tuple(port for port, words in labels.items() if any(noun | words <= block for block in blocks))
+        included = named or tuple(ports)
+        scopes[included] = None
+        if re.search(r"\bor\b", phrase) or not named and not re.search(r"\ball\b", phrase):
+            scopes.update(dict.fromkeys((port,) for port in included))
+    return tuple(scopes)
+
+
+def source_plans(engine, inputs, scope=None):
+    scopes = input_scopes(engine.goal, scope) if scope is not None else ((),)
+    for selected in scopes:
+        active = {name: part for name, part in inputs.items()
+                  if scope is None or name not in scope["ports"] or name in selected}
+        for combination in product(*(part["sources"] for part in active.values())):
+            plan = bind_inputs(engine, dict(zip(active, combination, strict=True)))
+            if plan is None:
+                continue
+            if scope is not None:
+                plan["scope"] = " + ".join(scope["ports"][port] for port in selected) + " " + scope["noun"]
             yield plan
 
 

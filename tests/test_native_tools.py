@@ -8,7 +8,7 @@ from jev_harness.composition import resolve_card
 from jev_harness.formal_runtime import BudgetExhausted
 from jev_harness.native_assembly import DISCOVER, FINISH, MORE_FRAGMENTS, NativeGeneration, blank_library
 from jev_harness.native_evidence import fragment_evidence
-from jev_harness.native_replay import first_change, recorded_card_checks
+from jev_harness.native_replay import first_change, recorded_card_checks, recorded_continuations
 from jev_harness.native_revision import apply_edits, trial_task
 from jev_harness.runtime import Trace, Uncovered
 from jev_harness.schema_tools import (
@@ -106,6 +106,70 @@ def test_recomputed_card_compares_accepted_payloads_even_with_a_richer_output(ro
     assert result["bindings"][endpoint] == {
         "recorded_arguments": 1, "candidate_bindings": 1, "matches_recorded": matches, "same_order": matches,
     }
+
+
+@pytest.mark.parametrize("goal, expected", [
+    ("How many songs are in my song and album libraries?", [("song", "album")]),
+    ("How many songs are in my album library?", [("album",)]),
+    ("How many songs does my album library contain?", [("album",)]),
+    ("Count songs across my song library, albums library and all playlists.", [("song", "album", "playlist")]),
+    ("How many are in my album or playlist libraries?", [("album", "playlist"), ("album",), ("playlist",)]),
+    ("Count songs across my libraries except playlists.", []),
+    ("Count songs not in my album library.", []),
+])
+def test_composition_plans_only_the_selected_collection_inputs(goal, expected):
+    collections = ("song", "album", "playlist")
+    endpoints = {name: f"music__show_{name}_library" for name in collections}
+    tools = [tool(endpoint, f"Show {name} library.") for name, endpoint in endpoints.items()]
+    fragment = card("Distinct song references", "return []", {
+        name: [{"source": endpoint, "read": [{}]}] for name, endpoint in endpoints.items()
+    }, fields={"song_id": "integer"}, goal_terms=["combine music collections"])
+    fragment["composition"]["scope"] = {"noun": "library", "ports": dict(zip(collections, collections))}
+    candidate = apply_edits(blank_library(), {"objects": [
+        {"kind": "fragment", "name": "scope_ids", "value": fragment},
+    ]}, {t["name"]: t for t in tools})
+    engine = ComposedAssembly(Mock(), Mock())
+    engine.trace = Trace()
+    engine.context = {"task": {"instruction": goal, "functions": tools}}
+    engine.initialize_native(candidate)
+    ranked = engine.card_plans()
+    assert [tuple(engine.card_offers[action][0]["reads"]) for _, _, _, action in ranked] == expected
+    assert not engine.environment.request.called
+
+
+def test_recorded_continuation_checks_an_explicit_answer_without_an_old_card():
+    source = "music__show_recommendations"
+    tools = [tool(source, "Show recommended tracks."), TOOLS[-1]]
+    parent = blank_library()
+    proposal = {"objects": [
+        {"kind": "fragment", "name": "credited_artist",
+         "value": card("Summarize the credits", 'return {"artist_name": state["inputs"]["tracks"]["rows"][0]["name"]}',
+                       {"tracks": [{"source": source, "read": [{}]}]}, fields={"artist_name": "string"},
+                       goal_terms=["summarize credits"])},
+        {"kind": "binding", "name": "answer_artist", "value": {
+            "endpoint": FINISH, "sources": ["credited_artist"], "label": "Answer the artist name", "covers": True,
+            "goal_terms": ["artist most recommended"], "fields": {"answer": "artist_name"},
+        }},
+    ]}
+    candidate = apply_edits(parent, proposal, {t["name"]: t for t in tools})
+    events = [
+        {"event": "task", "instruction": "Name the artist most recommended to me."},
+        {"event": "native_observation", "ref": "r1", "source": source, "value": [{"name": "Singing River"}],
+         "scope": "recommendations", "complete": True, "arguments": [{}]},
+        {"event": "api_action", "url": "/supervisor/message", "method": "post",
+         "data": {"answer": "Singing River"}},
+        {"event": "summary", "success": True},
+    ]
+    (check,) = recorded_continuations(events, parent, candidate, tools)
+    assert check["offered_at_start"] and check["status"] == "consumer_available"
+    (answer,) = check["consumers"]
+    assert answer["tool"] == FINISH and answer["matches_recorded"]
+    assert answer["example_arguments"] == [[{"answer": "Singing River"}]]
+    (after_write,) = recorded_continuations([events[0], events[2], events[1], events[3]], parent, candidate, tools)
+    assert after_write["status"] == "needs_recorded_reads"
+    unrelated = [{**events[0], "instruction": "Follow the artist most recommended to me."}, *events[1:]]
+    (unrelated_check,) = recorded_continuations(unrelated, parent, candidate, tools)
+    assert unrelated_check["status"] == "not_recommended"
 
 
 class World:

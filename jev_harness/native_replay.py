@@ -12,11 +12,40 @@ from .formal_runtime import BudgetExhausted
 from .native_evidence import observation_fields
 from .record_composition import contact_plans
 from .runtime import STEP_REVIEW, Trace, Uncovered
-from .schema_tools import FINISH, catalog, key, public_value
+from .schema_tools import FINISH, catalog, is_read, key, public_value
 
 
 class Boundary(Exception):
     """A recorded response cannot be supplied to this request."""
+
+
+def recorded_effects(events):
+    effects = defaultdict(lambda: defaultdict(list))
+    operation = {}
+    for event in events:
+        if event["event"] == "native_operation":
+            operation = event
+        elif event["event"] == "native_effect" and operation.get("tool") == event["tool"]:
+            args = operation["arguments"][event["batch_index"]]
+            effects[event["tool"]][None].append(args)
+            for ref in event.get("sources", {}):
+                effects[event["tool"]][ref].append(args)
+    if not effects[FINISH][None] and events[-1].get("success") is True:
+        for event in reversed(events):
+            if (event["event"] == "api_action" and event.get("url") == "/supervisor/message"
+                    and event.get("method", "").casefold() == "post"
+                    and isinstance(event.get("data"), dict) and "answer" in event["data"]):
+                effects[FINISH][None].append({"answer": event["data"]["answer"]})
+                break
+    return effects
+
+
+def compare_payloads(batches, recorded):
+    expected = list(map(key, recorded))
+    options = [list(map(key, batch)) for batch in batches]
+    return {"recorded_arguments": len(recorded), "candidate_bindings": len(batches),
+            "matches_recorded": any(sorted(batch) == sorted(expected) for batch in options),
+            "same_order": expected in options}
 
 
 def recorded_card_checks(events, parent, candidate, functions):
@@ -26,14 +55,7 @@ def recorded_card_checks(events, parent, candidate, functions):
     if not changed:
         return []
     observations = {e["ref"]: e for e in events if e["event"] == "native_observation"}
-    accepted = defaultdict(lambda: defaultdict(list))
-    operation = {}
-    for event in events:
-        if event["event"] == "native_operation":
-            operation = event
-        elif event["event"] == "native_effect" and event["tool"] == operation.get("tool"):
-            for ref in event.get("sources", {}):
-                accepted[ref][event["tool"]].append(operation["arguments"][event["batch_index"]])
+    effects = recorded_effects(events)
 
     def unavailable(op, **_):
         raise Boundary(op)
@@ -54,10 +76,11 @@ def recorded_card_checks(events, parent, candidate, functions):
             engine.initialize_native(candidate)
             for obs in inputs:
                 engine.observe(obs["source"], obs["value"], obs["scope"], arguments=obs.get("arguments"))
-            ports = card["composition"]["inputs"]
+            composition = card["composition"]
+            ports = composition["inputs"]
             plans = (p for p in contact_plans(engine) if contact_plan_available(engine, p)) if any(
                 "role" in port for port in ports.values()
-            ) else source_plans(engine, ports)
+            ) else source_plans(engine, ports, composition.get("scope"))
             input_refs = {o.ref for o in engine.observed}
             matched = []
             for plan in plans:
@@ -84,21 +107,128 @@ def recorded_card_checks(events, parent, candidate, functions):
             result = engine.observed[-1]
             check.update(status="computed", same_output=result.data == expected["value"], rows=len(result.rows),
                          output_fields=observation_fields(result.data), bindings={})
-            for endpoint, arguments in accepted[original["output"]].items():
+            for endpoint, by_ref in effects.items():
+                arguments = by_ref.get(original["output"])
+                if arguments is None:
+                    continue
                 if endpoint == FINISH:
                     options = [[args] for _, args, refs in engine.answer_bindings() if result.ref in refs]
                 else:
                     options = [batch for _, batch, _, refs in engine.compiled_bindings(endpoint)
                                if result.ref in refs]
-                recorded = [key(args) for args in arguments]
-                choices = [[key(args) for args in batch] for batch in options]
-                check["bindings"][endpoint] = {
-                    "recorded_arguments": len(arguments),
-                    "candidate_bindings": len(options),
-                    "matches_recorded": any(sorted(batch) == sorted(recorded) for batch in choices),
-                    "same_order": recorded in choices,
-                }
+                check["bindings"][endpoint] = compare_payloads(options, arguments)
     return checks
+
+
+class ContinuationPreview(ComposedAssembly):
+    def menu(self):
+        self.action_page(self.candidates()[:8])
+        return self.offered
+
+    def ask(self, node, question, options, skill, **extra):
+        if node != "native/action":
+            raise Boundary(question)
+        self.offered = [value for _, value in options]
+        return "@discover"
+
+
+def recorded_continuations(events, parent, candidate, functions):
+    """Check the real action page and the next binding using only recorded public inputs."""
+    cards = candidate["fragment"]
+    changed = {name for name, card in cards.items() if card != parent["fragment"].get(name)}
+    changed.update(source for name, rule in candidate["binding"].items()
+                   if rule != parent["binding"].get(name) for source in rule["sources"] if source in cards)
+    if not changed:
+        return []
+
+    def unavailable(op, **_):
+        raise Boundary(op)
+
+    def preview(observations):
+        client = SimpleNamespace(request=unavailable)
+        engine = ContinuationPreview(client, client)
+        engine.prepare_options()
+        start = events[0]
+        engine.trace, engine.seed, engine.done = Trace(), start.get("seed", 0), False
+        engine.context = {"task": {**start, "functions": functions}, "history": []}
+        engine.initialize_native(candidate)
+        refs = {}
+        for item in observations:
+            sources = {refs[ref]: how for ref, how in item.get("sources", {}).items() if ref in refs}
+            engine.observe(item["source"], item["value"], item["scope"], complete=item["complete"],
+                           arguments=item.get("arguments"), sources=sources)
+            refs[item["ref"]] = engine.observed[-1].ref
+        return engine
+
+    # Only reconstruct data that was seen before any state-changing action.
+    observations, refs = [], set()
+    tools = catalog(functions)
+    for event in events:
+        kind = event["event"]
+        if kind == "native_effect" or (kind == "api_action" and event.get("method", "").casefold()
+                not in {"get", "head"} and not event.get("url", "").endswith("/auth/token")):
+            break
+        if kind != "native_observation":
+            continue
+        source = event["source"]
+        if (source in tools and is_read(source) or source in cards and source not in changed) and (
+            event.get("sources", {}).keys() <= refs
+        ):
+            observations.append(event)
+            refs.add(event["ref"])
+
+    cold, populated = preview(()), preview(observations)
+    opening, ready = cold.menu(), populated.menu()
+    accepted = recorded_effects(events)
+    results = []
+    for name in sorted(changed):
+        is_card = lambda action: isinstance(action, tuple) and action[:2] == ("fragment", name)
+        offered = [action for action in ready if is_card(action)]
+        report = {"fragment": name, "offered_at_start": any(map(is_card, opening)),
+                  "offered_with_recorded_inputs": bool(offered)}
+        results.append(report)
+        if not offered:
+            executable = any(map(is_card, populated.card_offers))
+            report["status"] = "not_recommended" if executable else "no_read_plan"
+            continue
+        action = next((action for action in offered if any(
+            len(card_input_refs(populated, plan)) == len(plan["reads"])
+            for plan in populated.card_offers[action]
+        )), None)
+        if action is None:
+            report["status"] = "needs_recorded_reads"
+            continue
+        engine = preview(observations)
+        engine.menu()
+        try:
+            engine.execute_card(action)
+        except Boundary as exc:
+            report.update(status="needs_live_request", operation=str(exc))
+            continue
+        except (*PROGRAM_ERRORS, Uncovered) as exc:
+            report.update(status="uncovered", reason=str(exc)[:240])
+            continue
+        output = engine.observed[-1]
+        report.update(rows=len(output.rows), output_fields=observation_fields(output.data), consumers=[])
+        for option in engine.menu():
+            if isinstance(option, tuple) and option[0] == "fragment":
+                if any(output.ref in dict(card_input_refs(engine, plan)).values()
+                       for plan in engine.card_offers.get(option, [])):
+                    report["consumers"].append({"fragment": option[1]})
+                continue
+            if option == FINISH:
+                batches = [[args] for _, args, inputs in engine.answer_bindings() if output.ref in inputs]
+            else:
+                batches = [batch for _, batch, _, inputs in engine.plan_bindings.get(option, [])
+                           if output.ref in inputs]
+            if batches:
+                consumer = {"tool": option, "example_arguments": [batch[:2] for batch in batches[:2]]}
+                known = accepted[option][None]
+                if known:
+                    consumer.update(compare_payloads(batches, known))
+                report["consumers"].append(consumer)
+        report["status"] = "consumer_available" if report["consumers"] else "no_consumer"
+    return results
 
 
 def different_fields(left, right):

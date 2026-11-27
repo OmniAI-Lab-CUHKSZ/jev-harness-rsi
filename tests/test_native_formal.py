@@ -8,6 +8,7 @@ import pytest
 from jev_harness.artifacts import read, save
 from jev_harness import native_formal, native_replay
 from jev_harness.native_revision import EditRound, TrainSample, evidence, evidence_page, revise
+from jev_harness.policy_programs import load_program, policy_capabilities
 
 
 def test_ordered_dev_cold_start_two_rounds_and_dev_rollback(tmp_path, monkeypatch):
@@ -152,7 +153,60 @@ def test_editor_can_mine_and_open_local_generation_with_only_the_parent_trace(tm
     assert set(prompt["Train evidence"]) == {label} and set(prompt["trace roles"]) == {"h0_decision"}
     assert prompt["Train evidence"][label]["open_sites"] == [[1, "G_binding", "example__send", 37]]
     assert "G_binding" in str(page) and "example__send" in str(page)
+    assert prompt["first_proposal_by_reply"] == 9
+    assert prompt["policy_language"] == policy_capabilities()
+    blocked = json.loads(calls[9].args[1])
+    assert "Submit a draft before requesting another evidence page." in blocked["error"]
+    assert "rows" not in blocked
     study.start_workers.assert_not_called()
+
+
+def test_editor_repairs_early_draft_after_a_located_policy_error(tmp_path, monkeypatch):
+    from jev_harness.protocol import design_manifest
+
+    task = design_manifest()["train_batches"][0]["tasks"][0]
+    label = "h0_decision/" + task
+    trace = tmp_path / "entry.jsonl"
+    trace.write_text('{"event":"task","instruction":"Synthetic task"}\n', encoding="utf-8")
+    tool = {"name": "example__show_records", "description": "Read example records", "parameters": {
+        "type": "object", "properties": {"query": {"type": "string"}},
+    }}
+    save(tmp_path / "offline/public_functions.json", [tool])
+    library = native_formal.blank_library()
+    row = {"task_id": task, "success": False, "open_calls": 0, "output_tokens": 0}
+    current = EditRound(tmp_path / "offline/b01r01", library, {label: TrainSample(trace, row, library)}, {})
+    study = Mock(root=tmp_path, execution={})
+    sol = study.solver.return_value
+    monkeypatch.setattr(native_replay, "first_change", lambda *args: {"status": "unchanged"})
+    read_request = {"read": {"doc": label, "start": 0, "count": 1}}
+    source = {"source": tool["name"], "read": "query = state['goal']\nreturn [{'query': query.rstrip('.')}]"}
+    card = {"label": "Count observed requests", "program": "return len(state['inputs']['rows']['rows'])",
+            "composition": {"inputs": {"rows": {"sources": [source]}}, "output": {"value": "integer"}}}
+    broken = {"reason": "Synthetic example", "objects": [{"kind": "fragment", "name": "count_rows", "value": card}]}
+    fixed = deepcopy(broken)
+    fixed_card = fixed["objects"][0]["value"]
+    fixed_card["composition"]["inputs"]["rows"]["sources"][0]["read"] = source["read"].replace("rstrip", "strip")
+    sol.turn.side_effect = [json.dumps(reply) for reply in
+                            [*([read_request] * 8), broken, read_request, fixed, fixed]]
+
+    assert revise(study, [task], current=current)["fragment"]["count_rows"] == fixed_card
+    assert read(current.folder / "proposal.json") == fixed
+    calls = sol.turn.call_args_list
+    assert [c.args[2].name for c in calls[-4:]] == ["turn_9", "turn_10", "turn_11", "review"]
+    request = json.loads(calls[8].args[1])
+    assert "Submit the smallest complete draft now" in request["instruction"]
+    assert request["draft_replies_remaining"] == 4
+    error = json.loads(calls[9].args[1])
+    assert ("fragment/count_rows: composition.inputs.rows.sources[0].read: "
+            "line 2: Unsupported policy method: .rstrip()") in error["error"]
+    assert error["draft_replies_remaining"] == 3
+    assert json.loads(calls[10].args[1])["doc"] == label
+    study.start_workers.assert_not_called()
+
+
+def test_policy_operator_error_uses_the_body_line():
+    with pytest.raises(ValueError, match=r"line 2: Unsupported policy operation: Mod"):
+        load_program("value = 10\nreturn value % 3")
 
 
 def test_only_matching_composition_runs_can_resume(tmp_path, monkeypatch):

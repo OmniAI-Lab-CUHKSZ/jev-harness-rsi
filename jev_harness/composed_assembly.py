@@ -7,7 +7,7 @@ import re
 
 from .composition import (
     PROGRAM_ERRORS, acquire_inputs, already_covered, card_answers, card_input_refs, card_plan_key, card_writes,
-    contact_plan_available, output_fields, project_batch, request_scope, resolve_card,
+    contact_plan_available, input_scopes, output_fields, project_batch, request_scope, resolve_card,
     source_plans, validate_output,
 )
 from .artifacts import cleaned_text
@@ -55,7 +55,7 @@ class ComposedAssembly(NativeTools):
         self.goal = re.sub(r'["“][^"”]*["”]', "", self.instruction).casefold()
         self.answer_question = bool(re.search(
             r"\b(what|which|how many|how much|tell me|give me the (?:title|number|name))\b", self.goal
-        ))
+        ) or (self.answer_rules() and re.match(r"^(?:please\s+)?(?:name|list|count|report|state|give me)\b", self.goal)))
         self.set_request = bool(re.search(r"\b(all|each|every)\b.*\b(from|by|in|within)\b", self.goal))
         self.required = self.required_effects()
 
@@ -91,6 +91,11 @@ class ComposedAssembly(NativeTools):
     def facts(self):
         return {**super().facts(), "remaining_effects": sorted(self.outstanding()),
                 "verified_effects": sorted(self.chosen_effects)}
+
+    def answer_rules(self):
+        return [(name, rule) for name, rule in self.lib["binding"].items()
+                if FINISH in self.tools and rule.get("endpoint", name) == FINISH
+                and rule.get("covers") and rule.get("goal_terms") and relevance(rule, self.goal)]
 
     def perform(self, endpoint, batch, scope, sources=None):
         projected = "fields" in self.lib["binding"].get(endpoint, {}) or any(
@@ -130,28 +135,53 @@ class ComposedAssembly(NativeTools):
             name: max(relevance(card, self.goal), len(goal & goal_words(self.lib["retrieval"].get(name, ""))))
             for name, card in library.items()
         }
+        answer_rules = self.answer_rules() if self.answer_question else []
+        needed = {source for _, rule in answer_rules for source in [*rule["sources"], *rule.get("inputs", [])]
+                  if source in library}
+        for endpoint in self.outstanding():
+            rule = self.lib["binding"].get(endpoint, {})
+            if rule.get("covers"):
+                needed.update(source for source in [*rule["sources"], *rule.get("inputs", [])]
+                              if source in library and library[source]["composition"].get("scope"))
+        # Keep legacy recommendations, and recover producers with an applicable downstream binding.
+        for name in needed:
+            scores[name] = max(scores[name], 1)
         observed = {o.source for o in self.observed if o.complete and self.current_input(o)}
-        # Propagate relevance through required producer ports. An alternative collection keeps its own scope.
+        producers = {}
+        for name, card in library.items():
+            composition = card["composition"]
+            ports = composition["inputs"]
+            if scope := composition.get("scope"):
+                active = input_scopes(self.goal, scope)
+                if not active:
+                    continue
+                selected = set().union(*active)
+                ports = {port: value for port, value in ports.items() if port in selected or port not in scope["ports"]}
+            producers[name] = [part["sources"][0]["source"] for part in ports.values()
+                               if len(part.get("sources", [])) == 1]
+        # Propagate relevance through required producers in the applicable input scope.
         for _ in library:
-            for name, card in library.items():
-                for port in card["composition"]["inputs"].values():
-                    sources = port.get("sources", [])
-                    if len(sources) == 1:
-                        source = sources[0]["source"]
-                        if source in scores and source not in observed:
-                            scores[source] = max(scores[source], scores[name] - 1)
+            for name, sources in producers.items():
+                for source in sources:
+                    if source not in scores or source in observed:
+                        continue
+                    scores[source] = max(scores[source], scores[name] - 1)
+                    if name in needed:
+                        needed.add(source)
+                        scores[source] = max(scores[source], 1)
 
         self.card_offers.clear()
         ranked = []
         scoped_cards = []
         existing = []
         for name, card in library.items():
-            inputs = card["composition"]["inputs"]
+            composition = card["composition"]
+            inputs = composition["inputs"]
             if any("role" in port for port in inputs.values()):
                 scoped_cards.append((name, card))
                 continue
             yields = output_fields(card)
-            for plan in source_plans(self, inputs):
+            for plan in source_plans(self, inputs, composition.get("scope")):
                 if not self.card_plan_available(name, plan):
                     continue
                 ports = tuple(r.get("ref", r["source"]) for r in plan["reads"].values())
@@ -229,7 +259,9 @@ class ComposedAssembly(NativeTools):
                 raise Uncovered(f"{name} could not establish its result")
             validate_output(output, result, loaded)
         sources = {obs.ref: {"program_input": name} for obs in loaded.values()}
-        scope = plan["scope"] if scoped else ", ".join(f"{obs.ref} {obs.source}" for obs in loaded.values())
+        scope = plan["scope"] if scoped or "scope" in card["composition"] else ", ".join(
+            f"{obs.ref} {obs.source}" for obs in loaded.values()
+        )
         self.observe(name, result, scope, sources=sources)
         self.used_card_plans.add((name, card_plan_key(plan)))
         ref = self.observed[-1].ref
@@ -293,8 +325,39 @@ class ComposedAssembly(NativeTools):
             if cue in terms(self.goal):
                 wanted.update(choices)
         result = card_answers(self)
+        rules = self.answer_rules()
+        explicitly_bound = {source for _, rule in rules for source in rule["sources"]}
+        for name, rule in rules:
+            for obs in reversed(self.observed):
+                if obs.source not in rule["sources"] or not obs.complete or not self.current_input(obs):
+                    continue
+                for companions in self.companion_sets(rule):
+                    if not all(o.complete and self.current_input(o) for o in companions):
+                        continue
+                    try:
+                        if "fields" in rule:
+                            if len(obs.rows) != 1:
+                                continue
+                            batch = project_batch(self.tools[FINISH], obs, rule["fields"])
+                            sources = {obs.ref: {"fields": rule["fields"]}}
+                        else:
+                            batch = self.program("binding", name, obs, companions)
+                            sources = {o.ref: {"program_input": name} for o in (obs, *companions)}
+                        if not isinstance(batch, list) or len(batch) != 1:
+                            continue
+                        args = batch[0]
+                        check_args(self.tools[FINISH], args)
+                        if set(args) != {"answer"}:
+                            continue
+                    except (NameError, ValueError) as exc:
+                        self.trace.add("program_error", component="binding", name=name, error=str(exc)[:240])
+                        continue
+                    result.append((f"{rule['label']} from {obs.ref}: {preview(args['answer'], 140)}",
+                                   args, sources))
         for obs in reversed(self.observed):
             if not obs.complete or obs.source not in {*self.lib["fragment"], "calculation"}:
+                continue
+            if obs.source in explicitly_bound:
                 continue
             if output_fields(self.lib["fragment"].get(obs.source, {})) and not relevance(
                 self.lib["fragment"][obs.source], self.goal

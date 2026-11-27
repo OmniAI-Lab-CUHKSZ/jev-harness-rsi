@@ -9,12 +9,13 @@ from .artifacts import cleaned_text, read, read_events, read_page, save, visible
 from .composition import declared_sources, output_fields, validate_card, validate_projection
 from .native_assembly import FINISH
 from .native_evidence import fragment_evidence, observation_fields
-from .policy_programs import load_program
+from .policy_programs import policy_capabilities, validate_program
 from .protocol import design_manifest
 from .schema_tools import available, catalog, is_read
 
 
 DRAFT_REPLY_LIMIT = 12
+FIRST_DRAFT_REPLY = 9
 
 
 EDITOR = """Improve the shared AppWorld harness for the fixed 27B. First preserve or improve whole-task success;
@@ -38,7 +39,10 @@ whole-task recipe. Check which other tasks could see your new menu or guidance. 
 
 Use the exact key under "Train evidence" as the doc name in {"read":{"doc":"stage/task","start":0,"count":6,
 "offset":0}}. Use doc=index to list available document names or doc=tool/<exact endpoint> for a signature.
-The draft has twelve replies, including reads. Reserve the final reply for a complete proposal. Submit {"reason":"evidence and expected behavior",
+Submit a small complete draft as soon as the evidence supports it, by the first-proposal reply shown in the
+request. Use the remaining draft replies to repair validation errors or open evidence needed for the repair.
+Use the policy language in the first request. The final reply must be a complete proposal.
+Submit {"reason":"evidence and expected behavior",
 "objects":[{"kind":"fragment","name":"identifier","value":{...}}]}. Change at most three distinct named items.
 Use a justified empty list if no change is supported. An existing item can be deleted with value:null.
 
@@ -49,6 +53,9 @@ Consider all six components:
   kwargs or fields mapping required API parameters to typed output fields. Set covers:true for a complete
   binding. Optional inputs name companion observations. Use sources:[] for a task-only argument program.
   Set projections are grounded in complete observed rows; Jev still selects the operation and applicable set.
+  For an explicit answer, use a named binding with endpoint:"supervisor__complete_task", covers:true,
+  sources and short goal_terms describing the requested value. Map fields:{"answer":"artist_name"}
+  from a single result, or use a program returning exactly one {"answer": ...} argument object.
 - fragment: a reusable composition card described below.
 - state: label, sources and pure program for compact public evidence. An intent rule uses intent:true and
   sources:[], and returns requested write endpoints based on state["goal"]. Actual writes require receipts.
@@ -64,6 +71,11 @@ a pure planner returning the list of keyword objects, or {"input":"earlier_port"
 "card_field"}} to hydrate every row from a typed earlier input. Use [{}] for a public default, and None for an unsupported
 scope. The runtime validates the known arguments, provides authentication and paginates. Multiple argument
 objects produce one result per argument. Do not infer scope from the display label.
+An optional composition.scope has {"noun":"library","ports":{"songs":"song","albums":"album",
+"playlists":"playlist"}}. Declare those ports in inputs and give each its real read sources. Only the
+ports matching the current scope reach the program; any unlisted ports are still required. For example,
+iterate the selected inputs and deduplicate IDs. Give downstream calculations explicit sources or
+bindings so the runtime can retrieve the producer for count, rank, or other requested uses.
 
 The pure card and read planners see state["inputs"][port] with rows, source, ref, scope, complete and actual
 public arguments as inputs become available, plus instruction, goal and datetime. Output must declare
@@ -122,13 +134,16 @@ def apply_edits(parent, proposal, tools):
             if not isinstance(value, str) or not value.strip():
                 raise ValueError("Expected a short textual cue")
 
-    for card in lib["fragment"].values():
-        validate_card(card, tools, lib["fragment"])
+    for name, card in lib["fragment"].items():
+        try:
+            validate_card(card, tools, lib["fragment"])
+        except ValueError as exc:
+            raise ValueError(f"fragment/{name}: {exc}") from exc
     known = tools.keys() | lib["fragment"].keys() | {"calculation", "inspection"}
     for kind in ("binding", "state"):
         for name, spec in lib[kind].items():
             required = {"sources", "label"}
-            optional = {"inputs", "covers", "fields"} if kind == "binding" else {"intent"}
+            optional = {"inputs", "covers", "fields", "endpoint", "goal_terms"} if kind == "binding" else {"intent"}
             if (not isinstance(spec, dict) or not required <= spec.keys()
                     or spec.keys() - required - optional - {"program"}
                     or not isinstance(spec["label"], str) or not spec["label"].strip()
@@ -145,19 +160,34 @@ def apply_edits(parent, proposal, tools):
                 raise ValueError("An intent rule runs before tool observations and has empty sources")
             if kind == "state" and not (sources or spec.get("intent")):
                 raise ValueError("A state rule needs observations or intent")
-            if kind == "binding" and (name not in tools or not (available(name) or name == FINISH)):
+            endpoint = spec.get("endpoint", name)
+            if kind == "binding" and (not isinstance(endpoint, str) or endpoint not in tools
+                                      or not (available(endpoint) or endpoint == FINISH)):
                 raise ValueError("Bind a published endpoint")
+            if "endpoint" in spec and (endpoint != FINISH or name in tools and name != FINISH):
+                raise ValueError("A named answer binding must have its own name and use the completion endpoint")
+            explicit_answer = kind == "binding" and endpoint == FINISH and (
+                "endpoint" in spec or "goal_terms" in spec or "fields" in spec
+            )
+            if explicit_answer or "goal_terms" in spec:
+                terms = spec.get("goal_terms")
+                if (not explicit_answer or spec.get("covers") is not True or not sources
+                        or not isinstance(terms, list) or not terms
+                        or any(not isinstance(term, str) or not term.strip() for term in terms)):
+                    raise ValueError("An answer binding needs sources, covers:true and nonempty goal_terms")
             if "covers" in spec and type(spec["covers"]) is not bool:
                 raise ValueError("covers must be a boolean")
             if ("program" in spec) == ("fields" in spec):
                 raise ValueError("Use a pure program or a field projection")
             if "program" in spec:
-                load_program(spec["program"])
+                validate_program(spec["program"], location=f"{kind}/{name}.program")
             else:
-                if not spec.get("covers") or not sources or companions or is_read(name) or name == FINISH:
+                if not spec.get("covers") or not sources or companions or is_read(endpoint):
                     raise ValueError("A write projection needs a complete source and a public write endpoint")
+                if explicit_answer and (not isinstance(spec["fields"], dict) or set(spec["fields"]) != {"answer"}):
+                    raise ValueError("An answer projection must supply the answer parameter")
                 for source in sources:
-                    validate_projection(spec["fields"], tools[name], output_fields(lib["fragment"].get(source, {})))
+                    validate_projection(spec["fields"], tools[endpoint], output_fields(lib["fragment"].get(source, {})))
     return lib
 
 
@@ -321,46 +351,51 @@ def revise(study, train, *, current):
     (folder / "sol").mkdir(parents=True, exist_ok=True)
     (folder / "sol/system.txt").write_text(EDITOR, encoding="utf-8")
     thread = account.start(folder / "sol", EDITOR)
-    prompt = json.dumps(
-        {
-            "current_library": parent,
-            "Train evidence": panel,
-            "trace roles": {"h0_decision": "This round's parent harness, including its Jev choices and generation."},
-            "previous round on this batch": current.previous_round,
-            "documents": "Use doc=index or copy an exact Train evidence key. Use doc=tool/<endpoint> or doc=tools.",
-        },
-        ensure_ascii=False,
-    )
+    prompt = {
+        "current_library": parent,
+        "Train evidence": panel,
+        "trace roles": {"h0_decision": "This round's parent harness, including its Jev choices and generation."},
+        "previous round on this batch": current.previous_round,
+        "documents": "Use doc=index or copy an exact Train evidence key. Use doc=tool/<endpoint> or doc=tools.",
+        "first_proposal_by_reply": FIRST_DRAFT_REPLY,
+        "policy_language": policy_capabilities(),
+    }
     docs["tools"] = [json.dumps(t, ensure_ascii=False) for t in tools.values()]
     docs.update({f"tool/{name}": [json.dumps(tool, ensure_ascii=False)] for name, tool in tools.items()})
+    submitted_draft = False
     for turn in range(1, DRAFT_REPLY_LIMIT + 1):
         final_draft_turn = turn == DRAFT_REPLY_LIMIT
+        request = {**prompt, "draft_replies_remaining": DRAFT_REPLY_LIMIT - turn + 1}
         if final_draft_turn:
-            prompt += "\nFinal response: submit a proposal now using the verified evidence."
-        elif turn > 1 and prompt.startswith("{"):
-            response = json.loads(prompt)
-            response["draft_replies_remaining"] = DRAFT_REPLY_LIMIT - turn + 1
-            prompt = json.dumps(response, ensure_ascii=False)
-        answer = account.turn(thread, prompt, folder / "sol" / f"turn_{turn}")
+            request["instruction"] = "Final response: submit a proposal now using the verified evidence."
+        elif turn >= FIRST_DRAFT_REPLY and not submitted_draft:
+            request["instruction"] = "Submit the smallest complete draft now to receive validation feedback."
+        answer = account.turn(thread, json.dumps(request, ensure_ascii=False), folder / "sol" / f"turn_{turn}")
         try:
             from .runtime import parse_json
 
             proposal = parse_json(answer)
-            if "read" in proposal and not final_draft_turn:
-                req = proposal["read"]
-                response = evidence_page(docs, req)
-                prompt = json.dumps(response, ensure_ascii=False)
+            if "read" in proposal and "objects" not in proposal:
+                if final_draft_turn:
+                    raise ValueError("The final reply must contain a complete proposal.")
+                if turn >= FIRST_DRAFT_REPLY and not submitted_draft:
+                    raise ValueError("Submit a draft before requesting another evidence page.")
+                prompt = evidence_page(docs, proposal["read"])
                 continue
+            if isinstance(proposal.get("objects"), list):
+                submitted_draft = True
             lib = apply_edits(parent, proposal, tools)
         except (ValueError, TypeError, KeyError, AttributeError) as exc:
-            prompt = f"Could not apply this response: {exc}. Return corrected JSON."
+            prompt = {"error": f"Could not apply this response: {exc}",
+                      "instruction": "Correct the response and return valid JSON."}
             continue
         if lib != parent:
-            from .native_replay import first_change, recorded_card_checks, solved_preview
+            from .native_replay import first_change, recorded_card_checks, recorded_continuations, solved_preview
 
             draft_library = lib
             impact = {}
             reuse = {}
+            continuations = {}
             used_current = False
             checks_used = 0
             for task in train:
@@ -378,6 +413,9 @@ def revise(study, train, *, current):
                     else:
                         used_current = True
                 impact[task] = result
+                continuation = recorded_continuations(events, parent, lib, list(tools.values()))
+                if continuation:
+                    continuations[task] = continuation
                 if solved:
                     matches = recorded_card_checks(events, parent, lib, list(tools.values()))
                     if matches:
@@ -389,6 +427,7 @@ def revise(study, train, *, current):
                     study, lib, current.solved, budget=24 - checks_used
                 ),
                 "recorded_card_checks": reuse,
+                "recorded_continuations": continuations,
             }
             task = trial_task(train, impact, panel, parent, lib)
             preview["whole_current_train_trial"] = full_train_trial(study, task, lib, current) if task else None
@@ -406,6 +445,9 @@ def revise(study, train, *, current):
                 "Recorded card checks run the draft computation on complete inputs used by the original card. "
                 "Compare the recomputed output and bound payloads even when the original menu is unchanged. "
                 "These checks use recorded data and do not measure new task outcomes or Jev selection. "
+                "Recorded continuations rebuild the real menu on public inputs. They report whether an edited "
+                "card is offered, what inputs it still needs, and whether a downstream choice actually consumes "
+                "its output. An offline computation supplies no evidence of live selection or execution. "
                 "The whole_current_train_trial, when present, is an actual fresh episode on the draft. Read its "
                 "accepted payloads and fragment_flow, including unused output, before attributing benefit. "
                 "A cheaper pass may send the wrong content. Check against evidence and the public instruction. "

@@ -68,6 +68,15 @@ NODES = (ast.Module,ast.FunctionDef,ast.arguments,ast.arg,ast.Return,ast.For,ast
          ast.Lt,ast.LtE,ast.Gt,ast.GtE,ast.Add,ast.Sub,ast.Mult,ast.Div,ast.USub)
 
 
+def policy_capabilities():
+    return {
+        "functions": sorted(FUNCTIONS),
+        "methods": sorted(METHODS),
+        "operator_nodes": sorted(node.__name__ for node in NODES
+                                 if issubclass(node, (ast.operator, ast.unaryop, ast.boolop, ast.cmpop))),
+    }
+
+
 @lru_cache(maxsize=64)
 def load_program(source):
     if not isinstance(source,str) or not 1<=len(source)<=5000:
@@ -77,20 +86,45 @@ def load_program(source):
         tree=ast.parse(text)
         program=compile(tree,"<harness policy>","exec")
     except SyntaxError as exc:
-        raise ValueError("Policy syntax: "+str(exc)) from exc
+        line = max(1, (exc.lineno or 2) - 1)
+        raise ValueError(f"line {line}: Policy syntax: {exc.msg}") from exc
     entry=tree.body[0]
     if len(tree.body)!=1 or not isinstance(entry,ast.FunctionDef):
         raise ValueError("Expected one policy function")
     for node in ast.walk(tree):
-        if not isinstance(node,NODES) or (isinstance(node,ast.FunctionDef) and node is not entry):
-            raise ValueError("Unsupported policy operation: "+type(node).__name__)
-        if isinstance(node,ast.Name) and node.id.startswith("_"):
-            raise ValueError("Policy variables use public names")
-        if isinstance(node,ast.Attribute) and node.attr not in METHODS:
-            raise ValueError("Unsupported policy method: "+node.attr)
-        if isinstance(node,ast.Call) and not (isinstance(node.func,ast.Name) and node.func.id in FUNCTIONS
-                                               or isinstance(node.func,ast.Attribute) and node.func.attr in METHODS):
-            raise ValueError("Use built-in operations or the public pattern helpers")
+        error = None
+        if not isinstance(node, NODES) or (isinstance(node, ast.FunctionDef) and node is not entry):
+            error = f"Unsupported policy operation: {type(node).__name__}"
+        elif isinstance(node, ast.Name) and node.id.startswith("_"):
+            error = "Policy variables use public names"
+        elif isinstance(node, ast.Attribute) and node.attr not in METHODS:
+            error = f"Unsupported policy method: .{node.attr}"
+        elif isinstance(node, ast.Call):
+            target = node.func
+            if isinstance(target, ast.Name):
+                if target.id not in FUNCTIONS:
+                    error = f"Unsupported policy function: {target.id}()"
+            elif isinstance(target, ast.Attribute):
+                if target.attr not in METHODS:
+                    error = f"Unsupported policy method: .{target.attr}()"
+            else:
+                error = "Call a named policy function or method"
+        if error is not None:
+            line = getattr(node, "lineno", None)
+            if line is None:
+                # Operator nodes have no position of their own.
+                line = next((parent.lineno for parent in ast.walk(tree)
+                             if hasattr(parent, "lineno") and node in ast.iter_child_nodes(parent)), 2)
+            raise ValueError(f"line {max(1, line - 1)}: {error}")
     namespace={"__builtins__":{},**FUNCTIONS}
     exec(program,namespace)
     return namespace["policy"]
+
+
+def validate_program(source, *, location):
+    if not isinstance(source, str):
+        raise ValueError(f"{location}: Expected a Python policy body as a string")
+    try:
+        load_program(source)
+    except ValueError as exc:
+        raise ValueError(f"{location}: {exc}") from exc
