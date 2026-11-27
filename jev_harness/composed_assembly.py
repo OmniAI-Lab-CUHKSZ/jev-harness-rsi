@@ -354,6 +354,33 @@ class ComposedAssembly(NativeAssembly):
             return bool(self.answer_bindings())
         return bool(self.receipts or self.chosen_effects)
 
+    def preview_action_choices(self, actions):
+        compositions = {
+            value: self.dynamic_offers[value[1]][1]
+            for _, value in actions
+            if isinstance(value, tuple) and value[0] == "dynamic" and "composition" in self.lib["fragment"][value[1]]
+        }
+        if not compositions:
+            return actions
+        related_reads = set()
+        previews = {}
+        for value, plans in compositions.items():
+            sources = {read["source"] for plan in plans for read in plan["reads"].values()}
+            related_reads.update(sources)
+            apps = " and ".join(sorted({source.split("__", 1)[0] for source in sources}))
+            binding = "Read arguments already bound." if len(plans) == 1 else "First choose among the listed scopes."
+            previews[value] = (f"Acquires the scoped {apps} inputs itself and returns matched records. "
+                               f"{binding} Any write is a separate choice.")
+        for _, value in actions:
+            if isinstance(value, str) and value in related_reads:
+                if value in self.plan_bindings:
+                    previews[value] = "Returns this source with bound arguments. The requested follow-up remains."
+                else:
+                    previews[value] = ("Returns this source alone. Contact matching still remains. "
+                                       "Scope may need another choice or generated arguments.")
+        return [(f"{label} | Outcome: {previews[value]}" if value in previews else label, value)
+                for label, value in actions]
+
     def action_page(self, names, *, allow_discovery=True, include_compositions=True):
         outstanding = self.outstanding()
         answers = self.answer_bindings()
@@ -416,7 +443,7 @@ class ComposedAssembly(NativeAssembly):
         else:
             actions = actions[:15]
         action = self.ask(
-            "native/action", "What step advances the user's remaining goal?", actions,
+            "native/action", "What step advances the user's remaining goal?", self.preview_action_choices(actions),
             ACTION_SKILL + " " + self.lib["decision"].get("action", ""),
         )
         if action is None and include_compositions:

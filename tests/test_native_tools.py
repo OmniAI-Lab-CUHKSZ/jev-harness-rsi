@@ -1251,6 +1251,12 @@ def test_endpoint_independent_filter_preserves_both_transaction_directions_and_o
     engine.initialize_native(child)
     engine.ask = Mock(side_effect=[None, payments])
     assert engine.action_page([payments]) == payments
+    offered = {value: label for label, value in engine.ask.call_args_list[0].args[2]}
+    assert "Acquires the scoped phone and venmo inputs itself" in offered[("dynamic", "match_people")]
+    assert "Read arguments already bound." in offered[("dynamic", "match_people")]
+    assert "Contact matching still remains." in offered[payments]
+    assert "another choice or generated arguments" in offered[payments]
+    assert engine.ask.call_args_list[0].args[3] == prior_request.args[3]
     assert engine.ask.call_args == prior_request
     assert not engine.notices
 
