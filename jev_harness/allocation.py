@@ -6,9 +6,17 @@ import os
 import subprocess
 import time
 
-from formal_run import read, save
-from phase1_run import PhaseOneStudy
+from pathlib import Path
+import json
+import re
+from threading import Lock
+
+from .artifacts import include_retries, read, save
+from .composed_assembly import ComposedAssembly
 from .inference_workers import DeviceWorkers
+from .native_assembly import NativeGeneration
+from .sol_account import SolAccount
+from .transport import WorkerError, WorkerUnavailable
 
 
 SCAN_SECONDS = 60
@@ -40,65 +48,110 @@ def inspect_node(entry):
         return node, {"unavailable": str(exc)}
 
 
-class SharedStudy(PhaseOneStudy):
-    def __init__(self, root, settings, connections, *, devices=(), max_gpus=4, gpu_name="A800", lanes_per_gpu=None):
-        super().__init__(root, settings, connections)
+class SharedStudy:
+    compiled_executor = ComposedAssembly
+    generation_executor = NativeGeneration
+
+    def __init__(self, root, settings, connections, *, devices=(), max_gpus=6, lanes_per_gpu=2):
+        self.root = Path(root).resolve()
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.settings = settings
+        self.execution = settings["execution"]
+        self.seed = settings["seed"]
+        self.functions = []
+        self.test_started = False
+        self.account = None
+        self.log_lock = Lock()
         self.workers = []
-        self.connections = connections
         self.devices = tuple(devices)
         self.max_gpus = len(self.devices) or max_gpus
-        self.gpu_name = gpu_name
         self.groups = {}
         self.last_scan = float("-inf")
         self.started_utc = utcnow()
-        self.fixed_width = lanes_per_gpu
-        checkpoints = self.root / "checkpoints.json"
-        completed = read(checkpoints) if checkpoints.is_file() else []
-        self.lanes_per_gpu = self.width_for("train", len(completed) + 1)
-        self.decode_mode = "eager"
-        self.preferred_devices = ()
-        if settings.get("cuda_graph_from_start"):
-            self.enable_cuda_graph()
-        after = settings.get("cuda_graph_after")
-        if after is not None:
-            previous = self.root / "controller.json"
-            if previous.is_file():
-                self.preferred_devices = tuple(read(previous).get("devices", "").split(","))
-            if any(c.get("visit", f"b{c['batch']:02d}") == f"b{after:02d}" for c in completed):
-                self.enable_cuda_graph()
-
-    def enable_cuda_graph(self):
-        if self.decode_mode == "cuda_graph":
-            return
-        warm = bool(self.groups)
-        if warm:
-            self.preferred_devices = tuple(self.groups)
-            self.status("switching_decode_mode", decode_mode="cuda_graph")
-            self.close_devices()
-        self.connections = {**self.connections, "model_nodes": {
-            node: {**spec, "args": [*spec.get("args", []), "--cuda-graph"]} if "--cuda-graph" not in spec.get("args", []) else spec
-            for node, spec in self.connections["model_nodes"].items()}}
+        self.lanes_per_gpu = lanes_per_gpu
         self.decode_mode = "cuda_graph"
-        self.last_scan = float("-inf")
-        if warm:
-            self.start_workers()
+        self.connections = {
+            **connections,
+            "model_nodes": {
+                node: spec if "--cuda-graph" in spec["args"] else {**spec, "args": [*spec["args"], "--cuda-graph"]}
+                for node, spec in connections["model_nodes"].items()
+            },
+        }
 
-    def width_for(self, phase, batch):
-        schedule = self.settings.get("inference_schedule", {})
-        key = "test" if phase == "test" else "first_batch" if batch == 1 else "later_batches"
-        width = self.fixed_width if self.fixed_width is not None else schedule.get(key, 1)
-        if width not in (1, 2):
-            raise ValueError(f"Expected one or two inference sessions per GPU, got {width}")
-        return width
+    def status(self, stage, **values):
+        data = {"stage": stage, **values, "updated_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+        with self.log_lock:
+            save(self.root/"status.json", data)
+            print(json.dumps(data, ensure_ascii=False, default=str), flush=True)
 
-    def begin_inference_phase(self, phase, batch=None):
-        width = self.width_for(phase, batch)
-        if width != self.lanes_per_gpu:
-            self.status("switching_inference_concurrency", phase=phase, batch=batch, lanes_per_gpu=width)
-            self.close_devices()
-            self.lanes_per_gpu = width
-            self.last_scan = float("-inf")
-            self.start_workers()
+    def solver(self):
+        if self.test_started:
+            raise RuntimeError("No optimizer call is allowed during the held-out test")
+        if self.account is None:
+            # Keep the Sol working area separate from Dev/Test artifacts.
+            self.account = SolAccount(self.root/"offline", self.root/"offline")
+        return self.account
+
+    def close_account(self):
+        if self.account:
+            self.account.close()
+            self.account = None
+
+    def paired_model_info(self):
+        f = self.root/"execution_model.json"
+        if f.is_file():
+            return read(f)
+        data = self.workers[0].worker("model").request("info")
+        save(f, data)
+        return data
+
+    def record_public_catalog(self, stage):
+        return not self.test_started and stage.startswith("b")
+
+    def run_task(self, task, stage, variant, library, *, workers=None):
+        # Each result is bound to one task, version and seed.
+        folder = self.root/"runs"/stage/task
+        record_file = folder/"record.json"
+        if record_file.is_file():
+            return include_retries(self.root, read(record_file))
+        workers = workers or self.workers[0]
+        device = {"gpu": workers.gpu, "lanes_per_gpu": workers.lanes_per_gpu, "lane": workers.lane,
+                  "decode_mode": workers.decode_mode}
+        # Preserve partial receipts and use a fresh AppWorld run name on resume.
+        prior_attempts = [int(p.name.split("_")[-1]) for p in folder.glob("attempt_*")
+                          if p.name.split("_")[-1].isdigit()]
+        first_attempt = max(prior_attempts, default=0) + 1
+        for attempt in range(first_attempt, first_attempt+2):
+            part = folder/f"attempt_{attempt}"
+            folder.mkdir(parents=True, exist_ok=True)
+            self.status(stage, task=task, variant=variant, attempt=attempt, **device)
+            try:
+                env = workers.worker("environment")
+                executor_type = self.compiled_executor if variant == "B" else self.generation_executor
+                executor = executor_type(workers.worker("model"), env, **self.execution)
+                run_name = re.sub(r"[^A-Za-z0-9_]", "_", self.root.name+"_"+stage+f"_{attempt}")
+                trace = part/"trace.jsonl"
+                result = executor.run(task, library, trace, self.seed, run_name)
+                with self.log_lock:
+                    if not self.functions and self.record_public_catalog(stage):
+                        self.functions = executor.context["task"]["functions"]
+                        save(self.root/"offline"/"public_functions.json", self.functions)
+                result["trace_path"] = str(trace.relative_to(self.root))
+                result["variant"] = variant
+                result.update(device)
+                save(record_file, result)
+                with self.log_lock:
+                    print(json.dumps({"stage": stage, "task": task, "variant": variant, "success": result["success"],
+                                      "generated_tokens": result["output_tokens"],
+                                      "api_calls": result["api_calls"], "seconds": round(result["seconds"], 2),
+                                      **device}, ensure_ascii=False), flush=True)
+                return include_retries(self.root, result)
+            except (WorkerUnavailable, WorkerError) as exc:
+                save(part/"infrastructure.json", {"error": str(exc), "attempt": attempt})
+                workers.close_worker("environment")
+                workers.close_worker("model")
+                if attempt == first_attempt+1:
+                    raise
 
     def metadata(self):
         save(self.root / "controller.json", {"pid": os.getpid(), "started_utc": self.started_utc,
@@ -127,10 +180,9 @@ class SharedStudy(PhaseOneStudy):
             with ThreadPoolExecutor(len(hosts)) as pool:
                 nodes = dict(pool.map(inspect_node, hosts.items()))
             candidates = [row for rows in nodes.values() if isinstance(rows, list) for row in rows
-                          if row["gpu"] not in active and self.gpu_name in row["name"]
+                          if row["gpu"] not in active and "A800" in row["name"]
                           and row["free_mib"] >= FREE_MIB and row["util_pct"] <= LOW_UTIL]
-            candidates.sort(key=lambda row: (row["gpu"] not in self.preferred_devices,
-                                             row["util_pct"], -row["free_mib"], row["gpu"]))
+            candidates.sort(key=lambda row: (row["util_pct"], -row["free_mib"], row["gpu"]))
             inspection.update(nodes=nodes, min_free_mib=FREE_MIB, max_util_pct=LOW_UTIL)
         inspection["candidates"] = [row["gpu"] for row in candidates]
         take = candidates[:self.max_gpus - len(active)]
@@ -162,10 +214,6 @@ class SharedStudy(PhaseOneStudy):
             self.maybe_expand()
             if not self.groups:
                 time.sleep(SCAN_SECONDS)
-
-    def candidate_batch(self, *args, **kwargs):
-        self.maybe_expand()
-        return super().candidate_batch(*args, **kwargs)
 
     def execute_jobs(self, jobs, operation):
         return self.execute_preferred(jobs, operation, None)
@@ -216,17 +264,6 @@ class SharedStudy(PhaseOneStudy):
                     busy.remove(worker)
                     results[index] = future.result()
         return results
-
-    def batch(self, tasks, stage, variant="B", library=None):
-        rows = super().batch(tasks, stage, variant, library)
-        if stage == "dev_h00":
-            path = self.root / "dev_reference.json"
-            reference = read(path)
-            reference.update(mode="reuse_measured_parent", tasks=len(rows),
-                             successes=sum(row["success"] for row in rows),
-                             output_tokens=sum(row["output_tokens"] for row in rows))
-            save(path, reference)
-        return rows
 
     def close_devices(self):
         devices = list(self.groups.values())

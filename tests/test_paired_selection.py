@@ -6,10 +6,9 @@ from threading import Event
 from unittest import TestCase
 from unittest.mock import Mock, patch
 
-from formal_run import read, save
-from jev_harness.cli import RESOURCES, initialize
+from jev_harness.artifacts import read, save
 from jev_harness.paired_selection import TWO_REPEATS_ONLY, accuracy_review, cost_review, first_fork, review_scores
-from phase1_run import review_versions, run
+from jev_harness.paired_selection import review_versions
 
 
 def generation(prompt, text):
@@ -54,60 +53,15 @@ class PairedSelectionTests(TestCase):
         costs = {"a":{"success":[1,1], "tokens":[15,7], "same_request_fork":"generation_2"},
                  "b":{"success":[1,1], "tokens":[3,4], "same_request_fork":None}}
         self.assertEqual(cost_review(costs, {}), ["a"])
-        repeated = {"a":[{"success":True,"output_tokens":4},{"success":True,"output_tokens":10}]}
-        self.assertEqual(review_scores(costs, repeated), [[2, -12.5], [2, -12.5]])
-        self.assertEqual(cost_review(costs, repeated), [])
-
-    def test_train_and_dev_use_repeats_once_and_resume_the_selected_version(self):
-        with TemporaryDirectory() as temp:
-            root = Path(temp)
-            config = read(RESOURCES/"experiment.json")
-            config["paired_selection_from_batch"] = 1
-            study = Mock(root=root, settings=config, functions=[])
-            def panel(tasks, stage, candidate):
-                rows = []
-                for i, t in enumerate(tasks):
-                    solved = i == 0 if candidate else i in (1,2)
-                    row = {"task_id":t, "seed":1, "success":solved, "output_tokens":10,
-                           "seconds":1,"model_calls":{}, "trace_path":f"runs/{stage}/{t}/attempt_1/trace.jsonl"}
-                    folder = root/"runs"/stage/t
-                    save(folder/"record.json", row)
-                    trace = root/row["trace_path"]
-                    trace.parent.mkdir()
-                    prompt = "changed" if candidate and i == 0 else "q"
-                    trace.write_text(json.dumps(generation(prompt, str(solved)))+"\n",encoding="utf-8")
-                    rows.append(row)
-                return rows
-            study.batch.side_effect = lambda tasks,stage,library: panel(tasks, stage, stage=="dev_b01r01")
-            study.candidate_batch.side_effect = lambda tasks,stage,lib,parents,old: (parents,panel(tasks,stage,True))
-            def repeat(study, tasks, stages, variants, libraries):
-                self.assertEqual(variants, {"A":"B","B":"B"})
-                self.assertEqual(len(tasks), 3)
-                return [[{"task_id":t, "seed":1, "success":arm=="B", "output_tokens":20,
-                          "gpu":"node:0", "trace_path":f"runs/{stages[arm]}/{t}/attempt_1/trace.jsonl"}
-                         for t in tasks] for arm in ("A","B")]
-            prop={"objects":[{"kind":"handoff","name":"default","value":{"skill":"Use the current values."}}]}
-            with patch("jev_harness.phase1_optimizer.propose_one", return_value=prop), patch("phase1_run.paired_rollouts",side_effect=repeat) as rerun:
-                run(study, 1, 1, True, evaluate_test=False)
-                result = read(root/"batches/b01/b01r01/result.json")
-                checkpoint = read(root/"checkpoints.json")[0]
-                self.assertTrue(result["accepted"])
-                self.assertEqual(result["candidate_metrics"]["successes"], 1)
-                self.assertEqual(result["paired_selection"]["candidate_score"][0], 2)
-                self.assertEqual(checkpoint["next_version"], "b01r01")
-                self.assertEqual(checkpoint["dev_selection"]["reference"][0], 1)
-                self.assertEqual(checkpoint["dev_selection"]["paired_selection"]["repeat_output_tokens"],120)
-                run(study, 1, 1, True, evaluate_test=False)
-                self.assertEqual(rerun.call_count,2)
 
     def test_two_pass_cost_scores_and_initially_identical_tasks(self):
         pairs = {"a":{"success":[1,1], "tokens":[15,7], "same_request_fork":"generation_1"},
                  "b":{"success":[1,1], "tokens":[3,4], "same_request_fork":None}}
-        self.assertEqual(cost_review(pairs, {}, TWO_REPEATS_ONLY), ["a"])
+        self.assertEqual(cost_review(pairs, {}), ["a"])
         repeats = {"a":[{"success":True,"output_tokens":4}, {"success":True,"output_tokens":10},
                         {"success":True,"output_tokens":8}, {"success":True,"output_tokens":2}]}
-        self.assertEqual(review_scores(pairs, repeats, TWO_REPEATS_ONLY), [[2,-9], [2,-10]])
-        self.assertEqual(cost_review(pairs, repeats, TWO_REPEATS_ONLY), [])
+        self.assertEqual(review_scores(pairs, repeats), [[2,-9], [2,-10]])
+        self.assertEqual(cost_review(pairs, repeats), [])
 
     def test_pending_dev_reuses_first_pass_reverses_arms_and_resumes_second_pass(self):
         with TemporaryDirectory() as temp:
@@ -200,17 +154,3 @@ class PairedSelectionTests(TestCase):
             for task, arms, gpu in (("slow", ["parent","candidate","candidate_2","parent_2"], "node:0"),
                                     ("fast", ["candidate","parent","parent_2","candidate_2"], "node:1")):
                 self.assertEqual(calls[task], [(f"c_review_{arm}", gpu) for arm in arms])
-
-    def test_new_run_default_and_explicit_scoring_cutover(self):
-        def config():
-            return dict(read(RESOURCES/"experiment.json"), paired_selection_from_batch=2)
-        with TemporaryDirectory() as temp:
-            root = Path(temp)
-            initialize(root, config())
-            self.assertEqual(read(root/"configuration.json")["confirmation_scoring"], TWO_REPEATS_ONLY)
-            save(root/"configuration.json", config())
-            initialize(root, config())
-            self.assertNotIn("confirmation_scoring", read(root/"configuration.json"))
-            initialize(root, config(), confirmation_scoring=TWO_REPEATS_ONLY)
-            initialize(root, config())
-            self.assertEqual(read(root/"configuration.json")["confirmation_scoring"], TWO_REPEATS_ONLY)

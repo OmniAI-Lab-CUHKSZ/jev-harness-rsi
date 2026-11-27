@@ -2,36 +2,23 @@
 
 from pathlib import Path
 
-from formal_run import final_report, read, save
-from phase1_run import design_manifest, paired_rollouts, review_versions
-from .composed_assembly import ComposedAssembly, initial_library as composed_library
-from .formal_v2 import include_retries
-from .metrics import aggregate
-from .native_assembly import PROTOCOL, blank_library
-from .native_pilot import NativeStudy
+from .allocation import SharedStudy
+from .artifacts import include_retries, read, save
+from .composed_assembly import initial_library
+from .metrics import aggregate, final_report
+from .native_assembly import blank_library
+from .protocol import PROTOCOL, design_manifest
 from .native_revision import DRAFT_REPLY_LIMIT, EditRound, TrainSample, revise
-from .paired_selection import TWO_REPEATS_ONLY
+from .paired_selection import TWO_REPEATS_ONLY, paired_rollouts, review_versions
 
 
-class FormalNativeStudy(NativeStudy):
-    def record_public_catalog(self, stage):
-        return not self.test_started and stage.startswith("b")
-
-
-def configuration(shared, *, composed=False):
+def configuration(shared):
     optimizer = {k: shared["optimizer"][k] for k in ("model", "reasoning_effort", "rounds", "max_objects")}
     optimizer["draft_reply_limit"] = DRAFT_REPLY_LIMIT
-    settings = {**{k: shared[k] for k in ("executor", "model_path", "seed", "execution")},
-                "protocol": PROTOCOL, "cuda_graph_from_start": True, "lanes_per_gpu": 2,
-                "train_sampling": "entry_harness_only", "optimizer": optimizer,
-                "confirmation_scoring": TWO_REPEATS_ONLY}
-    if composed:
-        settings["execution_arm"] = "composed_cards"
-    return settings
-
-
-def initial_library(composed):
-    return composed_library() if composed else blank_library()
+    return {**{k: shared[k] for k in ("executor", "model_path", "seed", "execution")},
+            "protocol": PROTOCOL, "cuda_graph_from_start": True, "lanes_per_gpu": 2,
+            "train_sampling": "entry_harness_only", "optimizer": optimizer,
+            "confirmation_scoring": TWO_REPEATS_ONLY}
 
 
 def measure(study, ids, stage, arm, library, reference=()):
@@ -97,9 +84,8 @@ def optimization_costs(root, reviews):
 
 def run_formal(study, manifest, through):
     root = study.root
-    composed = study.settings.get("execution_arm") == "composed_cards"
     h0_path = root / "versions/h00.json"
-    h0 = read(h0_path) if h0_path.is_file() else initial_library(composed)
+    h0 = read(h0_path) if h0_path.is_file() else initial_library()
     save(h0_path, h0)
     react_library = blank_library()
     save(root / "task_split.json", manifest)
@@ -141,7 +127,7 @@ def run_formal(study, manifest, through):
                        **train_samples(root, rows, library, "h0_decision")}
             current = EditRound(root / "offline" / name, library, samples, past_solved, name + "_",
                                 outcomes[-1] if outcomes else {})
-            child = revise(study, ids, current=current, composed=composed)
+            child = revise(study, ids, current=current)
             proposal = read(current.folder / "proposal.json")
             result = {"round": rnd, "parent": version, "reason": proposal.get("reason", ""),
                       "objects": [[edit["kind"], edit["name"]] for edit in proposal["objects"]]}
@@ -213,7 +199,6 @@ def run_formal(study, manifest, through):
 def configure(parser):
     parser.add_argument("--connections", required=True, type=Path)
     parser.add_argument("--root", required=True, type=Path)
-    parser.add_argument("--composed", action="store_true", help="Start from the composed card library")
     parser.add_argument("--max-gpus", type=int, choices=range(1, 7), default=6)
     parser.add_argument("--through", choices=("react-dev", "h0-dev", "train", "test"), default="test",
                         help="Finish the named stage, including preceding stages in order")
@@ -221,31 +206,20 @@ def configure(parser):
 
 def launch(args, shared, connections):
     root = args.root.resolve()
-    composed = getattr(args, "composed", False)
-    settings = configuration(shared, composed=composed)
+    settings = configuration(shared)
     model_args = next(iter(connections["model_nodes"].values()))["args"]
     settings["model_path"] = model_args[model_args.index("--model") + 1]
     path = root / "configuration.json"
-    if path.is_file():
-        previous = read(path)
-        if "train_sampling" not in previous and not any((root / "runs").glob("b[0-9][0-9]*")):
-            # Initial Dev scores have the same meaning under both Train sampling schedules.
-            previous["train_sampling"] = settings["train_sampling"]
-        if "optimizer" in previous:
-            previous["optimizer"].setdefault("draft_reply_limit", DRAFT_REPLY_LIMIT)
-        incompatible = previous != settings
-    else:
-        incompatible = (root / "runs").exists() or (root / "pilot_plan.json").exists()
-    if incompatible:
-        raise ValueError("Use a fresh output directory or resume the same native experiment")
+    if path.is_file() and read(path) != settings:
+        raise ValueError("Use a fresh output directory or resume the same composition experiment")
+    if not path.is_file() and (root / "runs").exists():
+        raise ValueError("Choose a fresh output directory for the composition experiment")
     save(path, settings)
-    study = FormalNativeStudy(root, settings, connections, max_gpus=args.max_gpus, lanes_per_gpu=2)
-    if composed:
-        study.compiled_executor = ComposedAssembly
+    study = SharedStudy(root, settings, connections, max_gpus=args.max_gpus, lanes_per_gpu=2)
     try:
         study.start_workers()
         study.paired_model_info()
-        run_formal(study, design_manifest(PROTOCOL), args.through)
+        run_formal(study, design_manifest(), args.through)
     except BaseException as exc:
         study.status("interrupted", reason=f"{type(exc).__name__}: {exc}")
         raise

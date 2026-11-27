@@ -10,8 +10,6 @@ import subprocess
 import threading
 import time
 
-from .formal_runtime import FormalExecutor
-from .runtime import parse_json
 from .transport import WorkerUnavailable
 
 
@@ -189,58 +187,3 @@ class SolAccount:
         spent = {**latest_usage, "seconds": time.perf_counter()-started}
         Path(folder, "usage.json").write_text(json.dumps(spent, indent=2), encoding="utf-8")
         return result
-
-    def json(self, prompt, folder):
-        thread = self.start(folder)
-        return parse_json(self.turn(thread, prompt, folder))
-
-
-class SolDemonstrator(FormalExecutor):
-    def __init__(self, session, environment, *, folder, **kwargs):
-        super().__init__(None, environment, **kwargs)
-        self.session = session
-        self.folder = Path(folder)
-
-    def execute_task(self, _):
-        thread = self.session.start(self.folder, "You write Python cells for the AppWorld experiment. "
-            "A separate experiment runner executes your returned cells in the isolated simulator. Do not use tools yourself.")
-        schema = {"type": "object", "properties": {"code": {"type": "string"}}, "required": ["code"], "additionalProperties": False}
-        rules = (
-            "Complete this simulated AppWorld task. Return JSON {\"code\": \"one Python cell\"}. Only the runner executes it. "
-            "Use public apis.<app>.<method>, no filesystem, internal database or task data access. Python variables persist. "
-            "Use loops and pagination when needed. Get credentials from apis.supervisor.show_account_passwords(), "
-            "use the current supervisor phone/email as appropriate and call the app's login. Print small relevant "
-            "observations; the runner returns stdout and errors in its next message. The password API returns a list "
-            "of rows with `account_name` and `password`; select by `account_name`. "
-            "Call apis.supervisor.complete_task(answer=...) once the task is done, with no answer for action tasks.\n")
-        view = json.dumps(self.generation_view(compact=True), ensure_ascii=False, default=str)
-        prompt = rules + view
-        for index in range(self.max_calls):
-            self.check_time()
-            if self.api_total >= self.api_budget:
-                break
-            self.requests += 1
-            turn_directory = self.folder/f"turn_{index+1:02d}"
-            remaining = int(self.deadline - time.monotonic())
-            if remaining <= 0:
-                break
-            text = self.session.turn(thread, prompt, turn_directory, timeout=min(remaining, 600), schema=schema)
-            usage = json.loads((turn_directory/"usage.json").read_text(encoding="utf-8"))
-            self.trace.add("offline_model", **usage)
-            try:
-                code = self.code_from(text)
-            except (TypeError, ValueError) as exc:
-                prompt = f"The previous response was invalid: {exc}. Respond with one JSON code cell."
-                continue
-            result = self.code(code, "sol_demonstration")
-            if self.done:
-                return
-            observation = str(result["output"])
-            prompt = f"Previous cell stdout/error:\n{observation[:11000]}\nRemaining API calls: {self.api_budget-self.api_total}. Continue the original task with one JSON code cell."
-
-    def summarize(self, task_id, label, seed, started, error, evaluation):
-        row = super().summarize(task_id, label, seed, started, error, evaluation)
-        row["optimizer"] = f"{self.session.model}/{self.session.effort}"
-        for key in ("inputTokens", "cachedInputTokens", "outputTokens", "reasoningOutputTokens"):
-            row[key] = sum(e.get(key, 0) for e in self.trace.events if e["event"] == "offline_model")
-        return row

@@ -5,280 +5,153 @@ from dataclasses import dataclass, field
 import json
 from pathlib import Path
 
-from formal_run import read, save
-from phase1_run import design_manifest
-from .formal_optimizer import cleaned_text, read_events
-from .native_assembly import FINISH, blank_library
+from .artifacts import cleaned_text, read, read_events, read_page, save, visible_event
+from .composition import declared_sources, output_fields, validate_card, validate_projection
+from .native_assembly import FINISH
 from .native_evidence import fragment_evidence
 from .policy_programs import load_program
-from .schema_tools import MANAGED, available, catalog, is_read
-from .train_evidence import read_page, visible_event
+from .protocol import design_manifest
+from .schema_tools import available, catalog, is_read
 
 
 DRAFT_REPLY_LIMIT = 12
 
 
-EDITOR = """Improve this shared AppWorld harness for the fixed 27B. Preserve or raise whole-task success, then
-reduce online output including reasoning. Only official Train trajectories have been opened. Start with the
-current parent harness's own runs. Follow Jev choices and abstentions, local generation, public tool calls and
-receipts. On failed tasks, locate the first step where the action, bound values or result leave the user's goal
-unmet. On successful tasks, identify costly generated work that public data and a reusable decision could cover.
-When a prior round measured two harness versions on the same Train task, compare their first actionable
-difference and follow it through the tool results.
-Use fragment_flow to follow eligible -> recommended on an action page -> offered to Jev (including browsing)
--> chosen -> produced -> arguments of an accepted write or answer. An eligible fragment may have zero recommendations.
-An API receipt confirms acceptance. Inspect the submitted payload against source evidence even on official passes.
-If a skipped fragment was evaluated offline, its output comparison is a diagnostic, not an executed action or ground truth.
-Distinguish direct field projection, upstream data, a program input, a scope, and an unreferenced generated literal.
-For a partial update identify the target and actual change. Ground entity roles in the available public fields.
-Check whether a different wording with the same goal and sources would still reach the proposed operation.
-In the parent traces, G_tool generates a local action when the action menu leaves work uncovered. G_binding
-supplies missing arguments after an endpoint has been selected. A handoff cue reaches only that endpoint's
-G_binding. Use the recorded request purpose to locate the component to edit. Preserve filter/aggregation order and match the population
-used by a superlative; checking a selected record's status may require a wider source than prefiltering it.
-Prefer a public API's existing filters. Compile a repeated or expensive open step into a middle operation
-usable for another downstream goal. Match public sources, distinguish actor/direction/scope, and never
-embed a task ID, person, answer, specific amount or a whole-task sequence. A write needs explicit selection.
-Consider all six locations and modify only the ones supported by evidence. A binding/fragment is a possible
-choice for Jev, never an automatic write. Current and past solved Train cases matter. No model weights change.
-Return either {"read":{"doc":"stage/task","start":0,"count":6,"offset":0}} or one JSON proposal
-{"reason":"evidence and expected behavior","objects":[{"kind":"fragment","name":"...","value":...}]}.
-Use at most three distinct named changes. Use [] only when a justified no-change is best.
-For kind retrieval, decision or handoff: name = exact public tool name, value = a short string. Retrieval
-adds search words; decision adds a cue only next to that option; handoff guides only that tool's local generation.
-For fragment/state: give a new identifier. For binding: use the receiving official tool's exact name.
-For these three kinds value={"sources":["upstream public tool or installed fragment name"],"label":"clear meaning",
-"program":"body of a pure Python function receiving state"}. state contains instruction, datetime, source, scope,
-complete, rows (list, with nested real fields). A fragment returns selected records or a scalar as a NEW observation,
-a binding returns a list of official kwargs tied to the SAME row per call, a state rule returns compact evidence.
-For a cross-source fragment or binding, add "inputs":["another public source"] to its definition. The runtime
-offers combinations only after both inputs were observed. state["inputs"][that source] contains rows, ref, scope
-and complete. The built-in observation sources "calculation" and "inspection" can also be used.
-A fragment can set "goal_terms":["one goal cue","another wording"]. Each phrase is an alternative;
-use short, distinctive words for the user's goal, including paraphrases supported by Train evidence. The
-action page may recommend zero fragments. Sources alone do not establish relevance. Without this field
-the runtime uses the label. All eligible fragments remain reachable by browsing.
-A fragment may declare "choices":{"request":{"source":"one of its declared sources","fields":["public.field"],
-"question":"Which observed request does the user mean?"},"target":{...}}. Compute direct bindings first. At each
-ambiguity return {"$choose":{"role":"request","rows":[0,3]}} with 1-15 distinct zero-based row indices in that
-role's source. The pure program resumes with state["selections"] (ordered role,source,ref,row,value records)
-and state["selected"] (last bound source,ref,row,value). On the initial call use state.get("selections",[]).
-Return a result, None for missing evidence, or a further ballot as needed. A dependent ballot can add
-"using":{"request":3} inside "$choose" to show that observed row's declared fields, whether code or Jev found
-the row. Keep questions neutral. Use a previous result to narrow the rows before asking. The same role can recur
-with different candidates or reference evidence. Repeating an answered question without new evidence stops
-the fragment. All ballots share the task's normal model and token budgets. NONE leaves the fragment unresolved.
-The earlier single "choice":{source,fields,question} with {"$choose":[indices]} is also supported.
-Return None when unsupported; handle ambiguity, empty inputs and ties. No imports/external calls. Builtins allowed:
-len any all sorted min max sum enumerate zip str int float list dict set isinstance regex captures. regex checks
-case-insensitive match, captures returns findall. Allowed methods: get keys items values startswith endswith lower
-casefold strip split replace join append extend add count. For sorting use tuples or sorted values (no lambda).
-Match each option's wording to its actual effect and check the menus and generation requests that your change
-could reach on other tasks. Prefer the smallest change supported by this panel. Can request full events."""
+EDITOR = """Improve the shared AppWorld harness for the fixed 27B. First preserve or improve whole-task success;
+then reduce online output tokens, including reasoning. You have only official Train evidence. Use the parent
+runs first. Trace the first wrong choice, binding, computation or uncovered action on failed tasks. On successful
+tasks, look for repeated or expensive generated work that the program can assemble from official tools. Use the
+previous round's matched Train results when present. Past Train traces are available through the evidence index.
 
+Follow fragment_flow from eligibility and recommendation to actual selection, output and accepted uses. Inspect
+public inputs and exact accepted payloads, even on a pass. An accepted write only confirms what the API accepted.
+Distinguish a directly bound field, an upstream dependency and a generated literal. Preserve the requested
+population, ordering, range and object identity. Prefer native API filters. Factor out a computation that can take
+different sources and feed different later operations. Do not copy a task ID, person, answer, specific amount, or
+whole-task recipe. Check which other tasks could see your new menu or guidance. A write always needs Jev selection.
 
-COMPOSED_EDITOR = """
-These runs use composed cards. G_binding can still fill a selected API's missing fields. G is a stateful
-Python fallback for uncovered work. The code already has compiled['observations'][ref] and compiled['receipts'].
-Use the native_residual, tool_batch, and api_action events to locate which read, join, arithmetic or write collection
-generation attempted. Direct official tool calls share the card runtime's authentication, validation, pagination
-and receipts. Keep the concrete task's data out of the patch.
+Use the exact key under "Train evidence" as the doc name in {"read":{"doc":"stage/task","start":0,"count":6,
+"offset":0}}. Use doc=index to list available document names or doc=tool/<exact endpoint> for a signature.
+The draft has twelve replies, including reads. Reserve the final reply for a complete proposal. Submit {"reason":"evidence and expected behavior",
+"objects":[{"kind":"fragment","name":"identifier","value":{...}}]}. Change at most three distinct named items.
+Use a justified empty list if no change is supported. An existing item can be deleted with value:null.
 
-A fragment is an independently reusable data operation. Use optional "produces":{"field":"integer"}
-with JSON types to declare the output row fields. The identifier is the downstream source. A fragment may add
-"reads":{"app__public_read":"pure planner code returning a list of keyword objects"} for a declared
-primary source or companion in inputs. Materialization proceeds in that order, only after Jev selects the
-card. The program checks known read arguments before offering a card and checks dependent reads again after
-their upstream data arrives. A read can instead use {"source":"a previously loaded fragment","fields":
-{"api_parameter":"declared_output_field"}} to project one argument set from every record. This is useful
-for hydrating IDs already produced by a card. The pure read planner can see the full task text, datetime and previously loaded inputs; the first read
-must be plannable from the task itself. For acquired reads return [{}] for public defaults, or None when
-the goal leaves the scope ambiguous. The runtime supplies authentication and reads all pages when pagination
-is omitted. When choosing a set, use public date filters and join stable identity fields instead of text
-matching names. first_calendar_day(state["datetime"], n) gives the start of the last n calendar days including today.
-The pure card receives observed rows after those reads. A public read with multiple argument objects yields
-one result per argument. For a whole group use each correctly scoped row exactly once. Read observations have
-an "arguments" list containing the actual public argument objects, both at state["arguments"] for the primary
-source and within state["inputs"][source] for companion reads. Check scope against these structured arguments.
-The "scope" string is only a display label.
+Consider all six components:
+- retrieval: a short search cue for an endpoint or installed card. Use distinctive source and goal words.
+- decision: a short instruction next to an endpoint or card, or name="action" for the action ballot.
+- binding: name an official endpoint. Give label, sources, and either a pure program returning a list of public
+  kwargs or fields mapping required API parameters to typed output fields. Set covers:true for a complete
+  binding. Optional inputs name companion observations. Use sources:[] for a task-only argument program.
+  Set projections are grounded in complete observed rows; Jev still selects the operation and applicable set.
+- fragment: a reusable composition card described below.
+- state: label, sources and pure program for compact public evidence. An intent rule uses intent:true and
+  sources:[], and returns requested write endpoints based on state["goal"]. Actual writes require receipts.
+- handoff: short guidance for local generation at an endpoint or card. name="residual" addresses uncovered
+  work. G_binding fills missing arguments; residual Python can use compiled['observations'] and receipts.
+  Use model request purposes, native_residual, tool_batch and api_action events to locate the right edit.
 
-The binding rule for a public tool may use "sources":[] when it only needs task literals. Add "covers":true
-when the rule yields a deterministically grounded, complete binding for the proposed action, returning None
-otherwise. For a complete typed object set, the binding can use "fields":{"api_parameter":"declared_output_field"}
-in place of "program". The runtime validates the values, deduplicates argument sets and executes the batch
-after Jev selects the effect. If different observed sets can supply the same operation, Jev chooses which
-set to use. When a task clearly requires this effect, an intent rule should name the endpoint so the menu
-waits for its complete projected scope. Its effect and scope are shown before Jev authorizes the write. A matched contact or a write receipt
-alone is insufficient for all-of scope. Multiple requested actions should reuse the same selected cohort.
-A state rule with "intent":true and "sources":[] can return a list of remaining write endpoint requirements from
-the unquoted goal in state["goal"]. Endpoint success is tracked by actual receipts. Use this to prevent premature
-completion when the user clearly requests multiple effects. Update "decision"/"action" to guide the action
-ballot, or a tool-specific cue to clarify that tool only. "handoff"/"residual" applies when remaining work must
-run in Python; tool-specific handoff cues are selected by the unresolved operation. Do not accumulate multiple
-ways to do the same work. Reuse a card when its public inputs and output already fit.
+Every fragment uses {label, program, composition, optional goal_terms}. goal_terms are alternative short phrases
+grounded in the public task. A page may recommend zero cards. composition.inputs is an ordered mapping of
+named ports. A port has {"sources":[{"source":"public_endpoint_or_card"}]} to use a complete observation.
+You can add "read" to a public read alternative to acquire it after selection. Use public argument objects,
+a pure planner returning the list of keyword objects, or {"input":"earlier_port","fields":{"api_parameter":
+"card_field"}} to hydrate every row from a typed earlier input. Use [{}] for a public default, and None for an unsupported
+scope. The runtime validates the known arguments, provides authentication and paginates. Multiple argument
+objects produce one result per argument. Do not infer scope from the display label.
 
-Separate the input acquisition, calculation and consumption you see in Train. For a contact-based record
-filter, submit one fragment with "label", "program", and
-"composition":{"inputs":{"rows":"counterparty_records","people":"contact_identities"},"output":"matching_records"}.
-The program receives state["rows"], state["people"], state["record_key"] and state["people_key"]. Each key
-is a list of field names to traverse. Return the original matching rows with every field intact. A verified
-empty set is an empty list; return None when the data cannot support the filter. The runtime supplies the
-official read, requested directions, relationship groups, dates and consumer. This format has no task
-instruction or API endpoint in its program inputs. The same rows can supply a total or an official write.
-When a legacy fragment already computes the exact same selection, its name can go in the optional
-composition "equivalent" list. The runtime suppresses a duplicate only for the same reads and effects.
-Give the calculation a label reusable across different consumers. A retrieval, decision or handoff cue
-named for the fragment applies locally. For computations with other input roles, use the scoped card,
-binding or state interfaces described above.
+The pure card and read planners see state["inputs"][port] with rows, source, ref, scope, complete and actual
+public arguments as inputs become available, plus instruction, goal and datetime. Output must declare
+{"fields":{"field":"integer"}} for typed records, {"value":"number"} for a scalar answer or
+{"subset":"port"} for original rows. A subset may also declare fields. Return None when the evidence is
+insufficient. Output fields make the result available by card identifier to downstream ports and bindings.
+
+Use composition.choices only when a pure binding cannot resolve an observed record. Each named
+question has {"input":"port","fields":["public.field"],"question":"Which observed record matches?"}.
+Return {"$choose":{"role":"request","rows":[0,3]}} with up to 15 distinct indices into that port.
+The program resumes with state["selected"] and state["selections"] containing source, ref, row, value
+and role. It can ask again if a new ambiguity remains. For a dependent question, add
+"using":{"request":3} to show the referenced public row. Do not repeat an answered question with the
+same rows and reference evidence. NONE leaves the card unresolved. All choices share the task budget.
+
+A contact-based filter can use independent input roles:
+"composition":{"inputs":{"rows":{"role":"counterparty_records"},"people":{"role":"contact_identities"}},
+"output":{"subset":"rows"}}. The runtime finds the official record direction and contact group, validates
+the scope and exposes compatible write or aggregation choices. The program receives each named input's
+rows and the field paths state["record_key"] and state["people_key"]. It returns the original matching
+records with all fields intact. Keep task text, APIs and consumer selection out of the filter calculation.
+An optional composition.equivalent list names existing cards with the same computation. The runtime
+merges offers only when the concrete reads and the requested write effects agree.
+
+Pure programs have no imports or external calls. Read actual fields, handle empty sets and ambiguous
+values, and keep whole-set operations complete. Supported helpers include regex, captures, sorted,
+enumerate, zip, sum and first_calendar_day(state["datetime"], n). Use the smallest evidence-backed edit.
 """
 
 
-def validate_projection(fields, tool, sources, fragments):
-    schema = tool["parameters"]
-    if (
-        not isinstance(fields, dict) or not fields
-        or not all(isinstance(field, str) and field for field in fields.values())
-        or fields.keys() - (schema["properties"].keys() - MANAGED)
-        or (set(schema.get("required", [])) - MANAGED) - fields.keys()
-    ):
-        raise ValueError("A projection must supply the official tool's required public arguments")
-    if not sources or any(set(fields.values()) - fragments.get(source, {}).get("produces", {}).keys()
-                          for source in sources):
-        raise ValueError("A projection requires fields declared by each source fragment")
-
-
-def apply_edits(parent, proposal, tools, *, composed=False):
+def apply_edits(parent, proposal, tools):
     objects = proposal.get("objects")
     if not isinstance(objects, list) or len(objects) > 3:
         raise ValueError("A patch can change up to three named items")
     lib = deepcopy(parent)
     touched = set()
-    dynamic_names = {name for name, spec in lib["fragment"].items() if "dynamic" in spec or "composition" in spec}
-    if composed:
-        dynamic_names.update(edit["name"] for edit in objects if edit.get("kind") == "fragment"
-                             and isinstance(edit.get("value"), dict) and
-                             {"dynamic", "composition"} & edit["value"].keys())
     for edit in objects:
         kind, name, value = edit["kind"], edit["name"], edit["value"]
         if kind not in lib or not isinstance(name, str) or not name.isidentifier() or (kind, name) in touched:
             raise ValueError("Unknown, duplicate or invalid component")
         touched.add((kind, name))
-        special = composed and ((kind, name) in {("decision", "action"), ("handoff", "residual")}
-                                or (name in dynamic_names and kind in {"retrieval", "decision", "handoff"}))
-        if kind in {"retrieval", "decision", "binding", "handoff"} and not special and (
-            name not in tools or not (available(name) or name == FINISH)
-        ):
-            raise ValueError("This edit needs a published endpoint")
         if value is None and name in lib[kind]:
             del lib[kind][name]
+        else:
+            lib[kind][name] = value
+
+    cues = {"retrieval", "decision", "handoff"}
+    for kind, name in touched:
+        if name not in lib[kind]:
             continue
-        if kind in {"retrieval", "decision", "handoff"}:
+        value = lib[kind][name]
+        special = (kind, name) in {("decision", "action"), ("handoff", "residual")}
+        if kind in cues:
+            if not (special or name in lib["fragment"] or name in tools and (available(name) or name == FINISH)):
+                raise ValueError("A cue must name a published endpoint or installed card")
             if not isinstance(value, str) or not value.strip():
                 raise ValueError("Expected a short textual cue")
-        else:
-            composition = composed and kind == "fragment" and isinstance(value, dict) and "composition" in value
-            if composition:
-                value = {"sources": [], **value}
-            fields = {"sources", "label"}
-            optional = {"inputs"} if kind in ("fragment", "binding") else set()
-            if kind == "fragment":
-                optional.update(("choice", "choices", "goal_terms"))
-            if composed:
-                optional.update({
-                    "fragment": {"reads", "produces", "dynamic", "composition"},
-                    "binding": {"covers", "fields"},
-                    "state": {"intent"},
-                }.get(kind, set()))
-            if (
-                not isinstance(value, dict)
-                or not fields <= value.keys()
-                or value.keys() - fields - optional - {"program"}
-                or not isinstance(value["sources"], list)
-                or (not value["sources"] and not (composition or composed and (kind == "binding" or value.get("intent"))))
-            ):
-                raise ValueError("A program needs sources, label and program")
-            if not isinstance(value["label"], str) or not value["label"].strip():
-                raise ValueError("A program needs a useful choice label")
-            if "covers" in value and type(value["covers"]) is not bool:
-                raise ValueError("covers must be a boolean")
-            if "intent" in value and (value["intent"] is not True or value["sources"]):
-                raise ValueError("An intent rule runs before tool observations and has empty sources")
-            if ("program" in value) == ("fields" in value):
-                raise ValueError("Use a pure program or a field projection")
-            if "program" in value:
-                load_program(value["program"])
-        lib[kind][name] = value
-    sources = set(tools) | set(lib["fragment"]) | {"calculation", "inspection"}
-    for group in ("fragment", "binding", "state"):
-        for name, spec in lib[group].items():
-            companions = spec.get("inputs", [])
+
+    for card in lib["fragment"].values():
+        validate_card(card, tools, lib["fragment"])
+    known = tools.keys() | lib["fragment"].keys() | {"calculation", "inspection"}
+    for kind in ("binding", "state"):
+        for name, spec in lib[kind].items():
+            required = {"sources", "label"}
+            optional = {"inputs", "covers", "fields"} if kind == "binding" else {"intent"}
+            if (not isinstance(spec, dict) or not required <= spec.keys()
+                    or spec.keys() - required - optional - {"program"}
+                    or not isinstance(spec["label"], str) or not spec["label"].strip()
+                    or not isinstance(spec["sources"], list)):
+                raise ValueError("A binding or state rule needs public sources and a useful label")
+            sources, companions = spec["sources"], spec.get("inputs", [])
             if not isinstance(companions, list) or any(
-                not isinstance(s, str) or s not in sources for s in [*spec["sources"], *companions]
+                not isinstance(source, str) or source not in known for source in [*sources, *companions]
             ):
                 raise ValueError("Unknown input source in proposed harness")
-            if len(set(companions)) != len(companions) or set(companions) & set(spec["sources"]):
+            if len(set(companions)) != len(companions) or set(companions) & set(sources):
                 raise ValueError("Use distinct public sources for a joint operation")
-            if group == "binding" and "fields" in spec:
-                if not spec.get("covers") or companions or name not in tools or is_read(name) or name == FINISH:
+            if "intent" in spec and (spec["intent"] is not True or sources):
+                raise ValueError("An intent rule runs before tool observations and has empty sources")
+            if kind == "state" and not (sources or spec.get("intent")):
+                raise ValueError("A state rule needs observations or intent")
+            if kind == "binding" and (name not in tools or not (available(name) or name == FINISH)):
+                raise ValueError("Bind a published endpoint")
+            if "covers" in spec and type(spec["covers"]) is not bool:
+                raise ValueError("covers must be a boolean")
+            if ("program" in spec) == ("fields" in spec):
+                raise ValueError("Use a pure program or a field projection")
+            if "program" in spec:
+                load_program(spec["program"])
+            else:
+                if not spec.get("covers") or not sources or companions or is_read(name) or name == FINISH:
                     raise ValueError("A write projection needs a complete source and a public write endpoint")
-                validate_projection(spec["fields"], tools[name], spec["sources"], lib["fragment"])
-            if group != "fragment":
-                continue
-            if "composition" in spec:
-                from .record_composition import validate_record_composition
-
-                validate_record_composition(spec)
-            elif "dynamic" in spec:
-                from .dynamic_cards import validate_dynamic
-
-                validate_dynamic(spec, tools)
-            if "reads" in spec:
-                if not isinstance(spec["reads"], dict):
-                    raise ValueError("Card reads map public endpoints to pure planners")
-                for endpoint, body in spec["reads"].items():
-                    if (endpoint not in [*spec["sources"], *companions] or endpoint not in tools
-                            or not available(endpoint) or not is_read(endpoint)):
-                        raise ValueError("Card acquisition must use a declared public read source")
-                    if isinstance(body, dict):
-                        before = [
-                            [primary, *companions[:companions.index(endpoint)]]
-                            for primary in spec["sources"]
-                        ] if endpoint in companions else []
-                        if (
-                            body.keys() != {"source", "fields"} or not before
-                            or any(body["source"] not in path for path in before)
-                        ):
-                            raise ValueError("A read projection needs a fragment in an earlier input position")
-                        validate_projection(body["fields"], tools[endpoint], [body["source"]], lib["fragment"])
-                    else:
-                        load_program(body)
-            if "produces" in spec and (
-                not isinstance(spec["produces"], dict) or not spec["produces"]
-                or not all(isinstance(field, str) and field.strip() and kind in
-                           ("integer", "number", "string", "object", "array", "boolean")
-                           for field, kind in spec["produces"].items())
-            ):
-                raise ValueError("Card produces must map public field paths to JSON types")
-            if "goal_terms" in spec and (
-                not isinstance(spec["goal_terms"], list) or not spec["goal_terms"]
-                or not all(isinstance(term, str) and term.strip() for term in spec["goal_terms"])
-            ):
-                raise ValueError("Fragment goal_terms must be a nonempty list of goal phrases")
-            slots = spec.get("choices", {})
-            if "choices" in spec and (
-                "choice" in spec or not isinstance(slots, dict) or not slots
-                or not all(isinstance(role, str) and role.isidentifier() for role in slots)
-            ):
-                raise ValueError("Use either one choice or a mapping of named choice roles")
-            for slot in ([spec["choice"]] if "choice" in spec else slots.values()):
-                if (
-                    not isinstance(slot, dict) or slot.keys() != {"source", "fields", "question"}
-                    or slot["source"] not in [*spec["sources"], *companions]
-                    or not isinstance(slot["question"], str) or not slot["question"].strip()
-                    or not isinstance(slot["fields"], list) or not slot["fields"]
-                    or not all(isinstance(f, str) and f.strip() for f in slot["fields"])
-                ):
-                    raise ValueError("A fragment choice needs one of its sources, public field paths and a question")
+                for source in sources:
+                    validate_projection(spec["fields"], tools[name], output_fields(lib["fragment"].get(source, {})))
     return lib
 
 
@@ -297,33 +170,6 @@ class EditRound:
     solved: dict
     stage_prefix: str = ""
     previous_round: dict = field(default_factory=dict)
-
-
-def pilot_round(root, train, history, *, entry_only=False):
-    folder = root / "offline"
-    parent = read(root / "entry_harness.json")
-    samples, solved = {}, {}
-
-    def add(directory, stage, task, library, prefix=""):
-        row = read(directory / "runs" / stage / task / "record.json")
-        sample = TrainSample(directory / row["trace_path"], row, library)
-        samples[f"{prefix}{stage}/{task}"] = sample
-        return sample
-
-    for task in train:
-        if not entry_only:
-            add(root, "h0_generation", task, blank_library())
-        add(root, "h0_decision", task, parent)
-    for i, directory in enumerate(history):
-        plan = read(directory / "pilot_plan.json")
-        for task in plan["train"]:
-            for stage, path in (("h0_decision", "entry_harness.json"), ("candidate", "offline/candidate.json")):
-                record = directory / "runs" / stage / task / "record.json"
-                if record.is_file():
-                    sample = add(directory, stage, task, read(directory / path), f"history{i}/")
-                    if sample.row["success"]:
-                        solved[task] = (sample.trace, directory / "offline/public_functions.json", plan["execution"])
-    return EditRound(folder, parent, samples, solved)
 
 
 def evidence(samples):
@@ -362,7 +208,8 @@ def evidence(samples):
                 chosen = e["candidates"][e["selected"]]["label"]
                 steps.append([i, e["node"], chosen[:175]])
             if kind in ("native_operation", "native_feedback", "native_observation", "native_discovery",
-                        "native_card", "native_goal_progress", "native_residual", "native_residual_reentry"):
+                        "native_card", "native_card_exit", "native_goal_progress", "native_residual",
+                        "native_residual_reentry"):
                 detail = next((e[k] for k in ("tool", "source", "reason", "query", "name", "completed")
                                if k in e), None)
                 steps.append([i, kind, detail, e.get("count", e.get("remaining"))])
@@ -381,10 +228,16 @@ def evidence(samples):
 
 
 def evidence_page(docs, req):
-    content = docs[req["doc"]]
+    name = req["doc"]
+    if name == "index":
+        content = sorted(docs)
+    elif name in docs:
+        content = docs[name]
+    else:
+        raise ValueError(f"Unknown document {name!r}. Use doc=index or copy an exact Train evidence key.")
     if isinstance(content, Path):
         content = [cleaned_text(json.dumps(visible_event(e), ensure_ascii=False)) for e in read_events(content)]
-    return read_page(content, req.get("start", 0), req.get("count", 6), req.get("offset", 0))
+    return {"doc": name, **read_page(content, req.get("start", 0), req.get("count", 6), req.get("offset", 0))}
 
 
 def trial_task(train, impact, panel, parent, lib):
@@ -401,10 +254,13 @@ def trial_task(train, impact, panel, parent, lib):
         touched = 0
         for group, name in changed:
             obj = lib[group].get(name) or parent[group].get(name)
-            if isinstance(obj, dict):
-                touched += int(
-                    bool(set(obj.get("sources", [])) & seen) and set(obj.get("inputs", [])) <= seen
-                )
+            if group == "fragment":
+                ports = obj["composition"]["inputs"].values()
+                supported = all(any("read" in source or source["source"] in seen
+                                    for source in port.get("sources", ())) for port in ports)
+                touched += int(supported and bool(declared_sources(obj) & seen))
+            elif isinstance(obj, dict):
+                touched += int(bool(set(obj.get("sources", [])) & seen) and set(obj.get("inputs", [])) <= seen)
             else:
                 touched += int(name in seen)
         different = impact[task]["status"] not in {"unchanged", "unresolved"}
@@ -441,8 +297,7 @@ def full_train_trial(study, task, lib, current):
     }
 
 
-def revise(study, train, history=(), *, current=None, composed=False):
-    current = current or pilot_round(study.root, train, history)
+def revise(study, train, *, current):
     folder = current.folder
     candidate = folder / "candidate.json"
     if candidate.is_file():
@@ -452,46 +307,28 @@ def revise(study, train, history=(), *, current=None, composed=False):
     parent = current.parent
     account = study.solver()
     (folder / "sol").mkdir(parents=True, exist_ok=True)
-    instructions = EDITOR + (COMPOSED_EDITOR if composed else "")
-    (folder / "sol/system.txt").write_text(instructions, encoding="utf-8")
-    thread = account.start(folder / "sol", instructions)
-    roles = {"h0_decision": "This round's parent harness, including its Jev choices and local generation."}
-    if any(label.startswith("h0_generation/") for label in panel):
-        roles["h0_generation"] = "Pilot comparison that generates each action. Use it to identify work to compile into the harness."
-    reuse = {}
-    if composed and study.settings.get("calculation_reuse_evidence", False):
-        from .calculation_evidence import related_calculations
-
-        comparisons = related_calculations(current.samples, train)
-        save(folder / "calculation_evidence.json", comparisons)
-        reuse = {"Cross-task calculation evidence": {
-            "comparisons": comparisons,
-            "use": "Verify the shared computation, the task-specific inputs and scope, and the result fields that "
-                   "may support another consumer. The matching fields only locate related evidence. Check the "
-                   "indexed events when a code inference or tool effect is uncertain. Extend an existing card "
-                   "when it fits. When there is no historical match, use the current observed evidence.",
-        }}
+    (folder / "sol/system.txt").write_text(EDITOR, encoding="utf-8")
+    thread = account.start(folder / "sol", EDITOR)
     prompt = json.dumps(
         {
             "current_library": parent,
             "Train evidence": panel,
-            **reuse,
-            "trace roles": roles,
+            "trace roles": {"h0_decision": "This round's parent harness, including its Jev choices and generation."},
             "previous round on this batch": current.previous_round,
-            "catalogue": (
-                "Request doc=tool/<exact endpoint name> for one public signature, or doc=tools to browse."
-                if composed else "Request doc=tools to inspect official signatures"
-            ),
+            "documents": "Use doc=index or copy an exact Train evidence key. Use doc=tool/<endpoint> or doc=tools.",
         },
         ensure_ascii=False,
     )
     docs["tools"] = [json.dumps(t, ensure_ascii=False) for t in tools.values()]
-    if composed:
-        docs.update({f"tool/{name}": [json.dumps(tool, ensure_ascii=False)] for name, tool in tools.items()})
+    docs.update({f"tool/{name}": [json.dumps(tool, ensure_ascii=False)] for name, tool in tools.items()})
     for turn in range(1, DRAFT_REPLY_LIMIT + 1):
         final_draft_turn = turn == DRAFT_REPLY_LIMIT
         if final_draft_turn:
             prompt += "\nFinal response: submit a proposal now using the verified evidence."
+        elif turn > 1 and prompt.startswith("{"):
+            response = json.loads(prompt)
+            response["draft_replies_remaining"] = DRAFT_REPLY_LIMIT - turn + 1
+            prompt = json.dumps(response, ensure_ascii=False)
         answer = account.turn(thread, prompt, folder / "sol" / f"turn_{turn}")
         try:
             from .runtime import parse_json
@@ -502,7 +339,7 @@ def revise(study, train, history=(), *, current=None, composed=False):
                 response = evidence_page(docs, req)
                 prompt = json.dumps(response, ensure_ascii=False)
                 continue
-            lib = apply_edits(parent, proposal, tools, composed=composed)
+            lib = apply_edits(parent, proposal, tools)
         except (ValueError, TypeError, KeyError, AttributeError) as exc:
             prompt = f"Could not apply this response: {exc}. Return corrected JSON."
             continue
@@ -513,17 +350,15 @@ def revise(study, train, history=(), *, current=None, composed=False):
             impact = {}
             used_current = False
             checks_used = 0
-            runtime = {"executor_type": study.compiled_executor, "continue_after_choice": True} if composed else {}
             for task in train:
                 events = read_events(current.samples["h0_decision/" + task].trace)
-                result = first_change(events, lib, list(tools.values()), study.execution, **runtime)
+                result = first_change(events, lib, list(tools.values()), study.execution)
                 solved = current.samples["h0_decision/" + task].row["success"]
-                check_solved = composed and solved and checks_used < 24
-                if (check_solved or not used_current) and result["status"] == "needs_real_choice":
+                check_solved = solved and checks_used < 24
+                if (check_solved or not solved and not used_current) and result["status"] == "needs_real_choice":
                     study.start_workers()
                     result = first_change(
                         events, lib, list(tools.values()), study.execution, study.workers[0].worker("model"),
-                        **runtime,
                     )
                     if check_solved:
                         checks_used += 1
@@ -534,7 +369,7 @@ def revise(study, train, history=(), *, current=None, composed=False):
                 "draft": proposal,
                 "current_train": impact,
                 "previously_solved_train": solved_preview(
-                    study, lib, current.solved, **({"budget": 24 - checks_used, **runtime} if composed else {})
+                    study, lib, current.solved, budget=24 - checks_used
                 ),
             }
             task = trial_task(train, impact, panel, parent, lib)
@@ -570,7 +405,7 @@ def revise(study, train, history=(), *, current=None, composed=False):
                             folder / "sol" / "review_final",
                         )
                     )
-                lib = apply_edits(parent, reviewed, tools, composed=composed)
+                lib = apply_edits(parent, reviewed, tools)
                 proposal = reviewed
             except (ValueError, TypeError, KeyError, AttributeError) as exc:
                 save(folder / "review_error.json", {"error": str(exc), "used": "last valid draft"})

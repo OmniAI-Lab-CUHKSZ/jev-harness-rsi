@@ -2,8 +2,46 @@
 from datetime import datetime, timezone
 from threading import Lock
 
-from formal_run import ExecutionWorkers, save
+from .artifacts import save
 from .transport import Worker, WorkerError, WorkerUnavailable
+
+
+class ExecutionWorkers:
+    """One model copy and one simulator, used by one task at a time."""
+
+    def __init__(self, root, connections, gpu):
+        self.root = root
+        self.connections = dict(connections)
+        self.gpu = gpu
+        self.workers = {}
+        if gpu is not None:
+            node, separator, device = gpu.rpartition(":")
+            model = dict(connections["model_nodes"][node] if separator else connections["model"])
+            args = list(model.get("args", ()))
+            if "--gpu" in args:
+                args[args.index("--gpu")+1] = device
+            else:
+                args.extend(["--gpu", device])
+            self.connections["model"] = {**model, "args": args}
+            self.decode_mode = "cuda_graph" if "--cuda-graph" in args else "eager"
+
+    def worker(self, name):
+        if name not in self.workers:
+            suffix = f".gpu_{self.gpu.replace(':', '_')}" if self.gpu is not None else ""
+            self.workers[name] = Worker(self.connections[name], self.root/f"{name}{suffix}.stderr.log")
+        return self.workers[name]
+
+    def close_worker(self, name):
+        worker = self.workers.pop(name, None)
+        if worker:
+            try:
+                worker.close()
+            except (WorkerUnavailable, WorkerError, OSError):
+                pass
+
+    def close(self):
+        for name in list(self.workers):
+            self.close_worker(name)
 
 
 class DeviceWorkers:

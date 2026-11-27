@@ -1,9 +1,8 @@
 """Follow actually offered fragments through public observations to accepted effects."""
 
 import json
-import re
 
-from .native_assembly import requests_fragment_choice, run_program
+from .composition import PROGRAM_ERRORS, run_card, validate_output
 from .schema_tools import FINISH, Observation, is_read, public_value
 
 
@@ -14,9 +13,7 @@ def _brief(value, limit=185):
 
 
 def _fragment(choice):
-    return isinstance(choice, (list, tuple)) and (
-        len(choice) >= 3 and choice[0] == "fragment" or len(choice) == 2 and choice[0] == "dynamic"
-    )
+    return isinstance(choice, (list, tuple)) and len(choice) >= 2 and choice[0] == "fragment"
 
 
 def fragment_evidence(events, library):
@@ -127,26 +124,22 @@ def fragment_evidence(events, library):
                     continue
                 op = (name, refs)
                 if op not in comparable:
+                    card = definitions[name]
+                    spec = card["composition"]
+                    if len(spec["inputs"]) != len(refs):
+                        continue
+                    loaded = {port: observed[ref] for port, ref in zip(spec["inputs"], refs, strict=True)}
+                    state = {"instruction": task.get("instruction", ""), "datetime": task.get("datetime")}
+                    state["goal"] = state["instruction"].casefold()
                     try:
-                        comparable[op] = run_program(
-                            definitions[name],
-                            task.get("instruction", ""),
-                            task.get("datetime"),
-                            observed[refs[0]],
-                            [observed[r] for r in refs[1:]],
-                        )
-                    except (
-                        ValueError,
-                        TypeError,
-                        IndexError,
-                        KeyError,
-                        ArithmeticError,
-                        AttributeError,
-                        re.error,
-                    ):
+                        result = run_card(card, state, loaded)
+                        if result is not None and not (isinstance(result, dict) and set(result) == {"$choose"}):
+                            validate_output(spec["output"], result, loaded)
+                        comparable[op] = result
+                    except PROGRAM_ERRORS:
                         comparable[op] = None
                 result = comparable[op]
-                if requests_fragment_choice(definitions[name], result):
+                if isinstance(result, dict) and set(result) == {"$choose"}:
                     checks = fragments[name]["skipped_output_checks"]
                     if len(checks) < 6:
                         checks.append({"event": index, "tool": endpoint, "inputs": refs,

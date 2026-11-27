@@ -5,22 +5,19 @@ from unittest.mock import Mock
 
 import pytest
 
-from formal_run import read, save
+from jev_harness.artifacts import read, save
 from jev_harness import native_formal, native_replay
 from jev_harness.native_revision import EditRound, TrainSample, evidence, evidence_page, revise
 
 
-@pytest.mark.parametrize("composed", [False, True])
-def test_ordered_dev_cold_start_two_rounds_and_dev_rollback(tmp_path, monkeypatch, composed):
+def test_ordered_dev_cold_start_two_rounds_and_dev_rollback(tmp_path, monkeypatch):
     # These synthetic identifiers never go to AppWorld or a model service.
     tasks = lambda scenario: [f"{scenario}_{i}" for i in (1, 2, 3)]
     manifest = {"dev_tasks": tasks("dev"), "normal_holdout_tasks": tasks("heldout"),
                 "train_batches": [{"batch": i, "tasks": tasks(f"train{i}")} for i in (1, 2, 3)]}
     study = Mock(root=tmp_path, seed=42, execution={}, test_started=False,
                  settings={"optimizer": {"rounds": 2}, "confirmation_scoring": "two_repeats_only"})
-    if composed:
-        study.settings["execution_arm"] = "composed_cards"
-    h0 = native_formal.initial_library(composed)
+    h0 = native_formal.initial_library()
     worker = SimpleNamespace(gpu="fake:0")
     study.execute_preferred.side_effect = lambda jobs, run, pref: [run(job, worker) for job in jobs]
     episodes, edits = [], []
@@ -50,8 +47,7 @@ def test_ordered_dev_cold_start_two_rounds_and_dev_rollback(tmp_path, monkeypatc
 
     study.run_task.side_effect = run_one
 
-    def edit(study, ids, *, current, composed=False):
-        assert composed == bool(h0["fragment"])
+    def edit(study, ids, *, current):
         name = current.folder.name
         assert all(sample.row["task_id"].startswith("train") for sample in current.samples.values())
         assert all(sample.row["variant"] == "B" for sample in current.samples.values())
@@ -106,7 +102,7 @@ def test_ordered_dev_cold_start_two_rounds_and_dev_rollback(tmp_path, monkeypatc
 
 
 def test_editor_can_mine_and_open_local_generation_with_only_the_parent_trace(tmp_path):
-    from phase1_run import design_manifest
+    from jev_harness.protocol import design_manifest
 
     task = design_manifest()["train_batches"][0]["tasks"][0]
     events = [{"event": "task", "instruction": "Synthetic task"},
@@ -137,37 +133,32 @@ def test_editor_can_mine_and_open_local_generation_with_only_the_parent_trace(tm
     study.start_workers.assert_not_called()
 
 
-@pytest.mark.parametrize("composed", [False, True])
-def test_sampling_change_reuses_dev_only_and_separates_prior_train(tmp_path, monkeypatch, composed):
-    from jev_harness.cli import RESOURCES
+def test_only_matching_composition_runs_can_resume(tmp_path, monkeypatch):
+    from jev_harness.protocol import RESOURCES
 
     shared = read(RESOURCES / "experiment.json")
-    previous = native_formal.configuration(shared, composed=composed)
-    previous.pop("train_sampling")
-    previous["optimizer"].pop("draft_reply_limit")
-    connections = {"model_nodes": {"fake": {"args": ["--model", previous["model_path"]]}}}
+    settings = native_formal.configuration(shared)
+    connections = {"model_nodes": {"fake": {"args": ["--model", settings["model_path"]]}}}
     study_factory = Mock()
-    monkeypatch.setattr(native_formal, "FormalNativeStudy", study_factory)
+    monkeypatch.setattr(native_formal, "SharedStudy", study_factory)
     monkeypatch.setattr(native_formal, "run_formal", Mock())
-    args = SimpleNamespace(root=tmp_path, max_gpus=6, through="h0-dev", composed=composed)
-    save(tmp_path / "configuration.json", previous)
+    args = SimpleNamespace(root=tmp_path, max_gpus=6, through="h0-dev")
+    save(tmp_path / "configuration.json", {**settings, "protocol": "appworld_native_tools_v2"})
     save(tmp_path / "runs/dev_react/t/record.json", {"saved": True})
-    native_formal.launch(args, shared, connections)
-    settings = read(tmp_path / "configuration.json")
-    assert settings["train_sampling"] == "entry_harness_only"
-    assert settings["optimizer"]["draft_reply_limit"] == 12
-    if composed:
-        assert study_factory.return_value.compiled_executor is native_formal.ComposedAssembly
-    assert read(tmp_path / "runs/dev_react/t/record.json") == {"saved": True}
-    save(tmp_path / "configuration.json", previous)
-    save(tmp_path / "runs/b01_react/t/record.json", {"saved": True})
     with pytest.raises(ValueError, match="fresh output directory"):
         native_formal.launch(args, shared, connections)
+    study_factory.assert_not_called()
+    save(tmp_path / "configuration.json", settings)
+    native_formal.launch(args, shared, connections)
+    assert settings["train_sampling"] == "entry_harness_only"
+    assert settings["optimizer"]["draft_reply_limit"] == 12
+    assert settings["lanes_per_gpu"] == 2 and settings["cuda_graph_from_start"]
+    assert read(tmp_path / "runs/dev_react/t/record.json") == {"saved": True}
     assert study_factory.call_count == 1
 
 
 def test_old_train_index_opens_actual_events_and_excludes_dev(tmp_path):
-    from phase1_run import design_manifest
+    from jev_harness.protocol import design_manifest
 
     split = design_manifest()
     task = split["train_batches"][0]["tasks"][0]
@@ -180,6 +171,9 @@ def test_old_train_index_opens_actual_events_and_excludes_dev(tmp_path):
     docs, panel = evidence({doc: sample})
     assert panel[doc]["success"] and "steps" not in panel[doc]
     assert "native_feedback" in str(evidence_page(docs, {"doc": doc, "start": 1, "count": 1}))
+    assert evidence_page(docs, {"doc": "index"})["rows"][0]["text"] == doc
+    with pytest.raises(ValueError, match="Use doc=index"):
+        evidence_page(docs, {"doc": "missing"})
     with pytest.raises(ValueError, match="Only official Train"):
         evidence({"hidden": TrainSample(trace, {**row, "task_id": split["dev_tasks"][0]}, sample.library)})
 

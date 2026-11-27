@@ -1,4 +1,4 @@
-"""One public tool or one read-only transformation per turn, with local generation."""
+"""Public AppWorld tool execution, binding and local generation."""
 
 from copy import deepcopy
 from itertools import product
@@ -8,7 +8,8 @@ import re
 from .formal_runtime import FormalExecutor, bounded
 from .expressions import path_get
 from .policy_programs import load_program
-from .runtime import MAX_REAL_OPTIONS, Uncovered, parse_json
+from .protocol import PROTOCOL
+from .runtime import Uncovered, parse_json
 from .retrieval import terms
 from .schema_tools import (
     FINISH,
@@ -35,12 +36,8 @@ from .schema_tools import (
 )
 
 
-PROTOCOL = "appworld_native_tools_v2"
 DISCOVER = "@discover"
 MORE_FRAGMENTS = "@fragments"
-FRAGMENT_COMMON_WORDS = terms("find select match matching other relevant named source observed row field value "
-                              "available result need needed using given return from this these those its their "
-                              "there one only if can has have do about information")
 ACTION_SKILL = (
     "Choose one step that advances the user's outstanding request. Read the relevant source first "
     "when a target or value is unknown. A matching object alone does not authorize a write. "
@@ -73,21 +70,6 @@ def blank_library():
     return {group: {} for group in ("retrieval", "decision", "binding", "fragment", "state", "handoff")}
 
 
-def fragment_goal_score(spec, goal):
-    """Score goal evidence only. An input endpoint or an agent-supplied search is not a goal."""
-    source_words = terms(" ".join([*spec["sources"], *spec.get("inputs", [])]))
-    if {"text", "message"} <= source_words:
-        source_words = source_words | {"sms"}
-
-    def specific(words):
-        return {w for w in words - source_words - FRAGMENT_COMMON_WORDS if len(w) > 1 and not w.isdecimal()}
-
-    if "goal_terms" in spec:
-        cues = (terms(phrase) for phrase in spec["goal_terms"])
-        return max((len(specific(cue)) for cue in cues if cue <= goal), default=0)
-    return len(specific(terms(spec["label"]) & goal))
-
-
 def preview(value, chars=2000):
     return bounded(value, chars)
 
@@ -99,69 +81,6 @@ def tool_error(text):
     return "Execution failed. " + (text.strip().splitlines() or ["unknown error"])[-1][:240]
 
 
-def requests_fragment_choice(definition, result):
-    has_questions = "choice" in definition or "choices" in definition
-    return has_questions and isinstance(result, dict) and result.keys() == {"$choose"}
-
-
-def fragment_record(source, index, fields):
-    if source is None:
-        raise ValueError("The declared record source is missing from this fragment call")
-    if type(index) is not int or not 0 <= index < len(source.rows):
-        raise ValueError("A proposed record index is outside the observation")
-    evidence = {k: preview(path_get(source.rows[index], k), 500) for k in fields}
-    if all(value is None for value in evidence.values()):
-        raise ValueError(f"No declared field is visible in {source.ref}[{index}]")
-    return {"source": source.source, "ref": source.ref, "row": index}, evidence
-
-
-def fragment_record_options(source, indices, fields):
-    if not isinstance(indices, list) or not 1 <= len(indices) <= MAX_REAL_OPTIONS:
-        raise ValueError(f"A fragment ballot needs 1 to {MAX_REAL_OPTIONS} observed rows")
-    options = []
-    for index in indices:
-        record, evidence = fragment_record(source, index, fields)
-        label = f"{source.ref}[{index}] " + json.dumps(evidence, ensure_ascii=False)
-        options.append({"label": label, "value": record})
-    if len(set(indices)) != len(indices):
-        raise ValueError("The proposed record indices contain duplicates")
-    return options
-
-
-def fragment_ballot(name, spec, request, sources, instruction):
-    # A list selects the original single template. Named templates allow independent and dependent roles.
-    if isinstance(request, list) and "choice" in spec:
-        role, slot, rows, using = None, spec["choice"], request, {}
-    else:
-        if (
-            not isinstance(request, dict) or not {"role", "rows"} <= request.keys()
-            or request.keys() - {"role", "rows", "using"}
-        ):
-            raise ValueError("Choose a declared question role and its observed rows")
-        role, rows, using = request["role"], request["rows"], request.get("using", {})
-        slots = spec.get("choices", {})
-        if not isinstance(role, str) or role not in slots:
-            raise ValueError("The question role is missing from the fragment definition")
-        if not isinstance(using, dict) or using.keys() - slots.keys():
-            raise ValueError("Use declared roles when referring to other observed records")
-        slot = slots[role]
-    source = sources.get(slot["source"])
-    options = fragment_record_options(source, rows, slot["fields"])
-    # A search query or an operation label expresses the agent's hypothesis. Only show public records.
-    evidence = {"instruction": instruction, "source": source.source, "source_complete": source.complete}
-    references = []
-    for anchor in sorted(using):
-        template = spec["choices"][anchor]
-        record, fields = fragment_record(sources.get(template["source"]), using[anchor], template["fields"])
-        references.append({**record, "fields": fields})
-    if references:
-        evidence["reference_records"] = references
-    if role is not None:
-        for option in options:
-            option["value"].update(fragment=name, role=role)
-    return role, slot["question"], source, options, evidence
-
-
 def observed_input(obs):
     value = {"ref": obs.ref, "rows": deepcopy(obs.rows), "scope": obs.scope, "complete": obs.complete}
     if obs.arguments is not None:
@@ -169,7 +88,7 @@ def observed_input(obs):
     return value
 
 
-def run_program(definition, instruction, when, obs, companions=(), *, selected=None, selections=()):
+def run_program(definition, instruction, when, obs, companions=()):
     context = {
         "instruction": instruction,
         "datetime": when,
@@ -177,17 +96,12 @@ def run_program(definition, instruction, when, obs, companions=(), *, selected=N
         **observed_input(obs),
     }
     context["inputs"] = {o.source: observed_input(o) for o in companions}
-    if selected is not None:
-        context["selected"] = deepcopy(selected)
-    if selections:
-        context["selections"] = deepcopy(selections)
     result = load_program(definition["program"])(context)
     return json.loads(json.dumps(result, allow_nan=False))
 
 
-class NativeAssembly(FormalExecutor):
+class NativeTools(FormalExecutor):
     review_nodes = ("native/action", "native/binding", "native/app", "native/fragment_choice")
-    generation_only = False
 
     def initialize_native(self, library):
         self.lib = {**blank_library(), **library}
@@ -278,12 +192,11 @@ class NativeAssembly(FormalExecutor):
         sources = spec.get("inputs", [])
         return product(*([o for o in reversed(self.observed) if o.source == source] for source in sources))
 
-    def program(self, group, name, obs, companions=(), *, selected=None, selections=()):
+    def program(self, group, name, obs, companions=()):
         definition = self.lib[group][name]
         try:
             return run_program(
                 definition, self.instruction, self.context["task"].get("datetime"), obs, companions,
-                selected=selected, selections=selections,
             )
         except (
             ValueError,
@@ -296,50 +209,6 @@ class NativeAssembly(FormalExecutor):
         ) as exc:
             self.trace.add("program_error", component=group, name=name, error=str(exc)[:240])
             return None
-
-    def resolve_fragment(self, name, obs, companions=()):
-        spec = self.lib["fragment"][name]
-        sources = {item.source: item for item in (obs, *companions)}
-        selections, asked = [], []
-        result = self.program("fragment", name, obs, companions)
-        while requests_fragment_choice(spec, result):
-            try:
-                role, question, source, options, evidence = fragment_ballot(
-                    name, spec, result["$choose"], sources, self.instruction
-                )
-            except ValueError as exc:
-                self.trace.add("native_fragment_choice", name=name, status="unavailable", reason=str(exc))
-                return None
-            detail = {"ref": source.ref}
-            if role is not None:
-                detail["role"] = role
-            refs = evidence.get("reference_records", [])
-            if refs:
-                detail["using"] = [[r["ref"], r["row"]] for r in refs]
-            identity = (role, source.ref, sorted(o["value"]["row"] for o in options), refs)
-            if identity in asked:
-                self.trace.add("native_fragment_choice", name=name, status="repeated", **detail,
-                               reason="This question already has an answer for these records")
-                return None
-            asked.append(identity)
-            try:
-                selection = self.decision(
-                    question, evidence, options,
-                    "Use the public record that fills the requested role. Choose NONE if none fits or the evidence leaves a tie.",
-                    node="native/fragment_choice", review_step=self.requests + 1 < self.max_calls,
-                )
-            except Uncovered as exc:
-                self.trace.add("native_fragment_choice", name=name, status="unbound", **detail, reason=str(exc))
-                return None
-            index = selection["row"]
-            bound = {"source": source.source, "ref": source.ref, "row": index, "value": source.rows[index]}
-            selections.append({**bound, "role": role})
-            result = self.program("fragment", name, obs, companions, selected=bound, selections=selections)
-            status = "resolved" if result is not None and result != [] else "no_result"
-            if requests_fragment_choice(spec, result):
-                status = "continued"
-            self.trace.add("native_fragment_choice", name=name, row=index, status=status, **detail)
-        return result
 
     def ask(self, node, question, options, skill, **extra):
         view = {**self.facts(), **extra}
@@ -384,21 +253,6 @@ class NativeAssembly(FormalExecutor):
             self.lookup if query is None else query,
         )
 
-    def fragments(self):
-        options = []
-        for obs in reversed(self.observed):
-            for name, spec in self.lib["fragment"].items():
-                if obs.source not in spec["sources"]:
-                    continue
-                for others in self.companion_sets(spec):
-                    refs = [obs.ref, *(o.ref for o in others)]
-                    marker = f"{name}({','.join(refs)})"
-                    if marker not in self.used_transforms:
-                        inputs = ", ".join(f"{o.ref} ({o.source})" for o in (obs, *others))
-                        options.append((f"{spec['label']} | input {inputs}", ("fragment", name, *refs)))
-        options.sort(key=lambda o: -len(terms(o[0]) & terms(self.instruction)))
-        return options
-
     def calculation_options(self):
         self.transforms = {}
         self.calculation_refs = {}
@@ -416,44 +270,6 @@ class NativeAssembly(FormalExecutor):
         desc = tool["description"].split("\n")[0][:160]
         hint = self.lib["decision"].get(name)
         return f"{name}: {desc}" + (f" {hint}" if hint else "")
-
-    def action_page(self, names, *, allow_discovery=True):
-        eligible = self.fragments()
-        goal = terms(self.instruction)
-        names_with_inputs = {value[1] for label, value in eligible}
-        scores = {name: fragment_goal_score(self.lib["fragment"][name], goal) for name in names_with_inputs}
-        matches = [(label, value) for label, value in eligible if scores[value[1]] > 0]
-        fragments = sorted(matches, key=lambda option: scores[option[1][1]], reverse=True)[:2]
-        if eligible:
-            self.trace.add(
-                "native_fragment_retrieval",
-                eligible=[v for _, v in eligible],
-                page=[v for _, v in fragments],
-            )
-        available_slots = (
-            15
-            - len(names)
-            - len(fragments)
-            - int(bool(self.observed or self.receipts))
-            - int(allow_discovery)
-        )
-        derived = self.calculation_options()[: max(0, min(4, available_slots))]
-        actions = fragments + derived + [(self.tool_label(n), n) for n in names]
-        if self.observed or self.receipts:
-            actions.append(
-                (
-                    "Complete the task now (return the requested answer or finish after all requested effects)",
-                    FINISH,
-                )
-            )
-        if allow_discovery:
-            actions.append(("Browse additional public tools or learned operations", DISCOVER))
-        return self.ask(
-            "native/action",
-            "Which NEXT operation is supported by the request and current progress?",
-            actions,
-            ACTION_SKILL,
-        )
 
     def next_action(self):
         ranked = self.candidates()
@@ -883,44 +699,6 @@ class NativeAssembly(FormalExecutor):
             )
         self.lookup = ""
 
-    def execute_task(self, library):
-        self.initialize_native(library)
-        while not self.done:
-            try:
-                if self.generation_only:
-                    operation = self.local_action()
-                else:
-                    action = self.next_action()
-                    if isinstance(action, tuple):
-                        if action[0] == "calculate":
-                            label = action[1]
-                            self.used_transforms.add(label)
-                            self.observe(
-                                "calculation",
-                                self.transforms[label],
-                                label,
-                                sources={self.calculation_refs[label]: {"calculation": label}},
-                            )
-                            continue
-                        _, name, ref, *rest = action
-                        marker = f"{name}({','.join([ref, *rest])})"
-                        self.used_transforms.add(marker)
-                        obs = next(o for o in self.observed if o.ref == ref)
-                        by_ref = {o.ref: o for o in self.observed}
-                        result = self.resolve_fragment(name, obs, [by_ref[r] for r in rest])
-                        if result is None or result == []:
-                            raise Uncovered(f"{name} found no supported result in {ref}")
-                        self.observe(
-                            name, result, marker, sources={r: {"program_input": name} for r in [ref, *rest]}
-                        )
-                        continue
-                    operation = self.binding(action) if action is not None else self.local_action()
-                if operation:
-                    self.perform(*operation)
-            except (ValueError, TypeError, Uncovered) as exc:
-                self.notices.append(str(exc)[:350])
-                self.trace.add("native_feedback", reason=self.notices[-1])
-
     def summarize(self, *args):
         result = super().summarize(*args)
         events = self.trace.events
@@ -944,5 +722,16 @@ class NativeAssembly(FormalExecutor):
         return result
 
 
-class NativeGeneration(NativeAssembly):
-    generation_only = True
+class NativeGeneration(NativeTools):
+    """All-generation ReAct on the same official tool interface."""
+
+    def execute_task(self, library):
+        self.initialize_native(library)
+        while not self.done:
+            try:
+                operation = self.local_action()
+                if operation:
+                    self.perform(*operation)
+            except (ValueError, TypeError, Uncovered) as exc:
+                self.notices.append(str(exc)[:350])
+                self.trace.add("native_feedback", reason=self.notices[-1])

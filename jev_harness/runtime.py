@@ -1,4 +1,4 @@
-"""Execute precompiled workflows; no online question/candidate generation path."""
+"""Run AppWorld episodes and trace model requests and Jev decisions."""
 from __future__ import annotations
 
 from collections import Counter
@@ -7,7 +7,6 @@ from pathlib import Path
 import re
 import time
 
-from .expressions import build_candidates, resolve
 from .transport import WorkerUnavailable
 
 
@@ -18,10 +17,6 @@ REVIEW_MAX_TOKENS = 128
 REVIEW_THINKING_BUDGET = 96
 
 
-def is_open_generation(operation, request):
-    return operation == "generate" and request.get("purpose") != STEP_REVIEW
-
-
 class Uncovered(RuntimeError):
     """Continue the actual task through generation, without synthesizing decisions."""
 
@@ -30,10 +25,6 @@ class NativeNone(Uncovered):
     def __init__(self, response):
         super().__init__("Jev selected the uncovered option")
         self.response = response
-
-
-def abstained(exc):
-    return "uncovered option" in str(exc) or str(exc).startswith(("No grounded choice","No grounded options"))
 
 
 def parse_json(text):
@@ -86,10 +77,6 @@ class Executor:
         self.step_review_mode = step_review_mode
         self.step_review_thinking_budget = step_review_thinking_budget
 
-    def program_context(self):
-        # Generation output is not input to question/candidate construction.
-        return {"task": self.context["task"], "vars": self.context["vars"]}
-
     def _model(self, operation, **values):
         calls = [e for e in self.trace.events if e["event"] == "model"]
         spent = sum(e["response"].get("output_tokens", 0) for e in calls)
@@ -114,13 +101,6 @@ class Executor:
             values["purpose"] = STEP_REVIEW
         self.trace.add("model", operation=operation, request=values, response=result)
         return result
-
-    def call(self, app, api, arguments, node=None):
-        response = self.environment.request("call", app=app, api=api, arguments=arguments)
-        self.trace.add("api", node=node, app=app, api=api, arguments=arguments, response=response)
-        self.context["history"].append({"app": app, "api": api, "arguments": arguments, "response": response})
-        self.done = bool(response.get("done"))
-        return response.get("value", response.get("output"))
 
     def decision(self, question, evidence, candidates, skill="", policy=None, node=None,
                  review_step=False, widen_on_none=False, native_response=None):
@@ -219,100 +199,6 @@ class Executor:
                        output_tokens=response.get("output_tokens", 0), reasoning_tokens=response.get("reasoning_tokens", 0))
         return index
 
-    def steps(self, steps, harness):
-        for node in steps:
-            if self.done:
-                break
-            identifier = node.get("id", node["kind"])
-            kind = node["kind"]
-            self.trace.add("node", node=identifier, kind=kind)
-            if kind == "call":
-                binding = resolve(harness["bindings"][node["binding"]], self.context)
-                if node.get("paginate"):
-                    result = []
-                    for page in range(node.get("max_pages", 100)):
-                        arguments = {**binding.get("arguments", {}), "page_index": page, "page_limit": 20}
-                        chunk = self.call(binding["app"], binding["api"], arguments, identifier)
-                        if not isinstance(chunk, list):
-                            raise Uncovered("Pagination returned an unexpected response")
-                        result.extend(chunk)
-                        if len(chunk) < 20:
-                            break
-                    else:
-                        raise Uncovered("Pagination budget exhausted")
-                else:
-                    result = self.call(binding["app"], binding["api"], binding.get("arguments", {}), identifier)
-                self.context["vars"][node.get("store", identifier)] = result
-            elif kind == "compute":
-                self.context["vars"][node.get("store", identifier)] = resolve(
-                    harness["bindings"][node["binding"]], self.program_context())
-            elif kind == "decision":
-                key = node["decision"]
-                value = self.decision(resolve(harness["questions"][key], self.program_context()),
-                    resolve(harness["evidence"][key], self.program_context()),
-                    build_candidates(harness["candidates"][key], self.program_context()),
-                    harness.get("decision_skills", {}).get(key, ""),
-                    harness.get("mode_policy", {}).get(key), identifier)
-                self.context["vars"][node.get("store", key)] = value
-            elif kind == "foreach":
-                items = resolve(harness["bindings"][node["binding"]], self.program_context())
-                for item in items:
-                    self.context["vars"][node.get("item", "item")] = item
-                    self.steps(node["body"], harness)
-                    if self.done:
-                        break
-            elif kind == "if":
-                condition = resolve(harness["bindings"][node["binding"]], self.program_context())
-                self.steps(node.get("then", []) if condition else node.get("else", []), harness)
-            elif kind == "generate":
-                skill = harness["generation_skills"][node["skill"]]
-                prompt = resolve(skill, self.context)
-                response = self._model("generate", messages=[{"role": "user", "content": prompt}],
-                    max_tokens=harness.get("mode_policy", {}).get(node["skill"], {}).get("max_tokens", self.generation_tokens))
-                self.context["generated"][node.get("store", identifier)] = (
-                    parse_json(response["text"]) if node.get("json", True) else response["text"])
-            elif kind == "agent":
-                self.agent(harness.get("generation_skills", {}).get(node.get("skill", "fallback"), ""))
-            elif kind == "finish":
-                arguments = resolve(harness.get("bindings", {}).get(node.get("binding", "complete"), {}), self.context)
-                self.call("supervisor", "complete_task", arguments, identifier)
-            else:
-                raise ValueError("Unknown compiled operation: " + kind)
-
-    def select_workflow(self, library):
-        workflows = library.get("workflows", [])
-        if not workflows:
-            return None
-        instruction = self.context["task"]["instruction"]
-        definitions = []
-        for entry in workflows:
-            workflow = entry["workflow"]
-            if "applicable_if" in workflow and not resolve(workflow["applicable_if"], self.program_context()):
-                continue
-            description = workflow.get("description", entry.get("description", ""))
-            definitions.append({"label": description, "value": entry["id"]})
-        if not definitions:
-            raise Uncovered("No workflow satisfies its applicability conditions")
-        if len(definitions) > MAX_REAL_OPTIONS:
-            # This shortlist uses the instruction and compiled descriptions only.
-            stop_words = {"the", "and", "for", "with", "from", "this", "that", "all", "any"}
-            def terms(text):
-                return set(re.findall(r"[a-z0-9]{3,}", text.lower())) - stop_words
-            query = terms(instruction)
-            ranked = [(len(query & terms(option["label"])), option) for option in definitions]
-            shortlisted = [option for score, option in sorted(ranked, key=lambda pair: pair[0], reverse=True)
-                           if score > 0][:MAX_REAL_OPTIONS]
-            self.trace.add("workflow_shortlist", eligible=len(definitions),
-                           retained=[option["value"] for option in shortlisted])
-            if not shortlisted:
-                raise Uncovered("No compiled workflow matched the instruction during retrieval")
-            definitions = shortlisted
-        selected = self.decision(
-            "Which reusable workflow can carry out this request? Choose NONE if its operations or requirements do not fit.",
-            {"instruction": instruction}, definitions,
-            library.get("router_skill", "Match the requested operation, not just the app or shared keywords."), node="workflow_router")
-        return next(h for h in workflows if h["id"] == selected)
-
     def preferred_tool_docs(self):
         return set()
 
@@ -374,57 +260,6 @@ class Executor:
                         row[key] = json.dumps(row[key], ensure_ascii=False, default=str)[:self.history_chars // 5] + " [truncated]"
         return history
 
-    def agent(self, skill=""):
-        """Residual generation performs task actions directly, never makes Q/C for Jev."""
-        task = self.context["task"]
-        for step in range(self.max_calls):
-            if self.done:
-                return
-            system = (
-                "You are an AppWorld tool-calling agent. Complete the user's task by calling APIs. "
-                "Return ONLY one JSON object: {\"app\":\"app_name\",\"api\":\"api_name\",\"arguments\":{...}}. "
-                "Use actual identifiers and values from observations. The schemas list app and api separately. "
-                "To get credentials call supervisor.show_account_passwords; apps may then require login. "
-                "Explore api_docs for missing APIs. End by calling supervisor.complete_task; supply an answer only for questions. "
-                "The records below show actions already executed. Continue from their results. " + str(skill))
-            visible = {"instruction": task["instruction"], "supervisor": task["supervisor"],
-                       "datetime": task["datetime"], "compiled_bindings": self.context["vars"],
-                       "generated_parameters": self.context["generated"],
-                       "api_schemas": self._function_docs(), "executed_actions": self.generation_history()}
-            response = self._model("generate", messages=[{"role": "system", "content": system},
-                {"role": "user", "content": json.dumps(visible, ensure_ascii=False, default=str)}],
-                thinking=self.generation_thinking, purpose="G", max_tokens=self.generation_tokens, seed=self.seed)
-            try:
-                action = parse_json(response["text"])
-                if not isinstance(action, dict) or not all(k in action for k in ("app", "api")):
-                    raise ValueError("Expected app, api and arguments")
-                app, api = action["app"], action["api"]
-                if "__" in api:
-                    app, api = api.split("__", 1)
-                known = [r.get("function", r)["name"] for r in task["functions"]]
-                if app+"__"+api not in known:
-                    matches = [name for name in known if name.endswith("__"+api)]
-                    if len(matches) == 1:
-                        app, api = matches[0].split("__", 1)
-                self.call(app, api, action.get("arguments", {}), "residual_agent")
-            except (ValueError, KeyError, TypeError) as exc:
-                self.trace.add("generation_parse_error", error=str(exc))
-                self.context["history"].append({"format_error": str(exc), "generated": response["text"]})
-        raise RuntimeError("Residual agent step budget exhausted")
-
-    def execute_task(self, library):
-        try:
-            workflow = self.select_workflow(library)
-            if workflow:
-                self.workflow_id = workflow["id"]
-                self.trace.add("workflow", workflow_id=self.workflow_id)
-                self.steps(workflow["workflow"]["steps"], workflow)
-            if not self.done:
-                self.agent()
-        except (Uncovered, KeyError, TypeError, ValueError) as exc:
-            self.trace.add("fallback", reason=str(exc))
-            self.agent()
-
     def run(self, task_id, library=None, trace_path=None, seed=0, label="harness"):
         self.trace = Trace(trace_path)
         self.seed = seed
@@ -434,10 +269,10 @@ class Executor:
             task = self.environment.request("prepare", task_id=task_id, seed=seed,
                                              experiment_name=f"jev_compiled_{label}_{task_id}",
                                              **self.prepare_options())
-            self.context = {"task": task, "vars": {}, "generated": {}, "history": []}
+            self.context = {"task": task, "history": []}
             self.trace.add("task", task_id=task_id, instruction=task["instruction"],
                            supervisor=task["supervisor"], datetime=task["datetime"], seed=seed)
-            self.workflow_id, error = None, None
+            error = None
             try:
                 self.execute_task(library or {})
             except WorkerUnavailable:
@@ -461,7 +296,7 @@ class Executor:
         for event in model_events:
             if event["response"].get("thinking_used") and not event["request"].get("native_prechecked"):
                 modes["D"] += 1
-        summary = {"task_id": task_id, "label": label, "seed": seed, "workflow": self.workflow_id,
+        summary = {"task_id": task_id, "label": label, "seed": seed,
             "success": evaluation["success"], "error": error, "failures": evaluation["failures"],
             "input_tokens": sum(e["response"].get("input_tokens", 0) for e in model_events),
             "output_tokens": sum(e["response"].get("output_tokens", 0) for e in model_events),

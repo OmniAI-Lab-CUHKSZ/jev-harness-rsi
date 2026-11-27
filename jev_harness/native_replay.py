@@ -3,11 +3,52 @@
 from copy import deepcopy
 import json
 
-from formal_run import read
-from .formal_optimizer import cleaned_text, read_events
-from .native_assembly import NativeAssembly
+from .artifacts import cleaned_text, read, read_events
+from .composed_assembly import ComposedAssembly
+from .formal_runtime import BudgetExhausted
+from .runtime import STEP_REVIEW, Trace, Uncovered
 from .schema_tools import catalog, public_value
-from .trace_comparison import Boundary, different_fields, recorded_requests, run_on_tape
+
+
+class Boundary(Exception):
+    """A recorded response cannot be supplied to this request."""
+
+
+def different_fields(left, right):
+    return sorted(key for key in left.keys() | right.keys()
+                  if key not in left or key not in right or
+                  json.dumps(left[key], sort_keys=True) != json.dumps(right[key], sort_keys=True))
+
+
+def recorded_requests(events):
+    for index, e in enumerate(events):
+        kind = e["event"]
+        if kind == "model":
+            args = dict(e["request"])
+            if e["operation"] == "decide" and e["response"].get("thinking_used") and args.get("purpose") == STEP_REVIEW:
+                args.pop("purpose")
+            yield index, e["operation"], args, e["response"]
+        elif kind in ("api", "tool_batch"):
+            keys = ("app", "api", "arguments") if kind == "api" else ("code", "permit_finish", "trace_actions")
+            yield index, "call" if kind == "api" else "execute", {k:e[k] for k in keys if k in e}, e["response"]
+        elif kind == "generation_resume_bindings":
+            yield index, "bind_progress", {"names":e["names"]}, {}
+
+
+def run_on_tape(events, library, functions, settings, client, executor_type):
+    start = events[0]
+    task = {k:start[k] for k in ("task_id", "instruction", "datetime", "supervisor")}
+    engine = executor_type(client, client, **settings)
+    engine.prepare_options()
+    engine.trace, engine.seed, engine.done = Trace(), start["seed"], False
+    engine.context = {"task":{**task, "functions":functions}, "history":[]}
+    try:
+        engine.execute_task(library)
+        return "returned"
+    except Boundary:
+        return "boundary"
+    except (BudgetExhausted, Uncovered) as exc:
+        return str(exc)
 
 
 def fragment_question(node, values, evidence):
@@ -22,36 +63,18 @@ def fragment_question(node, values, evidence):
     }
 
 
-class RecordedChoices:
+class RecordedComposition(ComposedAssembly):
     def decision(self, question, evidence, candidates, *args, **kwargs):
         self.model.offered = [c["value"] for c in candidates] + [None]
         self.model.menu_node = kwargs.get("node")
         self.model.fragment_question = fragment_question(self.model.menu_node, self.model.offered, evidence)
         self.model.calculations = self.transforms
-        self.model.dynamic_offers = getattr(self, "dynamic_offers", {})
+        self.model.card_offers = self.card_offers
         return super().decision(question, evidence, candidates, *args, **kwargs)
 
-    def session_token(self, app):
-        # Original traces contain no credentials. Never create a live environment in this check.
-        return "<session>"
-
-
-class RecordedNative(RecordedChoices, NativeAssembly):
-    pass
-
-
-class RecordedGeneration(RecordedNative):
-    generation_only = True
-
-
-def first_change(events, candidate, functions, execution, model=None, *, generation_only=False, executor_type=None,
-                 continue_after_choice=False):
+def first_change(events, candidate, functions, execution, model=None):
     apps = [name.split("__", 1)[0] for name in catalog(functions) if name.endswith("__login")]
-    tape = [
-        (i, op, request, response)
-        for i, op, request, response in recorded_requests(events)
-        if executor_type is not None or events[i].get("node") != "session"
-    ]
+    tape = list(recorded_requests(events))
     position = 0
     report = {}
     recorded_menus = {}
@@ -86,9 +109,9 @@ def first_change(events, candidate, functions, execution, model=None, *, generat
                 comparable.get("arguments", {}).pop("raise_on_failure", None)
             elif op == "bind_progress":
                 comparable = {"names": sorted(args["values"])}
-            elif op == "execute" and executor_type is not None:
+            elif op == "execute":
                 comparable = {**args, "code": cleaned_text(args["code"])}
-            changed = different_fields(previous, comparable)
+            changed = different_fields(previous, comparable) if op == expected else []
             old_values = recorded_menus.get(i)
             comparable_menu = old_values and not any(type(v) is int for v in old_values)
             if op == expected == "decide" and comparable_menu:
@@ -157,34 +180,28 @@ def first_change(events, candidate, functions, execution, model=None, *, generat
                                     report["same_local_result"] = event["value"] == self.calculations[new[1]]
                                     break
                     selected = self.offered[result["index"]]
-                    if continue_after_choice:
-                        is_card = isinstance(selected, (tuple, list)) and selected[0] == "dynamic"
-                        same_choice = report.get("same_semantic_choice")
-                        returning = selected == "standard" and previous.get("question") != args.get("question")
-                        if is_card:
-                            _, plans = self.dynamic_offers.get(selected[1], (None, ()))
-                            report["proposed_reads"] = [
-                                {"result": plan["result"], "choices": plan["choices"],
-                                 "sources": [read["source"] for read in plan["reads"].values()]}
-                                for plan in plans
-                            ]
-                        if same_choice or is_card or returning:
-                            report["continuation"] = {"status": "replaying", "first_choice_matched": bool(same_choice)}
-                            if same_choice:
-                                position += 1
-                            return result
+                    is_card = isinstance(selected, (tuple, list)) and tuple(selected) in self.card_offers
+                    declined_card = selected is None and any(
+                        isinstance(value, (tuple, list)) and tuple(value) in self.card_offers
+                        for value in self.offered
+                    )
+                    same_choice = report.get("same_semantic_choice")
+                    if is_card:
+                        report["proposed_reads"] = [
+                            {"scope": plan["scope"], "choices": plan.get("choices", {}),
+                             "sources": [read["source"] for read in plan["reads"].values()]}
+                            for plan in self.card_offers[tuple(selected)]
+                        ]
+                    if same_choice or is_card or declined_card:
+                        report["continuation"] = {"status": "replaying", "first_choice_matched": bool(same_choice)}
+                        if same_choice:
+                            position += 1
+                        return result
             else:
                 report["status"] = "changed_" + op
             raise Boundary
 
-    if executor_type is not None:
-        class Recorded(RecordedChoices, executor_type):
-            # Reconstruct the public history of authentication with inert values.
-            session_token = executor_type.session_token
-        executor = Recorded
-    else:
-        executor = RecordedGeneration if generation_only else RecordedNative
-    stop = run_on_tape(events, candidate, functions, execution, Client(), executor)
+    stop = run_on_tape(events, candidate, functions, execution, Client(), RecordedComposition)
     if not report:
         report = {"status": "unchanged" if position == len(tape) else "unresolved", "stop": stop}
     if report.get("continuation", {}).get("status") == "replaying":
@@ -194,33 +211,17 @@ def first_change(events, candidate, functions, execution, model=None, *, generat
     return report
 
 
-def historical_preview(study, candidate, history):
-    opened = {}
-    for directory in history:
-        plan = read(directory / "pilot_plan.json")
-        for task in plan["train"]:
-            for stage in ("h0_decision", "candidate"):
-                path = directory / "runs" / stage / task / "record.json"
-                if path.is_file() and (row := read(path))["success"]:
-                    opened[task] = (directory / row["trace_path"], directory / "offline/public_functions.json",
-                                    plan["execution"])
-    return solved_preview(study, candidate, opened)
-
-
-def solved_preview(study, candidate, opened, *, budget=24, executor_type=None, continue_after_choice=False):
+def solved_preview(study, candidate, opened, *, budget=24):
     results = {}
     used = 0
     for task, (trace, catalogue, execution) in opened.items():
         events = read_events(trace)
         functions = read(catalogue)
-        runtime = {"executor_type": executor_type} if executor_type is not None else {}
-        if continue_after_choice:
-            runtime["continue_after_choice"] = True
-        outcome = first_change(events, candidate, functions, execution, **runtime)
+        outcome = first_change(events, candidate, functions, execution)
         if outcome["status"] == "needs_real_choice" and used < budget:
             study.start_workers()
             model = study.workers[used % len(study.workers)].worker("model")
-            outcome = first_change(events, candidate, functions, execution, model, **runtime)
+            outcome = first_change(events, candidate, functions, execution, model)
             used += 1
         elif outcome["status"] == "needs_real_choice":
             outcome["reason"] = f"{budget} historical reselections already used this round"

@@ -1,10 +1,11 @@
 """Connect a contact-based filter to AppWorld record sources and consumers."""
 
-from copy import deepcopy
+from dataclasses import replace
 from itertools import product
 import re
 
-from .policy_programs import calendar_windows, load_program
+from .composition import PROGRAM_ERRORS, run_card
+from .policy_programs import calendar_windows
 from .runtime import Uncovered
 from .schema_tools import key
 
@@ -41,18 +42,6 @@ REQUEST_WRITES = {
 FILTER_INPUTS = {"rows": "counterparty_records", "people": "contact_identities"}
 
 
-def validate_record_composition(spec):
-    composition = spec["composition"]
-    if (spec.keys() - {"label", "program", "composition", "goal_terms", "sources"}
-            or spec.get("sources") or not isinstance(composition, dict)
-            or composition.keys() - {"inputs", "output", "equivalent"}
-            or composition.get("inputs") != FILTER_INPUTS or composition.get("output") != "matching_records"):
-        raise ValueError("A record composition needs endpoint-independent roles and matching_records output")
-    equivalent = composition.get("equivalent", [])
-    if not isinstance(equivalent, list) or not all(isinstance(name, str) and name.isidentifier() for name in equivalent):
-        raise ValueError("Name any equivalent filter by its fragment identifier")
-
-
 def payment_directions(goal, tool):
     if not tool:
         return []
@@ -70,19 +59,19 @@ def payment_directions(goal, tool):
     return [selection for selection in wanted if set(selection) <= directions]
 
 
-def record_composition(engine, spec):
+def contact_plans(engine):
     """Build full read plans for the requested scope and at least one compatible use."""
     goal = engine.goal
     if (CONTACTS not in engine.tools or not re.search(r"\bvenmo\b", goal)
             or re.search(r"\b(?:social feed|simple note|except|unless|excluding)\b", goal)):
-        return None, []
+        return []
     roles = sorted(role for role, pattern in CONTACT_ROLES.items() if re.search(rf"\b(?:{pattern})\b", goal))
     try:
         windows = calendar_windows(goal, engine.context["task"]["datetime"])
     except (TypeError, ValueError, OverflowError):
-        return None, []
+        return []
     if not roles or not windows:
-        return None, []
+        return []
     pending = bool(re.search(r"\bpayment requests?\b", goal))
     requested = set(engine.required)
     if re.search(r"(?:^|[.!?]\s*|\band\s+)(?:please\s+)?like\s+(?:all\s+)?(?:the\s+)?venmo\s+transactions?\b",
@@ -91,7 +80,7 @@ def record_composition(engine, spec):
     scope = "incoming pending requests" if pending else "Venmo transactions"
     source = REQUESTS if pending else PAYMENTS
     if source not in engine.tools:
-        return None, []
+        return []
     choices = [("pending",)] if pending else payment_directions(goal, engine.tools.get(source))
     offered_writes = REQUEST_WRITES if pending else PAYMENT_WRITES
     writes = {name: rule for name, rule in offered_writes.items() if name in requested and name in engine.tools}
@@ -102,20 +91,10 @@ def record_composition(engine, spec):
         elif re.search(r"\bhow many\s+(?:venmo\s+)?(?:transactions?|payments?)\b", goal):
             calculations["count"] = True
     if requested - writes.keys() or not (requested - engine.chosen_effects or calculations):
-        return None, []
+        return []
     fields = {"payment_request_id" if pending else "transaction_id": "integer"}
     if "sum" in calculations:
         fields["amount"] = "number"
-    slots = {
-        "records": {"question": "Which official records cover the requested direction?",
-                    "skill": "Match the direction to the user's words. Both directions is the union."},
-        "contacts": {"question": "Which contact relationships define the requested set?"},
-        "date": {"question": "Which date interval, inclusive, matches the user's request?"},
-    }
-    result = {"fields": fields, "calculations": calculations, "writes": writes,
-              "equivalent": spec["composition"].get("equivalent", [])}
-    prepared = {**spec, "sources": [CONTACTS, source],
-                "dynamic": {"slots": slots, "results": {scope: result}}}
     plans = []
     for directions, (start, end) in product(choices, windows):
         reads = {"people": {"source": CONTACTS, "arguments": [{"relationship": role} for role in roles]}}
@@ -130,14 +109,15 @@ def record_composition(engine, spec):
                   "contacts": ", ".join(roles)}
         if start:
             labels["date"] = f"{start} through {end} inclusive"
-        plans.append({"result": scope, "reads": reads, "choices": labels, "requested": sorted(requested),
-                      "actors": actors, "window": [start, end]})
-    return prepared, plans
+        plans.append({"scope": ", ".join(labels.values()), "reads": reads, "choices": labels,
+                      "requested": sorted(requested), "actors": actors, "window": [start, end],
+                      "fields": fields, "calculations": calculations, "writes": writes})
+    return plans
 
 
-def select_record_subset(program, plan, inputs, id_field):
+def select_record_subset(card, plan, loaded, id_field):
     """Preserve the official rows and reject records outside the selected read scope."""
-    people = inputs["people"]
+    people = loaded["people"].data
     if len(plan["reads"]["people"]["arguments"]) > 1:
         if not isinstance(people, list) or any(not isinstance(group, list) for group in people):
             raise Uncovered("Incomplete contact groups")
@@ -146,9 +126,9 @@ def select_record_subset(program, plan, inputs, id_field):
         raise Uncovered("The selected contacts are not a record collection")
     start, end = plan["window"]
     selected = {}
-    filter_rows = load_program(program)
+    contacts = replace(loaded["people"], data=people)
     for port, actor in plan["actors"].items():
-        rows = inputs[port]
+        rows = loaded[port].data
         if not isinstance(rows, list) or any(not isinstance(row, dict) or id_field not in row for row in rows):
             raise Uncovered("The selected official read did not return the expected record type")
         if start:
@@ -157,12 +137,14 @@ def select_record_subset(program, plan, inputs, id_field):
             rows = [row for row in rows if start <= row["created_at"][:10] <= end]
         originals = {key(row): row for row in rows}
         try:
-            result = filter_rows({"rows": deepcopy(rows), "people": deepcopy(people),
-                                  "record_key": [actor, "email"], "people_key": ["email"]})
-        except (ArithmeticError, AttributeError, IndexError, KeyError, NameError, TypeError, ValueError) as exc:
+            result = run_card(card, {"record_key": [actor, "email"], "people_key": ["email"]},
+                              {"rows": replace(loaded[port], data=rows), "people": contacts})
+        except PROGRAM_ERRORS as exc:
             raise Uncovered(f"Cannot apply the filter to the selected records: {exc}") from exc
         if not isinstance(result, list) or any(not isinstance(row, dict) or key(row) not in originals for row in result):
             raise Uncovered("The filter must return a subset of the selected official records")
+        if any(type(row[id_field]) is not int for row in result):
+            raise Uncovered("The selected records do not have valid official identifiers")
         for row in result:
             selected[row[id_field]] = originals[key(row)]
     return list(selected.values())

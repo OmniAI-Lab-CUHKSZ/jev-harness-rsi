@@ -3,12 +3,14 @@ from unittest.mock import Mock
 
 import pytest
 
+from jev_harness.composed_assembly import ComposedAssembly
+from jev_harness.composition import resolve_card
 from jev_harness.formal_runtime import BudgetExhausted
-from jev_harness.native_assembly import DISCOVER, FINISH, MORE_FRAGMENTS, NativeAssembly, NativeGeneration, blank_library
+from jev_harness.native_assembly import DISCOVER, FINISH, MORE_FRAGMENTS, NativeGeneration, blank_library
 from jev_harness.native_evidence import fragment_evidence
 from jev_harness.native_replay import first_change
 from jev_harness.native_revision import apply_edits, trial_task
-from jev_harness.runtime import Trace
+from jev_harness.runtime import Trace, Uncovered
 from jev_harness.schema_tools import (
     Observation,
     bound_plans,
@@ -45,6 +47,19 @@ TOOLS = [
     tool("store__request_item", "Ask a recipient to send an item.", {"item_id": INTEGER}, ["item_id"]),
     tool(FINISH, "Mark the task as completed", {"answer": STRING}),
 ]
+
+
+def card(label, program, sources, *, fields=None, subset=None, choices=None, goal_terms=None):
+    inputs = {port: {"sources": [{"source": source}] if isinstance(source, str) else source}
+              for port, source in sources.items()}
+    output = {"subset": subset} if subset else {}
+    if fields:
+        output["fields"] = fields
+    composition = {"inputs": inputs, "output": output}
+    if choices:
+        composition["choices"] = choices
+    return {"label": label, "program": program, "composition": composition,
+            **({"goal_terms": goal_terms} if goal_terms else {})}
 
 
 def choose(index, count):
@@ -94,7 +109,7 @@ def scripted(operation, **req):
             return choose(len(options) - 1, len(options))
         facts = json.loads(req["state"])
         target = (
-            "Complete the task now"
+            "Complete the task"
             if facts["tool_receipts"]
             else "store__send_item"
             if facts["observations"]
@@ -112,7 +127,7 @@ def scripted(operation, **req):
 def setup_engine():
     model = Mock()
     model.request.side_effect = scripted
-    return NativeAssembly(
+    return ComposedAssembly(
         model,
         World(),
         max_calls=12,
@@ -253,11 +268,8 @@ def test_offline_fragment_gets_a_real_source_and_no_unselected_guidance_enters_g
                 {
                     "kind": "fragment",
                     "name": "latest_order",
-                    "value": {
-                        "sources": ["store__show_orders"],
-                        "label": "Get the latest order",
-                        "program": "return state['rows'][-1:]",
-                    },
+                    "value": card("Get the latest order", "return state['inputs']['orders']['rows'][-1:]",
+                                  {"orders": "store__show_orders"}, subset="orders"),
                 },
                 {"kind": "decision", "name": "store__request_item", "value": "unused decision guidance"},
             ]
@@ -267,7 +279,8 @@ def test_offline_fragment_gets_a_real_source_and_no_unselected_guidance_enters_g
     e.initialize_native(lib)
     e.observe("store__show_orders", [{"item_id": 1}, {"item_id": 2}], "all")
     assert e.fragments()[0][1] == ("fragment", "latest_order", "r1")
-    assert e.program("fragment", "latest_order", e.observed[0]) == [{"item_id": 2}]
+    e.execute_card(("fragment", "latest_order", "r1"))
+    assert e.observed[-1].rows == [{"item_id": 2}]
     for endpoint in ("store__send_item", None):
         e.generate_one = Mock(return_value={"search": "missing prerequisite"})
         e.local_action(endpoint)
@@ -409,12 +422,12 @@ def test_learned_join_waits_for_both_observations_and_additional_fragments_remai
     e = setup_engine()
     e.trace = Trace()
     e.context = {"task": {"instruction": "Get the items referenced by my notes", "functions": TOOLS}}
-    spec = {
-        "sources": ["store__show_orders"],
-        "inputs": ["notes__show_items"],
-        "label": "Select referenced items",
-        "program": "ids = [n['id'] for n in state['inputs']['notes__show_items']['rows']]\nreturn [r for r in state['rows'] if r['id'] in ids]",
-    }
+    spec = card(
+        "Select referenced items",
+        "ids = [r['id'] for r in state['inputs']['notes']['rows']]\n"
+        "return [r for r in state['inputs']['orders']['rows'] if r['id'] in ids]",
+        {"orders": "store__show_orders", "notes": "notes__show_items"}, subset="orders",
+    )
     lib = apply_edits(
         blank_library(),
         {"objects": [{"kind": "fragment", "name": "match_notes", "value": spec}]},
@@ -425,7 +438,7 @@ def test_learned_join_waits_for_both_observations_and_additional_fragments_remai
     assert not e.fragments()
     e.observe("notes__show_items", [{"id": 4}], "notes")
     assert e.fragments()[0][1] == ("fragment", "match_notes", "r1", "r2")
-    assert e.program("fragment", "match_notes", e.observed[0], [e.observed[1]]) == [{"id": 4}]
+    assert resolve_card(e, "match_notes", spec, dict(zip(("orders", "notes"), e.observed))) == [{"id": 4}]
     for i in range(14):
         lib["fragment"][f"other_{i}"] = {**spec, "label": f"Other transformation {i}"}
     pages = []
@@ -444,8 +457,8 @@ def test_homepage_can_offer_zero_and_browse_the_same_fragment_on_request():
     notes, sms = "notes__show_note", "phone__search_messages"
     e.context = {"task": {"instruction": "Use my note to reply to the message about music", "functions": TOOLS}}
     e.initialize_native(blank_library())
-    spec = {"sources": [notes], "inputs": [sms], "label": "Find film titles in a note for a message",
-            "goal_terms": ["film", "something to watch"], "program": "return state['rows']"}
+    spec = card("Find film titles in a note for a message", "return state['inputs']['note']['rows']",
+                {"note": notes, "message": sms}, subset="note", goal_terms=["film", "something to watch"])
     e.lib["fragment"]["films"] = spec
     e.observe(notes, [{"title": "Film notes"}], "films")
     assert not e.fragments()
@@ -465,32 +478,32 @@ def test_homepage_can_offer_zero_and_browse_the_same_fragment_on_request():
     entry = fragment_evidence(e.trace.events, e.lib)["fragments"]["films"]
     assert entry["eligible"] == 1 and entry["recommended"] == 0
     e.ask = lambda node, question, options, skill: [value for _, value in options]
-    e.instruction = "Reply from the note about something to sit down and watch"
+    e.instruction = e.goal = "Reply from the note about something to watch"
     assert chosen in e.action_page([])
-    e.instruction = "Give me the film titles"
+    e.instruction = e.goal = "Give me the film titles"
     assert chosen in e.action_page([])
     with pytest.raises(ValueError, match="goal_terms"):
         apply_edits(blank_library(), {"objects": [{"kind": "fragment", "name": "films",
             "value": {**spec, "goal_terms": "film"}}]}, {notes: {}, sms: {}})
     del spec["goal_terms"]
     assert chosen in e.action_page([])
-    e.instruction = "Find the messages in my notes"
+    e.instruction = e.goal = "Set the phone alarm"
     assert chosen not in e.action_page([])
     for name in ("second", "third"):
         e.lib["fragment"][name] = dict(spec)
-    e.instruction = "Give me the film titles"
+    e.instruction = e.goal = "Give me the film titles"
     assert len(e.fragments()) == 3
-    assert len([v for v in e.action_page([]) if isinstance(v, tuple) and v[0] == "fragment"]) == 2
+    assert len([v for v in e.action_page([]) if isinstance(v, tuple) and v[0] == "fragment"]) == 3
 
 
 def test_adding_irrelevant_fragment_preserves_solved_prefix_and_new_recommendation_reselects():
     e = setup_engine()
     assert e.run("synthetic")["success"]
     candidate = blank_library()
-    candidate["fragment"]["sample"] = {
-        "sources": ["store__show_orders"], "label": "Select a greeting for the order",
-        "program": "return state['rows']", "goal_terms": ["film"],
-    }
+    candidate["fragment"]["sample"] = card(
+        "Select a greeting for the order", "return state['inputs']['orders']['rows']",
+        {"orders": "store__show_orders"}, subset="orders", goal_terms=["film"],
+    )
     config = dict(max_calls=12, step_review_mode="official_adaptive", step_review_threshold=0.60,
                   step_review_thinking_budget=256)
     e.model.request.reset_mock()
@@ -573,12 +586,12 @@ def test_already_satisfied_checkbox_is_idempotent_and_ambiguous_goal_offers_both
 def test_real_flow_credits_projections_and_never_credits_a_skipped_or_rejected_write():
     e = setup_engine()
     library = blank_library()
-    library["fragment"]["greeting"] = {
-        "sources": ["store__show_orders"],
-        "label": "Prepare the greeting",
-        "goal_terms": ["personalized message"],
-        "program": "return [{'item_id': state['rows'][0]['item_id'], 'message': 'Enjoy your order!'}]",
-    }
+    library["fragment"]["greeting"] = card(
+        "Prepare the greeting",
+        "return [{'item_id': state['inputs']['orders']['rows'][0]['item_id'], 'message': 'Enjoy your order!'}]",
+        {"orders": "store__show_orders"}, fields={"item_id": "integer", "message": "string"},
+        goal_terms=["personalized message"],
+    )
 
     def decide(op, **req):
         if op == "decide":
@@ -591,7 +604,7 @@ def test_real_flow_credits_projections_and_never_credits_a_skipped_or_rejected_w
             facts = json.loads(req["state"])
             source = [o["source"] for o in facts["observations"]]
             start = (
-                "Complete the task now"
+                "Complete the task"
                 if facts["tool_receipts"]
                 else "store__send_item"
                 if "greeting" in source
@@ -622,9 +635,10 @@ def test_real_flow_credits_projections_and_never_credits_a_skipped_or_rejected_w
     initial = library["fragment"]["greeting"]
     revised = apply_edits(library, {"objects": [{"kind": "fragment", "name": "greeting", "value": {
         **initial,
-        "choice": {"source": "store__show_orders", "fields": ["item_id"],
-                   "question": "Which order did the customer mean?"},
-        "program": "if 'selected' not in state:\n    return {'$choose': [0]}\n"
+        "composition": {**initial["composition"], "choices": {"order": {
+            "input": "orders", "fields": ["item_id"], "question": "Which order did the customer mean?",
+        }}},
+        "program": "if 'selected' not in state:\n    return {'$choose': {'role': 'order', 'rows': [0]}}\n"
                    "return [{'item_id': state['selected']['value']['item_id'], 'message': 'Enjoy your order!'}]",
     }}]}, {t["name"]: t for t in TOOLS})
     config = dict(max_calls=12, step_review_mode="official_adaptive", step_review_threshold=0.60,
@@ -651,12 +665,13 @@ def test_unusable_fragment_rows_do_not_call_jev_or_become_observations(indices):
     e.prepare_options()
     e.trace = Trace()
     e.context = {"task": {"instruction": "Choose an order", "functions": TOOLS}}
-    spec = {"sources": ["store__show_orders"], "label": "Order",
-            "choice": {"source": "store__show_orders", "fields": ["item_id"], "question": "Which order?"},
-            "program": "return {'$choose': " + repr(indices) + "}"}
+    spec = card("Order", f"return {{'$choose': {{'role': 'order', 'rows': {indices!r}}}}}",
+                {"orders": "store__show_orders"}, subset="orders",
+                choices={"order": {"input": "orders", "fields": ["item_id"], "question": "Which order?"}})
     e.initialize_native({"fragment": {"order": spec}})
     obs = Observation("r1", "store__show_orders", [{"item_id": 12}], "orders")
-    assert e.resolve_fragment("order", obs) is None
+    with pytest.raises(Uncovered):
+        resolve_card(e, "order", spec, {"orders": obs})
     assert e.trace.events[-1]["status"] == "unavailable"
     e.model.request.assert_not_called()
 
@@ -666,29 +681,29 @@ def test_fragment_none_abstains_even_if_there_is_only_one_offered_row():
     e.prepare_options()
     e.trace = Trace()
     e.context = {"task": {"instruction": "Use the other order", "functions": TOOLS}}
-    spec = {"sources": ["store__show_orders"], "label": "Order",
-            "choice": {"source": "store__show_orders", "fields": ["item_id"], "question": "Which order?"},
-            "program": "return {'$choose': [0]}"}
+    spec = card("Order", "return {'$choose': {'role': 'order', 'rows': [0]}}",
+                {"orders": "store__show_orders"}, subset="orders",
+                choices={"order": {"input": "orders", "fields": ["item_id"], "question": "Which order?"}})
     e.initialize_native({"fragment": {"order": spec}})
     e.model.request.side_effect = lambda op, **req: choose(len(req["options"]) - 1, len(req["options"]))
     obs = Observation("r1", "store__show_orders", [{"item_id": 12}], "orders")
-    assert e.resolve_fragment("order", obs) is None
+    with pytest.raises(Uncovered):
+        resolve_card(e, "order", spec, {"orders": obs})
     assert e.trace.events[-1]["status"] == "unbound" and e.model.request.call_count == 1
 
 
 def test_fragment_can_ask_again_using_only_the_relevant_previous_record():
     source = "store__show_orders"
-    slot = {"source": source, "fields": ["item_id"], "question": "Which order is referred to?"}
-    spec = {
-        "sources": [source], "label": "Resolve related orders", "choices": {"start": slot, "related": slot},
-        "program": """answers = state.get('selections', [])
+    slot = {"input": "orders", "fields": ["item_id"], "question": "Which order is referred to?"}
+    spec = card("Resolve related orders", """answers = state.get('selections', [])
 if not answers:
     return {'$choose': {'role': 'start', 'rows': [0, 1]}}
 if len(answers) <= 2:
     reference = answers[-1]['row']
     return {'$choose': {'role': 'related', 'rows': [0, 1], 'using': {'start': reference}}}
-return [a['value']['item_id'] for a in answers]""",
-    }
+return [a['value'] for a in answers]""",
+        {"orders": source}, subset="orders", choices={"start": slot, "related": slot},
+    )
     library = apply_edits(blank_library(), {"objects": [{"kind": "fragment", "name": "related", "value": spec}]},
                           {t["name"]: t for t in TOOLS})
     obs = Observation("r1", source, [{"item_id": 4, "private_context": "irrelevant"}, {"item_id": 7}], "guess")
@@ -698,7 +713,7 @@ return [a['value']['item_id'] for a in answers]""",
     e.context = {"task": {"instruction": "Find the related orders", "functions": TOOLS}}
     e.initialize_native(library)
     e.model.request.side_effect = [choose(1, 3), choose(0, 3), choose(1, 3)]
-    assert e.resolve_fragment("related", obs) == [7, 4, 7]
+    assert [r["item_id"] for r in resolve_card(e, "related", spec, {"orders": obs})] == [7, 4, 7]
     views = [json.loads(c.kwargs["state"]) for c in e.model.request.call_args_list]
     assert "reference_records" not in views[0]
     assert [v["reference_records"] for v in views[1:]] == [
@@ -718,7 +733,7 @@ return [a['value']['item_id'] for a in answers]""",
     e.model.request.reset_mock()
     e.model.request.side_effect = [choose(1, 3), choose(0, 3)]
     with pytest.raises(BudgetExhausted):
-        e.resolve_fragment("related", obs)
+        resolve_card(e, "related", spec, {"orders": obs})
     assert e.model.request.call_count == 2
 
 
@@ -728,27 +743,30 @@ def test_fragment_does_not_pay_twice_for_an_answered_question_with_reordered_row
     e.trace = Trace()
     e.context = {"task": {"instruction": "Pick an order", "functions": TOOLS}}
     source = "store__show_orders"
-    spec = {"sources": [source], "label": "Order", "choice": {
-        "source": source, "fields": ["item_id"], "question": "Which order?"},
-        "program": "return {'$choose': [1,0] if state.get('selected') else [0,1]}"}
+    spec = card("Order", "return {'$choose': {'role': 'order', 'rows': [1,0] if state.get('selected') else [0,1]}}",
+                {"orders": source}, subset="orders",
+                choices={"order": {"input": "orders", "fields": ["item_id"], "question": "Which order?"}})
     e.initialize_native({"fragment": {"order": spec}})
     e.model.request.side_effect = lambda op, **req: choose(0, len(req["options"]))
-    assert e.resolve_fragment("order", Observation("r1", source, [{"item_id": 0}, {"item_id": 1}], "")) is None
+    obs = Observation("r1", source, [{"item_id": 0}, {"item_id": 1}], "")
+    with pytest.raises(Uncovered, match="already has an answer"):
+        resolve_card(e, "order", spec, {"orders": obs})
     assert e.model.request.call_count == 1 and e.trace.events[-1]["status"] == "repeated"
 
 
 def test_historical_replay_reaches_the_first_changed_internal_question_after_matching_the_first():
     e = setup_engine()
     source = "store__show_orders"
-    slot = {"source": source, "fields": ["item_id"], "question": "Which record?"}
-    spec = {"sources": [source], "label": "Prepare the greeting", "goal_terms": ["personalized message"], "choices": {
-        "target": slot, "item": slot, "owner": slot},
-        "program": """answers = state.get('selections', [])
+    slot = {"input": "orders", "fields": ["item_id"], "question": "Which record?"}
+    spec = card("Prepare the greeting", """answers = state.get('selections', [])
 if not answers:
     return {'$choose': {'role': 'target', 'rows': [0]}}
 if len(answers) == 1:
     return {'$choose': {'role': 'item', 'rows': [0], 'using': {'target': answers[0]['row']}}}
-return [{'item_id': state['selected']['value']['item_id'], 'message': 'Enjoy your order!'}]"""}
+return [{'item_id': state['selected']['value']['item_id'], 'message': 'Enjoy your order!'}]""",
+        {"orders": source}, fields={"item_id": "integer", "message": "string"},
+        goal_terms=["personalized message"], choices={"target": slot, "item": slot, "owner": slot},
+    )
     lib = blank_library()
     lib["fragment"]["greeting"] = spec
 
@@ -759,7 +777,7 @@ return [{'item_id': state['selected']['value']['item_id'], 'message': 'Enjoy you
             return choose(0, len(options))
         facts = json.loads(req["state"])
         sources = [obs["source"] for obs in facts["observations"]]
-        label = ("Complete the task now" if facts["tool_receipts"] else "store__send_item" if "greeting" in sources
+        label = ("Complete the task" if facts["tool_receipts"] else "store__send_item" if "greeting" in sources
                  else "Prepare the greeting" if sources else "store__show_orders")
         return choose(next(i for i, option in enumerate(options) if option.startswith(label)), len(options))
 
@@ -783,11 +801,10 @@ return [{'item_id': state['selected']['value']['item_id'], 'message': 'Enjoy you
 
 def test_skipped_fragment_can_disagree_with_an_officially_accepted_literal():
     lib = blank_library()
-    lib["fragment"]["shortlist"] = {
-        "sources": ["app__show_catalogue"],
-        "label": "Shortlist",
-        "program": "return [{'message': state['rows'][0]['title']}]",
-    }
+    lib["fragment"]["shortlist"] = card(
+        "Shortlist", "return [{'message': state['inputs']['catalogue']['rows'][0]['title']}]",
+        {"catalogue": "app__show_catalogue"}, fields={"message": "string"},
+    )
     events = [
         {"event": "task", "instruction": "Send titles"},
         {"event": "native_protocol", "version": "v2"},
@@ -826,8 +843,11 @@ def test_skipped_fragment_can_disagree_with_an_officially_accepted_literal():
         "submitted": "A, B",
     }
     spec = lib["fragment"]["shortlist"]
-    spec["choice"] = {"source": "app__show_catalogue", "fields": ["title"], "question": "Which title?"}
-    spec["program"] = "return {'$choose': [0]}"
+    spec["composition"]["choices"] = {
+        "title": {"input": "catalogue", "fields": ["title"], "question": "Which title?"}
+    }
+    spec["program"] = "return {'$choose': {'role': 'title', 'rows': [0]}}"
+
     flow = fragment_evidence(events, lib)["fragments"]["shortlist"]
     assert flow["skipped_output_checks"][0]["status"] == "needs_fragment_choice"
     assert not flow["produced"] and not flow["accepted_uses"]
@@ -835,11 +855,8 @@ def test_skipped_fragment_can_disagree_with_an_officially_accepted_literal():
 
 def test_scope_and_program_inputs_are_distinguished_from_proven_field_use():
     lib = blank_library()
-    lib["fragment"]["sample"] = {
-        "sources": ["app__show"],
-        "label": "Sample",
-        "program": "return state['rows']",
-    }
+    lib["fragment"]["sample"] = card("Sample", "return state['inputs']['records']['rows']",
+                                     {"records": "app__show"}, subset="records")
     events = [
         {"event": "native_protocol", "version": "v2"},
         {
@@ -903,7 +920,7 @@ def test_scope_and_program_inputs_are_distinguished_from_proven_field_use():
 def test_draft_trial_selects_only_an_affected_current_training_task():
     parent = blank_library()
     lib = blank_library()
-    lib["fragment"]["joint"] = {"sources": ["app__show_x"], "inputs": ["app__show_y"]}
+    lib["fragment"]["joint"] = card("Join", "return None", {"x": "app__show_x", "y": "app__show_y"}, subset="x")
     panel = {
         "h0_decision/a": {"success": False, "steps": [], "observed_sources": ["app__show_x"]},
         "h0_decision/b": {"success": True, "steps": [], "observed_sources": ["app__show_x", "app__show_y"]},
@@ -913,91 +930,7 @@ def test_draft_trial_selects_only_an_affected_current_training_task():
     assert trial_task(["a", "b"], impacts, panel, parent, lib) == "b"
 
 
-def test_score_command_runs_three_independent_arms_without_editor(tmp_path, monkeypatch):
-    import argparse
-    from formal_run import read, save
-    from jev_harness import native_pilot
-
-    root = tmp_path / "scores"
-    parent = blank_library()
-    child = blank_library()
-    child["decision"]["store__send_item"] = "Deliver the selected order."
-    save(tmp_path / "entry.json", parent)
-    save(tmp_path / "candidate.json", child)
-    calls = []
-
-    class Study:
-        def __init__(self, *args, **kwargs):
-            self.groups = {"local:0": object()}
-
-        def start_workers(self):
-            pass
-
-        def paired_model_info(self):
-            pass
-
-        def status(self, *args, **kwargs):
-            pass
-
-        def close(self):
-            pass
-
-        def execute_preferred(self, jobs, fn, affinity):
-            return [fn(job, object()) for job in jobs]
-
-        def run_task(self, task, stage, arm, library, workers):
-            calls.append((task, stage, arm, library))
-            fn = root / "runs" / stage / task / "attempt_1" / "trace.jsonl"
-            fn.parent.mkdir(parents=True)
-            fn.write_text(json.dumps({"event": "task", "instruction": "Read"}) + "\n", encoding="utf-8")
-            row = {
-                k: 0
-                for k in (
-                    "output_tokens",
-                    "open_calls",
-                    "native_ballots",
-                    "open_output_tokens",
-                    "decision_output_tokens",
-                    "api_calls",
-                    "seconds",
-                )
-            }
-            row.update(
-                task_id=task, success=True, error=None, gpu="local:0", trace_path=str(fn.relative_to(root))
-            )
-            save(fn.parent.parent / "record.json", row)
-            return row
-
-    monkeypatch.setattr(native_pilot, "NativeStudy", Study)
-    parser = argparse.ArgumentParser()
-    native_pilot.configure(parser)
-    args = parser.parse_args(
-        [
-            "--connections",
-            "x",
-            "--root",
-            str(root),
-            "--train",
-            "07b42fd_1",
-            "--check",
-            "cf6abd2_2",
-            "--phase",
-            "score",
-            "--entry-library",
-            str(tmp_path / "entry.json"),
-            "--candidate-library",
-            str(tmp_path / "candidate.json"),
-        ]
-    )
-    native_pilot.run_pilot(args, {"seed": 10, "execution": {}}, {"model_nodes": {}})
-    assert len(calls) == len(read(root / "pilot_results.json")) == 6
-    assert all(lib == child if stage == "candidate" else lib == parent for _, stage, _, lib in calls)
-    assert len(list((root / "runs").glob("*/*/fragment_flow.json"))) == 6
-
-
 def test_composed_reads_and_cards_form_one_scoped_answer_without_generation():
-    from jev_harness.composed_assembly import ComposedAssembly
-
     tools = [
         tool("store__show_orders", "List owned orders."),
         tool("store__show_order", "Read order details.", {"order_id": INTEGER}, ["order_id"]),
@@ -1032,23 +965,17 @@ def test_composed_reads_and_cards_form_one_scoped_answer_without_generation():
 
     lib = blank_library()
     lib["fragment"] = {
-        "order_ids": {
-            "label": "collect the owned orders",
-            "sources": ["store__show_orders"],
-            "reads": {"store__show_orders": "return [{}]"},
-            "produces": {"order_id": "integer"},
-            "program": 'return state["rows"] if state["arguments"] == [{}] else None',
-        },
-        "largest_order": {
-            "label": "find the largest order",
-            "goal_terms": ["largest order"],
-            "sources": ["order_ids"],
-            "inputs": ["store__show_order"],
-            "reads": {"store__show_order": 'return state["inputs"]["order_ids"]["rows"]'},
-            "produces": {"title": "string"},
-            "program": 'rows = state["inputs"]["store__show_order"]["rows"]\n'
-                       'return {"title": max((r["size"], r["title"]) for r in rows)[1]}',
-        },
+        "order_ids": card(
+            "collect the owned orders", 'return state["inputs"]["orders"]["rows"]',
+            {"orders": [{"source": "store__show_orders", "read": [{}]}]}, fields={"order_id": "integer"},
+        ),
+        "largest_order": card(
+            "find the largest order",
+            'rows = state["inputs"]["details"]["rows"]\nreturn {"title": max((r["size"], r["title"]) for r in rows)[1]}',
+            {"ids": "order_ids", "details": [{"source": "store__show_order",
+              "read": {"input": "ids", "fields": {"order_id": "order_id"}}}]},
+            fields={"title": "string"}, goal_terms=["largest order"],
+        ),
     }
     executor = ComposedAssembly(Mock(request=model), Mock(request=environment))
     row = executor.run("synthetic", lib)
@@ -1057,12 +984,10 @@ def test_composed_reads_and_cards_form_one_scoped_answer_without_generation():
                      ("complete_task", {"answer": "Large"})]
     flow = fragment_evidence(executor.trace.events, lib)
     assert flow["fragments"]["order_ids"]["accepted_uses"][0]["role"] == "upstream_of_bound_source"
-    assert first_change(executor.trace.events, lib, tools, {}, executor_type=ComposedAssembly)["status"] == "unchanged"
+    assert first_change(executor.trace.events, lib, tools, {})["status"] == "unchanged"
 
 
 def test_composed_effects_share_scope_and_require_both_receipts():
-    from jev_harness.composed_assembly import ComposedAssembly
-
     fields = {"payment_id": INTEGER}
     tools = [tool("store__like_payment", "Like a payment.", fields, fields),
              tool("store__comment_payment", "Comment on a payment.", fields, fields),
@@ -1106,8 +1031,6 @@ def test_composed_effects_share_scope_and_require_both_receipts():
 
 
 def test_composed_read_delegation_resumes_and_preserves_existing_observations():
-    from jev_harness.composed_assembly import ComposedAssembly
-
     captured = []
     tools = [tool("store__show_orders", "List orders."), tool(FINISH, "Finish.")]
 
@@ -1137,60 +1060,19 @@ def test_composed_read_delegation_resumes_and_preserves_existing_observations():
 
 def test_composed_editor_accepts_typed_acquisition_and_blocks_writes_from_read_ports():
     tools = {t["name"]: t for t in TOOLS}
-    spec = {"label": "Read open orders", "sources": ["store__show_orders"],
-            "produces": {"item_id": "integer"}, "reads": {"store__show_orders": "return [{}]"},
-            "program": 'return state["rows"]'}
+    spec = card("Read open orders", 'return state["inputs"]["orders"]["rows"]',
+                {"orders": [{"source": "store__show_orders", "read": [{}]}]}, fields={"item_id": "integer"})
     edit = {"objects": [{"kind": "fragment", "name": "open_orders", "value": spec}]}
-    assert apply_edits(blank_library(), edit, tools, composed=True)["fragment"]["open_orders"] == spec
-    spec.update(sources=["store__send_item"], reads={"store__send_item": "return [{}]"})
-    with pytest.raises(ValueError, match="declared public read source"):
-        apply_edits(blank_library(), edit, tools, composed=True)
-
-
-def test_dynamic_editor_and_menu_ground_a_single_plan_without_extra_model_questions():
-    from jev_harness.composed_assembly import ComposedAssembly
-
-    spec = {
-        "label": "Read order for the requested item",
-        "sources": ["store__show_orders"],
-        "program": 'return state["reads"]["orders"]',
-        "dynamic": {
-            "plan": ('return [{"result":"item", "choices":{"scope":"ordered items"}, '
-                     '"reads":{"orders":{"source":"store__show_orders", "arguments":[{}]}}}]'),
-            "slots": {"scope": {"question": "Which items?"}},
-            "results": {"item": {"fields": {"item_id": "integer"}, "writes": {
-                "store__send_item": {"fields": {"item_id": "item_id"},
-                                     "arguments": 'return {"message":"Enjoy your order!"}'}
-            }}},
-        },
-    }
-    proposal = {"objects": [
-        {"kind": "fragment", "name": "order_items", "value": spec},
-        {"kind": "decision", "name": "order_items", "value": "Use actual orders."},
-        {"kind": "state", "name": "send_intent", "value": {
-            "label": "Requested item delivery", "sources": [], "intent": True,
-            "program": 'return ["store__send_item"] if "send" in state["goal"] else []',
-        }},
-    ]}
-    tools = {t["name"]: t for t in TOOLS}
-    library = apply_edits(blank_library(), proposal, tools, composed=True)
-    engine = ComposedAssembly(Mock(), World())
-    engine.trace, engine.done = Trace(), False
-    engine.context = {"task": {"functions": TOOLS, "instruction": "Send the item from the order"}, "history": []}
-    engine.initialize_native(library)
-    assert any("Use actual orders." in label for _, _, label, _ in engine.card_plans())
-    engine.ask = Mock(side_effect=AssertionError("There is only one scope to bind"))
-    engine.observe("store__show_orders", [{"item_id": 12}], "Published orders", arguments=[{}])
-    engine.execute_card(("dynamic", "order_items"))
-    (endpoint, batch, _, source), = engine.compiled_bindings("store__send_item")
-    assert endpoint == "store__send_item"
-    assert batch == [{"item_id": 12, "message": "Enjoy your order!"}]
-    assert source == {"r2": {"fields": {"item_id": "item_id"}}}
-    engine.ask.assert_not_called()
-
-    engine.context["task"]["instruction"] = "Review the order's phone number"
-    engine.initialize_native(library)
-    assert not engine.card_plans()
+    assert apply_edits(blank_library(), edit, tools)["fragment"]["open_orders"] == spec
+    spec["composition"]["inputs"]["orders"]["sources"][0]["source"] = "store__send_item"
+    with pytest.raises(ValueError, match="published read endpoint"):
+        apply_edits(blank_library(), edit, tools)
+    edit["objects"][0]["value"] = {"label": "Retired", "program": "return []", "sources": ["store__show_orders"]}
+    with pytest.raises(ValueError, match="needs label, program and composition"):
+        apply_edits(blank_library(), edit, tools)
+    edit["objects"][0]["value"]["dynamic"] = {}
+    with pytest.raises(ValueError, match="needs label, program and composition"):
+        apply_edits(blank_library(), edit, tools)
 
 
 def test_calendar_scope_distinguishes_no_restriction_from_unsupported_dates():
@@ -1206,8 +1088,6 @@ def test_calendar_scope_distinguishes_no_restriction_from_unsupported_dates():
 
 
 def test_endpoint_independent_filter_preserves_both_transaction_directions_and_original_fields():
-    from jev_harness.composed_assembly import ComposedAssembly
-
     contacts, payments, like = "phone__search_contacts", "venmo__show_transactions", "venmo__like_transaction"
     tools = [
         tool(contacts, "Search phone contacts", {"relationship": STRING}),
@@ -1218,16 +1098,17 @@ def test_endpoint_independent_filter_preserves_both_transaction_directions_and_o
     ]
     proposal = {"objects": [{"kind": "fragment", "name": "match_people", "value": {
         "label": "Match counterparties to the selected contacts",
-        "composition": {"inputs": {"rows": "counterparty_records", "people": "contact_identities"},
-                        "output": "matching_records"},
+        "composition": {"inputs": {"rows": {"role": "counterparty_records"},
+                                   "people": {"role": "contact_identities"}},
+                        "output": {"subset": "rows"}},
         "program": (
-            'emails = {person[state["people_key"][0]] for person in state["people"]}\n'
+            'emails = {person[state["people_key"][0]] for person in state["inputs"]["people"]["rows"]}\n'
             'actor, field = state["record_key"]\n'
-            'return [row for row in state["rows"] if row[actor][field] in emails]'
+            'return [row for row in state["inputs"]["rows"]["rows"] if row[actor][field] in emails]'
         ),
     }}]}
     parent = blank_library()
-    child = apply_edits(parent, proposal, {t["name"]: t for t in tools}, composed=True)
+    child = apply_edits(parent, proposal, {t["name"]: t for t in tools})
     model = Mock(request=lambda operation, **request: choose(0, len(request["options"])))
     engine = ComposedAssembly(model, Mock())
     engine.trace = Trace()
@@ -1240,8 +1121,7 @@ def test_endpoint_independent_filter_preserves_both_transaction_directions_and_o
 
     engine.initialize_native(parent)
     engine.next_action()
-    change = first_change(engine.trace.events, child, tools, {}, model,
-                          executor_type=ComposedAssembly, continue_after_choice=True)
+    change = first_change(engine.trace.events, child, tools, {}, model)
     assert change["status"] == "reselected" and change["continuation"]["after"] == "call"
     assert change["proposed_reads"][0]["sources"] == [contacts, payments, payments]
 
@@ -1252,8 +1132,8 @@ def test_endpoint_independent_filter_preserves_both_transaction_directions_and_o
     engine.ask = Mock(side_effect=[None, payments])
     assert engine.action_page([payments]) == payments
     offered = {value: label for label, value in engine.ask.call_args_list[0].args[2]}
-    assert "Acquires the scoped phone and venmo inputs itself" in offered[("dynamic", "match_people")]
-    assert "Read arguments already bound." in offered[("dynamic", "match_people")]
+    assert "Acquires the scoped phone and venmo inputs itself" in offered[("fragment", "match_people")]
+    assert "Read arguments already bound." in offered[("fragment", "match_people")]
     assert "Contact matching still remains." in offered[payments]
     assert "another choice or generated arguments" in offered[payments]
     assert engine.ask.call_args_list[0].args[3] == prior_request.args[3]
@@ -1272,8 +1152,8 @@ def test_endpoint_independent_filter_preserves_both_transaction_directions_and_o
                    arguments=[{"direction": "sent", "min_created_at": "2023-01-01"}])
     engine.observe(payments, [received, {**received, "transaction_id": 3, "created_at": "2022-12-31"}],
                    "Received transactions", arguments=[{"direction": "received", "min_created_at": "2023-01-01"}])
-    assert engine.card_plans()[0][3] == ("dynamic", "match_people")
-    engine.execute_card(("dynamic", "match_people"))
+    assert engine.card_plans()[0][3] == ("fragment", "match_people")
+    engine.execute_card(("fragment", "match_people"))
     assert engine.observed[-1].rows == [sent, received]
     assert engine.compiled_bindings(like)[0][1] == [{"transaction_id": 1}, {"transaction_id": 2}]
 
@@ -1284,17 +1164,16 @@ def test_endpoint_independent_filter_preserves_both_transaction_directions_and_o
 
 @pytest.mark.parametrize("planner", ['return None', 'return [{"contact_id": "invalid"}]'])
 def test_composed_prechecks_a_companion_before_showing_the_card(planner):
-    from jev_harness.composed_assembly import ComposedAssembly
-
     tools = [*TOOLS, tool("store__show_contact", "Read one contact.", {"contact_id": INTEGER}, ["contact_id"])]
     e = ComposedAssembly(Mock(), Mock())
     e.trace = Trace()
     e.context = {"task": {"functions": tools, "instruction": "Read order and contact"}, "history": []}
     library = blank_library()
-    library["fragment"]["read_contact"] = {
-        "label": "Select order contact", "sources": ["store__show_orders"], "inputs": ["store__show_contact"],
-        "reads": {"store__show_contact": planner}, "program": 'return state["rows"]',
-    }
+    library["fragment"]["read_contact"] = card(
+        "Select order contact", 'return state["inputs"]["orders"]["rows"]',
+        {"orders": "store__show_orders", "contact": [{"source": "store__show_contact", "read": planner}]},
+        subset="orders",
+    )
     e.initialize_native(library)
     e.observe("store__show_orders", [{"order_id": 1}], "Complete order read")
     assert not e.card_plans()
@@ -1304,8 +1183,6 @@ def test_composed_prechecks_a_companion_before_showing_the_card(planner):
 
 @pytest.mark.parametrize("matched_ids", [[12, 12, 13], []])
 def test_composed_projected_sets_drive_official_reads_and_writes(matched_ids):
-    from jev_harness.composed_assembly import ComposedAssembly
-
     tools = [
         tool("store__show_orders", "List orders."),
         tool("store__show_order", "Read details of an order.", {"order_id": INTEGER}, ["order_id"]),
@@ -1343,18 +1220,17 @@ def test_composed_projected_sets_drive_official_reads_and_writes(matched_ids):
 
     library = blank_library()
     library["fragment"] = {
-        "order_ids": {
-            "label": "Read all order IDs", "sources": ["store__show_orders"], "produces": {"order_id": "integer"},
-            "reads": {"store__show_orders": "return [{}]"},
-            "program": 'return state["rows"]',
-        },
-        "matched": {
-            "label": "Filter order items", "sources": ["order_ids"], "inputs": ["store__show_order"],
-            "reads": {"store__show_order": {"source": "order_ids", "fields": {"order_id": "order_id"}}},
-            "produces": {"item_id": "integer"},
-            "program": 'return [{"item_id": r["item"]["id"]} for r in state["inputs"]["store__show_order"]["rows"]'
-                       ' if r["item"]["id"] != 99]',
-        },
+        "order_ids": card(
+            "Read all order IDs", 'return state["inputs"]["orders"]["rows"]',
+            {"orders": [{"source": "store__show_orders", "read": [{}]}]}, fields={"order_id": "integer"},
+        ),
+        "matched": card(
+            "Filter order items",
+            'return [{"item_id": r["item"]["id"]} for r in state["inputs"]["details"]["rows"] if r["item"]["id"] != 99]',
+            {"ids": "order_ids", "details": [{"source": "store__show_order",
+              "read": {"input": "ids", "fields": {"order_id": "order_id"}}}]},
+            fields={"item_id": "integer"},
+        ),
     }
     library["binding"]["store__send_item"] = {
         "label": "Send matched items", "covers": True, "sources": ["matched"], "fields": {"item_id": "item_id"},
@@ -1362,7 +1238,7 @@ def test_composed_projected_sets_drive_official_reads_and_writes(matched_ids):
     library["state"]["intent"] = {
         "label": "Send matched orders", "intent": True, "sources": [], "program": 'return ["store__send_item"]',
     }
-    apply_edits(library, {"objects": []}, {t["name"]: t for t in tools}, composed=True)
+    apply_edits(library, {"objects": []}, {t["name"]: t for t in tools})
 
     e = ComposedAssembly(Mock(request=model), Mock(request=environment))
     row = e.run("synthetic", library)
@@ -1381,8 +1257,6 @@ def test_composed_projected_sets_drive_official_reads_and_writes(matched_ids):
 
 
 def test_composed_asks_jev_when_complete_projections_disagree():
-    from jev_harness.composed_assembly import ComposedAssembly
-
     tools = [tool("store__send_item", "Send an item.", {"item_id": INTEGER}, ["item_id"])]
     model = Mock()
     model.request.side_effect = [choose(0, 2), choose(1, 3)]

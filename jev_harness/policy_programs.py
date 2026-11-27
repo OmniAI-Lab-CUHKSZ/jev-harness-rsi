@@ -1,7 +1,6 @@
 """Small pure-Python policies that Sol can replace inside a versioned harness."""
 import ast
 from calendar import month_abbr, month_name
-from copy import deepcopy
 from datetime import date, timedelta
 from functools import lru_cache
 import re
@@ -94,14 +93,3 @@ def load_program(source):
     namespace={"__builtins__":{},**FUNCTIONS}
     exec(compile(tree,"<harness policy>","exec"),namespace)
     return namespace["policy"]
-
-
-def run_program(library, name, state, trace):
-    code=library.get("programs",{}).get(name)
-    if not code:
-        return None
-    try:
-        return load_program(code)(deepcopy(state))
-    except (ValueError,TypeError,KeyError,IndexError,AttributeError,ArithmeticError,re.error) as exc:
-        trace.add("program_error",policy=name,error=str(exc)[:300])
-        return None
