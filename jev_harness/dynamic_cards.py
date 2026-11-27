@@ -7,6 +7,7 @@ from decimal import Decimal
 from .expressions import path_get
 from .native_assembly import FINISH, preview
 from .policy_programs import load_program
+from .record_composition import select_record_subset
 from .runtime import Uncovered
 from .schema_tools import MANAGED, accepts, available, check_args, is_read, key
 
@@ -92,15 +93,16 @@ def read_available(engine, sources, read):
     return True
 
 
-def dynamic_plans(engine, name, spec, *, downstream=False):
+def dynamic_plans(engine, name, spec, *, downstream=False, proposed=None):
     config = spec["dynamic"]
-    context = {**engine.policy_context(engine.observed), "remaining_effects": sorted(engine.outstanding()),
-               "answer_question": engine.answer_question}
-    try:
-        proposed = load_program(config["plan"])(context)
-    except (ArithmeticError, AttributeError, KeyError, TypeError, ValueError) as exc:
-        engine.trace.add("native_dynamic_skip", name=name, reason=str(exc)[:250])
-        return []
+    if proposed is None:
+        context = {**engine.policy_context(engine.observed), "remaining_effects": sorted(engine.outstanding()),
+                   "answer_question": engine.answer_question}
+        try:
+            proposed = load_program(config["plan"])(context)
+        except (ArithmeticError, AttributeError, KeyError, TypeError, ValueError) as exc:
+            engine.trace.add("native_dynamic_skip", name=name, reason=str(exc)[:250])
+            return []
     if not isinstance(proposed, list):
         return []
     checked = {}
@@ -117,7 +119,8 @@ def dynamic_plans(engine, name, spec, *, downstream=False):
                 continue
             if not all(read_available(engine, spec["sources"], read) for read in reads.values()):
                 continue
-            writes = set(result.get("writes", {})) & engine.outstanding()
+            intended = set(plan["requested"]) - engine.chosen_effects if "composition" in spec else engine.outstanding()
+            writes = set(result.get("writes", {})) & intended
             if not (writes or downstream or (engine.answer_question and result.get("calculations"))):
                 continue
             for endpoint in writes:
@@ -138,7 +141,9 @@ def dynamic_label(engine, spec, plans):
         if labels:
             scope.append(labels[0] if len(labels) == 1 else " / ".join(labels[:3]))
     results = [config["results"][plan["result"]] for plan in plans]
-    effects = sorted({endpoint for result in results for endpoint in result.get("writes", {})} & engine.outstanding())
+    intended = (set(plans[0]["requested"]) - engine.chosen_effects if "composition" in spec
+                else engine.outstanding())
+    effects = sorted({endpoint for result in results for endpoint in result.get("writes", {})} & intended)
     uses = [endpoint.split("__", 1)[1].replace("_", " ") for endpoint in effects]
     if engine.answer_question:
         sums = sorted({result["calculations"]["sum"] for result in results if "sum" in result.get("calculations", {})})
@@ -235,9 +240,12 @@ def execute_dynamic(engine, name, spec, plans):
         inputs[port] = deepcopy(observation.data)
         refs.append(observation.ref)
 
-    values = {**engine.policy_context(), "reads": inputs, "parameters": deepcopy(plan.get("parameters", {}))}
-    records = load_program(spec["program"])(values)
     result = config["results"][plan["result"]]
+    if "composition" in spec:
+        records = select_record_subset(spec["program"], plan, inputs, next(iter(result["fields"])))
+    else:
+        values = {**engine.policy_context(), "reads": inputs, "parameters": deepcopy(plan.get("parameters", {}))}
+        records = load_program(spec["program"])(values)
     fields = {**spec.get("produces", {}), **result["fields"]}
     if not isinstance(records, list) or any(not isinstance(row, dict) or any(
         path_get(row, field) is None or not accepts({"type": kind}, path_get(row, field))
@@ -248,6 +256,8 @@ def execute_dynamic(engine, name, spec, plans):
     engine.observe(name, records, scope, sources={ref: {"program_input": name} for ref in refs})
     ref = engine.observed[-1].ref
     engine.dynamic_results[ref] = result
+    if "composition" in spec:
+        engine.required.update(plan["requested"])
     engine.used_dynamic_plans.add((name, key(plan)))
     engine.trace.add("native_card", name=name, inputs=refs, output=ref, result_type=plan["result"])
 

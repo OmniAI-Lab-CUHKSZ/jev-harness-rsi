@@ -10,6 +10,7 @@ from .expressions import path_get
 from .formal_optimizer import cleaned_text
 from .native_assembly import ACTION_SKILL, FINISH, NativeAssembly, blank_library, observed_input, preview
 from .policy_programs import load_program
+from .record_composition import record_composition
 from .retrieval import terms
 from .runtime import Uncovered
 from .schema_tools import Observation, accepts, available, check_args, has_update, is_read, key, public_value
@@ -174,14 +175,14 @@ class ComposedAssembly(NativeAssembly):
         library = self.lib["fragment"]
         scores = {name: relevance(spec, self.goal) for name, spec in library.items()}
         for name, spec in library.items():
-            if "dynamic" in spec and (hint := self.lib["retrieval"].get(name)):
+            if ("dynamic" in spec or "composition" in spec) and (hint := self.lib["retrieval"].get(name)):
                 scores[name] = max(scores[name], len(goal_words(hint) & goal_words(self.goal)))
         # Relevance can reach a required producer with no live result yet. Primary sources
         # listed as alternatives keep their own goal/scope evidence.
         observed = {o.source for o in self.observed if o.complete}
         for _ in range(len(library)):
             for name, spec in library.items():
-                if "dynamic" in spec:
+                if "dynamic" in spec or "composition" in spec:
                     continue
                 producers = spec.get("inputs", []) + (spec["sources"] if len(spec["sources"]) == 1 else [])
                 for source in set(producers) - observed:
@@ -189,7 +190,7 @@ class ComposedAssembly(NativeAssembly):
                         scores[source] = max(scores[source], scores[name] - 1)
         self.dynamic_offers.clear()
         for name, spec in library.items():
-            if "dynamic" in spec:
+            if "dynamic" in spec or "composition" in spec:
                 continue
             for primary in spec["sources"]:
                 ports = tuple(self.sources_for(spec, primary))
@@ -207,20 +208,27 @@ class ComposedAssembly(NativeAssembly):
                 plans.append((score, ready, label, action))
         existing = [plan for plan in plans if plan[0] > 0]
         for name, spec in library.items():
-            if "dynamic" not in spec or scores[name] <= 0:
+            if "composition" not in spec and ("dynamic" not in spec or scores[name] <= 0):
                 continue
             downstream = any(scores[other] > 0 and name in [*consumer["sources"], *consumer.get("inputs", ())]
                              for other, consumer in library.items() if other != name)
-            found = dynamic_plans(self, name, spec, downstream=downstream)
-            choices = [plan for plan in found if not already_covered(self, spec, plan, existing)]
+            if "composition" in spec:
+                prepared, proposed = record_composition(self, spec)
+                if not proposed:
+                    continue
+                found = dynamic_plans(self, name, prepared, downstream=downstream, proposed=proposed)
+            else:
+                prepared = spec
+                found = dynamic_plans(self, name, prepared, downstream=downstream)
+            choices = [plan for plan in found if not already_covered(self, prepared, plan, existing)]
             if found and not choices:
                 self.trace.add("native_dynamic_reuse_existing", name=name)
             if choices:
-                self.dynamic_offers[name] = choices
-                label = dynamic_label(self, spec, choices)
+                self.dynamic_offers[name] = (prepared, choices)
+                label = dynamic_label(self, prepared, choices)
                 if cue := self.lib["decision"].get(name):
                     label += f" | {cue}"
-                plans.append((scores[name], 0, label, ("dynamic", name)))
+                plans.append((max(scores[name], 1), 0, label, ("dynamic", name)))
         return sorted(plans, key=lambda row: (-row[0], -row[1]))
 
     def fragments(self):
@@ -231,7 +239,8 @@ class ComposedAssembly(NativeAssembly):
         kind, name, *ports = action
         spec = self.lib["fragment"][name]
         if kind == "dynamic":
-            execute_dynamic(self, name, spec, self.dynamic_offers[name])
+            prepared, plans = self.dynamic_offers[name]
+            execute_dynamic(self, name, prepared, plans)
             return
         by_ref = {o.ref: o for o in self.observed}
         loaded = []
@@ -345,7 +354,7 @@ class ComposedAssembly(NativeAssembly):
             return bool(self.answer_bindings())
         return bool(self.receipts or self.chosen_effects)
 
-    def action_page(self, names, *, allow_discovery=True):
+    def action_page(self, names, *, allow_discovery=True, include_compositions=True):
         outstanding = self.outstanding()
         answers = self.answer_bindings()
         plans = self.card_plans()
@@ -396,7 +405,8 @@ class ComposedAssembly(NativeAssembly):
             actions = self.calculation_options()[:2] + actions
         capacity = 14 if allow_discovery else 15
         room = min(3, max(0, capacity - len(actions)))
-        dynamic_cards = ([(label, action) for _, _, label, action in plans if action[0] == "dynamic"][:room]
+        dynamic_cards = ([(label, action) for _, _, label, action in plans if action[0] == "dynamic"
+                          and (include_compositions or "composition" not in self.lib["fragment"][action[1]])][:room]
                          if not answers else [])
         actions[:0] = dynamic_cards
         self.trace.add("native_fragment_retrieval", eligible=[p[3] for p in plans],
@@ -405,10 +415,22 @@ class ComposedAssembly(NativeAssembly):
             actions = actions[:14] + [("Look for another relevant public operation", "@discover")]
         else:
             actions = actions[:15]
-        return self.ask(
+        action = self.ask(
             "native/action", "What step advances the user's remaining goal?", actions,
             ACTION_SKILL + " " + self.lib["decision"].get("action", ""),
         )
+        if action is None and include_compositions:
+            declined = [value[1] for _, value in dynamic_cards if "composition" in self.lib["fragment"][value[1]]]
+            for name in declined:
+                self.decline_dynamic(name, "No applicable card on this action page")
+            if declined:
+                return self.action_page(names, allow_discovery=allow_discovery, include_compositions=False)
+        return action
+
+    def decline_dynamic(self, name, reason):
+        _, plans = self.dynamic_offers[name]
+        self.used_dynamic_plans.update((name, key(plan)) for plan in plans)
+        self.trace.add("native_dynamic_exit", name=name, reason=reason)
 
     def binding(self, endpoint):
         if endpoint in self.plan_bindings:
@@ -532,9 +554,7 @@ class ComposedAssembly(NativeAssembly):
             except (TypeError, ValueError, Uncovered) as exc:
                 reason = str(exc)[:350]
                 if isinstance(action, tuple) and action[0] == "dynamic":
-                    name = action[1]
-                    self.used_dynamic_plans.update((name, key(plan)) for plan in self.dynamic_offers[name])
-                    self.trace.add("native_dynamic_exit", name=name, reason=reason)
+                    self.decline_dynamic(action[1], reason)
                     continue
                 self.notices.append(reason)
                 self.trace.add("native_feedback", reason=reason)

@@ -25,8 +25,9 @@ def first_calendar_day(when, days):
 def calendar_windows(goal, when):
     """Resolve public dates, distinguishing a missing restriction from an unsupported one."""
     text = goal.casefold()
+    period = re.search(r"\b(?:this|ongoing|current)\s+(month|year)\b", text)
     temporal = r"\b(?:since|yesterday|today|last|past|before|after|between|recently)\b"
-    if not re.search(temporal, text):
+    if not period and not re.search(temporal, text):
         return [(None, None)]
     today = date.fromisoformat(when[:10])
     months = {name.casefold(): i for names in (month_abbr, month_name) for i, name in enumerate(names) if name}
@@ -48,6 +49,9 @@ def calendar_windows(goal, when):
         return [(yesterday, today.isoformat())]
     if re.search(r"\byesterday\b", text):
         return [(yesterday, yesterday)]
+    if period and not re.search(temporal, text):
+        first = today.replace(month=1, day=1) if period[1] == "year" else today.replace(day=1)
+        return [(first.isoformat(), today.isoformat())]
     return []
 
 

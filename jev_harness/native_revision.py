@@ -117,30 +117,19 @@ ballot, or a tool-specific cue to clarify that tool only. "handoff"/"residual" a
 run in Python; tool-specific handoff cues are selected by the unresolved operation. Do not accumulate multiple
 ways to do the same work. Reuse a card when its public inputs and output already fit.
 
-For a reusable operation with several possible input sources or scopes, a fragment can declare "dynamic"
-instead of "reads" and record choices. Use it when variants share the same calculation. Keep the public
-"sources" list and the pure "program". The dynamic object has three keys:
-1. "plan": a pure policy with state['goal'], state['instruction'], state['datetime'], state['inputs'],
-   state['remaining_effects'] and state['answer_question']. Return one or more plans or [] when the task
-   cannot use this result. Each plan has "result" (a declared result name), "choices" (a slot name to a
-   readable label), "reads" (a port name to {"source":"app__read","arguments":[{...}]} or to
-   {"source":"declared source","ref":"r1"}), and optional "parameters" for the transform. The requested
-   entity, operation and scope must make sense together. An app mention alone does not support a card.
-   calendar_windows(state['goal'], state['datetime']) returns inclusive (start, end) choices. It returns
-   [(None,None)] with no date requirement and [] when the date is outside its supported forms.
-2. "slots": ordered slot names to {"question":"...","skill":"..."}. A singleton is bound by the program.
-   Omit a slot that does not apply. If several executable plans disagree on a slot, Jev chooses the label.
-   Give each distinct plan meaningful choices. A returned plan must have all its public reads bindable.
-3. "results": result names to {"fields":{"id":"integer","amount":"number"}, "calculations":{"count":true,
-   "sum":"amount"}, "writes":{"app__effect":{"fields":{"id":"id"},"arguments":"return {...}"}}}.
-   Fields must match the read records or values the pure transform actually computes. Calculations and
-   writes are optional. Writes describe separate consumers whose required literals can be grounded from the
-   current goal. Only a requested operation is offered, and Jev chooses it after the records are available.
-   An optional "equivalent" list names existing fragments that perform the same calculation for the same
-   write scope. The executor keeps the existing one only when its concrete reads and requested effects match.
-The transform receives state['reads'] by port and state['parameters'] and returns a list of result rows.
-Use different result types for genuinely different records, and keep the fields needed by other consumers.
-Put a search cue or a local decision or handoff instruction under the dynamic fragment's name if needed.
+Separate the input acquisition, calculation and consumption you see in Train. For a contact-based record
+filter, submit one fragment with "label", "program", and
+"composition":{"inputs":{"rows":"counterparty_records","people":"contact_identities"},"output":"matching_records"}.
+The program receives state["rows"], state["people"], state["record_key"] and state["people_key"]. Each key
+is a list of field names to traverse. Return the original matching rows with every field intact. A verified
+empty set is an empty list; return None when the data cannot support the filter. The runtime supplies the
+official read, requested directions, relationship groups, dates and consumer. This format has no task
+instruction or API endpoint in its program inputs. The same rows can supply a total or an official write.
+When a legacy fragment already computes the exact same selection, its name can go in the optional
+composition "equivalent" list. The runtime suppresses a duplicate only for the same reads and effects.
+Give the calculation a label reusable across different consumers. A retrieval, decision or handoff cue
+named for the fragment applies locally. For computations with other input roles, use the scoped card,
+binding or state interfaces described above.
 """
 
 
@@ -164,10 +153,11 @@ def apply_edits(parent, proposal, tools, *, composed=False):
         raise ValueError("A patch can change up to three named items")
     lib = deepcopy(parent)
     touched = set()
-    dynamic_names = {name for name, spec in lib["fragment"].items() if "dynamic" in spec}
+    dynamic_names = {name for name, spec in lib["fragment"].items() if "dynamic" in spec or "composition" in spec}
     if composed:
         dynamic_names.update(edit["name"] for edit in objects if edit.get("kind") == "fragment"
-                             and isinstance(edit.get("value"), dict) and "dynamic" in edit["value"])
+                             and isinstance(edit.get("value"), dict) and
+                             {"dynamic", "composition"} & edit["value"].keys())
     for edit in objects:
         kind, name, value = edit["kind"], edit["name"], edit["value"]
         if kind not in lib or not isinstance(name, str) or not name.isidentifier() or (kind, name) in touched:
@@ -186,13 +176,16 @@ def apply_edits(parent, proposal, tools, *, composed=False):
             if not isinstance(value, str) or not value.strip():
                 raise ValueError("Expected a short textual cue")
         else:
+            composition = composed and kind == "fragment" and isinstance(value, dict) and "composition" in value
+            if composition:
+                value = {"sources": [], **value}
             fields = {"sources", "label"}
             optional = {"inputs"} if kind in ("fragment", "binding") else set()
             if kind == "fragment":
                 optional.update(("choice", "choices", "goal_terms"))
             if composed:
                 optional.update({
-                    "fragment": {"reads", "produces", "dynamic"},
+                    "fragment": {"reads", "produces", "dynamic", "composition"},
                     "binding": {"covers", "fields"},
                     "state": {"intent"},
                 }.get(kind, set()))
@@ -201,7 +194,7 @@ def apply_edits(parent, proposal, tools, *, composed=False):
                 or not fields <= value.keys()
                 or value.keys() - fields - optional - {"program"}
                 or not isinstance(value["sources"], list)
-                or (not value["sources"] and not (composed and (kind == "binding" or value.get("intent"))))
+                or (not value["sources"] and not (composition or composed and (kind == "binding" or value.get("intent"))))
             ):
                 raise ValueError("A program needs sources, label and program")
             if not isinstance(value["label"], str) or not value["label"].strip():
@@ -231,7 +224,11 @@ def apply_edits(parent, proposal, tools, *, composed=False):
                 validate_projection(spec["fields"], tools[name], spec["sources"], lib["fragment"])
             if group != "fragment":
                 continue
-            if "dynamic" in spec:
+            if "composition" in spec:
+                from .record_composition import validate_record_composition
+
+                validate_record_composition(spec)
+            elif "dynamic" in spec:
                 from .dynamic_cards import validate_dynamic
 
                 validate_dynamic(spec, tools)
@@ -462,7 +459,7 @@ def revise(study, train, history=(), *, current=None, composed=False):
     if any(label.startswith("h0_generation/") for label in panel):
         roles["h0_generation"] = "Pilot comparison that generates each action. Use it to identify work to compile into the harness."
     reuse = {}
-    if composed and study.settings.get("calculation_reuse_evidence", True):
+    if composed and study.settings.get("calculation_reuse_evidence", False):
         from .calculation_evidence import related_calculations
 
         comparisons = related_calculations(current.samples, train)

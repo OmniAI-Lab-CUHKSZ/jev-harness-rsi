@@ -162,10 +162,11 @@ def first_change(events, candidate, functions, execution, model=None, *, generat
                         same_choice = report.get("same_semantic_choice")
                         returning = selected == "standard" and previous.get("question") != args.get("question")
                         if is_card:
+                            _, plans = self.dynamic_offers.get(selected[1], (None, ()))
                             report["proposed_reads"] = [
                                 {"result": plan["result"], "choices": plan["choices"],
                                  "sources": [read["source"] for read in plan["reads"].values()]}
-                                for plan in self.dynamic_offers.get(selected[1], ())
+                                for plan in plans
                             ]
                         if same_choice or is_card or returning:
                             report["continuation"] = {"status": "replaying", "first_choice_matched": bool(same_choice)}

@@ -1200,8 +1200,80 @@ def test_calendar_scope_distinguishes_no_restriction_from_unsupported_dates():
     assert calendar_windows("Approve all pending requests", when) == [(None, None)]
     assert calendar_windows("Payments in the last 7 days, including today", when) == [("2023-05-26", "2023-06-01")]
     assert calendar_windows("Payments since 1st Feb of this year", when) == [("2023-02-01", "2023-06-01")]
+    assert calendar_windows("Payments in the ongoing year", when) == [("2023-01-01", "2023-06-01")]
+    assert calendar_windows("Payments in the current month", when) == [("2023-06-01", "2023-06-01")]
     assert calendar_windows("Payments after the last company outing", when) == []
 
+
+def test_endpoint_independent_filter_preserves_both_transaction_directions_and_original_fields():
+    from jev_harness.composed_assembly import ComposedAssembly
+
+    contacts, payments, like = "phone__search_contacts", "venmo__show_transactions", "venmo__like_transaction"
+    tools = [
+        tool(contacts, "Search phone contacts", {"relationship": STRING}),
+        tool(payments, "Show transactions", {
+            "direction": {**STRING, "enum": ["sent", "received"]}, "min_created_at": STRING,
+        }),
+        tool(like, "Like a transaction", {"transaction_id": INTEGER}, ["transaction_id"]),
+    ]
+    proposal = {"objects": [{"kind": "fragment", "name": "match_people", "value": {
+        "label": "Match counterparties to the selected contacts",
+        "composition": {"inputs": {"rows": "counterparty_records", "people": "contact_identities"},
+                        "output": "matching_records"},
+        "program": (
+            'emails = {person[state["people_key"][0]] for person in state["people"]}\n'
+            'actor, field = state["record_key"]\n'
+            'return [row for row in state["rows"] if row[actor][field] in emails]'
+        ),
+    }}]}
+    parent = blank_library()
+    child = apply_edits(parent, proposal, {t["name"]: t for t in tools}, composed=True)
+    model = Mock(request=lambda operation, **request: choose(0, len(request["options"])))
+    engine = ComposedAssembly(model, Mock())
+    engine.trace = Trace()
+    engine.prepare_options()
+    task = {"task_id": "example", "datetime": "2023-06-01", "supervisor": {},
+            "instruction": "Like all Venmo transactions in the ongoing year to and from my roommates."}
+    engine.seed, engine.done = 0, False
+    engine.trace.add("task", **task, seed=engine.seed)
+    engine.context = {"task": {**task, "functions": tools}, "history": []}
+
+    engine.initialize_native(parent)
+    engine.next_action()
+    change = first_change(engine.trace.events, child, tools, {}, model,
+                          executor_type=ComposedAssembly, continue_after_choice=True)
+    assert change["status"] == "reselected" and change["continuation"]["after"] == "call"
+    assert change["proposed_reads"][0]["sources"] == [contacts, payments, payments]
+
+    engine.ask = Mock(return_value=payments)
+    engine.action_page([payments])
+    prior_request = engine.ask.call_args
+    engine.initialize_native(child)
+    engine.ask = Mock(side_effect=[None, payments])
+    assert engine.action_page([payments]) == payments
+    assert engine.ask.call_args == prior_request
+    assert not engine.notices
+
+    engine.initialize_native(child)
+    engine.ask = Mock(side_effect=AssertionError("All of these values are determined by the task"))
+    engine.observe(contacts, [{"email": "roommate@example.test"}], "Roommates",
+                   arguments=[{"relationship": "roommate"}])
+    sent = {"transaction_id": 1, "receiver": {"email": "roommate@example.test"},
+            "created_at": "2023-04-22", "amount": 5}
+    received = {"transaction_id": 2, "sender": {"email": "roommate@example.test"},
+                "created_at": "2023-05-28", "amount": 9}
+    engine.observe(payments, [sent], "Sent transactions",
+                   arguments=[{"direction": "sent", "min_created_at": "2023-01-01"}])
+    engine.observe(payments, [received, {**received, "transaction_id": 3, "created_at": "2022-12-31"}],
+                   "Received transactions", arguments=[{"direction": "received", "min_created_at": "2023-01-01"}])
+    assert engine.card_plans()[0][3] == ("dynamic", "match_people")
+    engine.execute_card(("dynamic", "match_people"))
+    assert engine.observed[-1].rows == [sent, received]
+    assert engine.compiled_bindings(like)[0][1] == [{"transaction_id": 1}, {"transaction_id": 2}]
+
+    engine.context["task"]["instruction"] = "I would like all the Venmo transactions with my roommates."
+    engine.initialize_native(child)
+    assert not engine.card_plans()
 
 
 @pytest.mark.parametrize("planner", ['return None', 'return [{"contact_id": "invalid"}]'])
