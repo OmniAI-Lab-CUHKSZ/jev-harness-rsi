@@ -3,7 +3,7 @@
 import json
 
 from .composition import PROGRAM_ERRORS, run_card, validate_output
-from .schema_tools import FINISH, Observation, is_read, public_value
+from .schema_tools import FINISH, Observation, is_read, leaf_fields, public_value
 
 
 def _brief(value, limit=185):
@@ -14,6 +14,12 @@ def _brief(value, limit=185):
 
 def _fragment(choice):
     return isinstance(choice, (list, tuple)) and len(choice) >= 2 and choice[0] == "fragment"
+
+
+def observation_fields(value):
+    while isinstance(value, list) and value:
+        value = value[0]
+    return {name: type(field).__name__ for name, field in leaf_fields(value)}
 
 
 def fragment_evidence(events, library):

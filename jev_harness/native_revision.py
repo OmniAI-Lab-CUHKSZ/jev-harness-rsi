@@ -8,7 +8,7 @@ from pathlib import Path
 from .artifacts import cleaned_text, read, read_events, read_page, save, visible_event
 from .composition import declared_sources, output_fields, validate_card, validate_projection
 from .native_assembly import FINISH
-from .native_evidence import fragment_evidence
+from .native_evidence import fragment_evidence, observation_fields
 from .policy_programs import load_program
 from .protocol import design_manifest
 from .schema_tools import available, catalog, is_read
@@ -19,9 +19,15 @@ DRAFT_REPLY_LIMIT = 12
 
 EDITOR = """Improve the shared AppWorld harness for the fixed 27B. First preserve or improve whole-task success;
 then reduce online output tokens, including reasoning. You have only official Train evidence. Use the parent
-runs first. Trace the first wrong choice, binding, computation or uncovered action on failed tasks. On successful
-tasks, look for repeated or expensive generated work that the program can assemble from official tools. Use the
-previous round's matched Train results when present. Past Train traces are available through the evidence index.
+runs first. Trace the first wrong choice, binding, computation or uncovered action on failed tasks. Use the prior
+round's matched Train results when present. Past Train traces are available through the evidence index.
+
+Inspect computations in successful traces, including installed cards and zero-generation paths. Look for a useful
+calculation whose input scope or output use is currently narrower than the calculation itself. When the batch
+already passes, prioritize evidence-backed reuse alongside measurable savings. Describe the common computation,
+which sources, fields or scope the runtime can choose, and which output fields support distinct consumers.
+Check observed input and output fields and accepted uses before proposing a new card. An equivalent old entry may
+continue to handle the original task while the new card supports further uses. Avoid duplicating computations.
 
 Follow fragment_flow from eligibility and recommendation to actual selection, output and accepted uses. Inspect
 public inputs and exact accepted payloads, even on a pass. An accepted write only confirms what the API accepted.
@@ -224,6 +230,12 @@ def evidence(samples):
             "observed_sources": sorted({e["source"] for e in events if e["event"] == "native_observation"}),
             "fragment_flow": fragment_evidence(events, sample.library),
         }
+        if label.startswith("h0_decision/"):
+            panel[label]["observations"] = [
+                {"event": i, "ref": e["ref"], "source": e["source"], "complete": e["complete"], "count": e["count"],
+                 "sample_fields": observation_fields(e["value"]), "inputs": list(e.get("sources", {}))}
+                for i, e in enumerate(events) if e["event"] == "native_observation"
+            ]
     return docs, panel
 
 
@@ -344,10 +356,11 @@ def revise(study, train, *, current):
             prompt = f"Could not apply this response: {exc}. Return corrected JSON."
             continue
         if lib != parent:
-            from .native_replay import first_change, solved_preview
+            from .native_replay import first_change, recorded_card_checks, solved_preview
 
             draft_library = lib
             impact = {}
+            reuse = {}
             used_current = False
             checks_used = 0
             for task in train:
@@ -365,12 +378,17 @@ def revise(study, train, *, current):
                     else:
                         used_current = True
                 impact[task] = result
+                if solved:
+                    matches = recorded_card_checks(events, parent, lib, list(tools.values()))
+                    if matches:
+                        reuse[task] = matches
             preview = {
                 "draft": proposal,
                 "current_train": impact,
                 "previously_solved_train": solved_preview(
                     study, lib, current.solved, budget=24 - checks_used
                 ),
+                "recorded_card_checks": reuse,
             }
             task = trial_task(train, impact, panel, parent, lib)
             preview["whole_current_train_trial"] = full_train_trial(study, task, lib, current) if task else None
@@ -385,6 +403,9 @@ def revise(study, train, *, current):
                 "The reselected ballot used the real 27B. A changed generation request was not executed. "
                 "Continuation describes what the harness reached after a changed decision. Proposed reads are "
                 "executable plans, and accepted uses in a fresh trace are the evidence of execution. "
+                "Recorded card checks run the draft computation on complete inputs used by the original card. "
+                "Compare the recomputed output and bound payloads even when the original menu is unchanged. "
+                "These checks use recorded data and do not measure new task outcomes or Jev selection. "
                 "The whole_current_train_trial, when present, is an actual fresh episode on the draft. Read its "
                 "accepted payloads and fragment_flow, including unused output, before attributing benefit. "
                 "A cheaper pass may send the wrong content. Check against evidence and the public instruction. "

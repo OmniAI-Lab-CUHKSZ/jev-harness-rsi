@@ -1,17 +1,104 @@
-"""Check the first changed decision on each previously solved, explicitly opened Train task."""
+"""Replay Train requests and verify draft computations using recorded public observations."""
 
+from collections import defaultdict
 from copy import deepcopy
 import json
+from types import SimpleNamespace
 
 from .artifacts import cleaned_text, read, read_events
+from .composition import PROGRAM_ERRORS, card_input_refs, contact_plan_available, source_plans
 from .composed_assembly import ComposedAssembly
 from .formal_runtime import BudgetExhausted
+from .native_evidence import observation_fields
+from .record_composition import contact_plans
 from .runtime import STEP_REVIEW, Trace, Uncovered
-from .schema_tools import catalog, public_value
+from .schema_tools import FINISH, catalog, key, public_value
 
 
 class Boundary(Exception):
     """A recorded response cannot be supplied to this request."""
+
+
+def recorded_card_checks(events, parent, candidate, functions):
+    """Recompute changed cards on the exact complete inputs used by a recorded card."""
+    changed = {name: card for name, card in candidate["fragment"].items()
+               if card != parent["fragment"].get(name)}
+    if not changed:
+        return []
+    observations = {e["ref"]: e for e in events if e["event"] == "native_observation"}
+    accepted = defaultdict(lambda: defaultdict(list))
+    operation = {}
+    for event in events:
+        if event["event"] == "native_operation":
+            operation = event
+        elif event["event"] == "native_effect" and event["tool"] == operation.get("tool"):
+            for ref in event.get("sources", {}):
+                accepted[ref][event["tool"]].append(operation["arguments"][event["batch_index"]])
+
+    def unavailable(op, **_):
+        raise Boundary(op)
+
+    client = SimpleNamespace(request=unavailable)
+    start = events[0]
+    checks = []
+    for original in (e for e in events if e["event"] == "native_card"):
+        inputs = [observations.get(ref) for ref in original.get("inputs", ())]
+        expected = observations.get(original.get("output"))
+        if not inputs or expected is None or not all(o and o["complete"] for o in inputs):
+            continue
+        for name, card in changed.items():
+            engine = ComposedAssembly(client, client)
+            engine.prepare_options()
+            engine.trace, engine.seed, engine.done = Trace(), start.get("seed", 0), False
+            engine.context = {"task": {**start, "functions": functions}, "history": []}
+            engine.initialize_native(candidate)
+            for obs in inputs:
+                engine.observe(obs["source"], obs["value"], obs["scope"], arguments=obs.get("arguments"))
+            ports = card["composition"]["inputs"]
+            plans = (p for p in contact_plans(engine) if contact_plan_available(engine, p)) if any(
+                "role" in port for port in ports.values()
+            ) else source_plans(engine, ports)
+            input_refs = {o.ref for o in engine.observed}
+            matched = []
+            for plan in plans:
+                bound = card_input_refs(engine, plan)
+                if len(bound) == len(plan["reads"]) and {ref for _, ref in bound} == input_refs:
+                    matched.append(plan)
+            if not matched:
+                continue
+            check = {"fragment": name, "reference_fragment": original["name"], "inputs": original["inputs"]}
+            checks.append(check)
+            if len(matched) > 1:
+                check["status"] = "ambiguous_scope"
+                continue
+            action = ("fragment", name)
+            engine.card_offers[action] = matched
+            try:
+                engine.execute_card(action)
+            except Boundary as exc:
+                check.update(status="needs_live_request", operation=str(exc))
+                continue
+            except (*PROGRAM_ERRORS, Uncovered) as exc:
+                check.update(status="uncovered", reason=str(exc)[:240])
+                continue
+            result = engine.observed[-1]
+            check.update(status="computed", same_output=result.data == expected["value"], rows=len(result.rows),
+                         output_fields=observation_fields(result.data), bindings={})
+            for endpoint, arguments in accepted[original["output"]].items():
+                if endpoint == FINISH:
+                    options = [[args] for _, args, refs in engine.answer_bindings() if result.ref in refs]
+                else:
+                    options = [batch for _, batch, _, refs in engine.compiled_bindings(endpoint)
+                               if result.ref in refs]
+                recorded = [key(args) for args in arguments]
+                choices = [[key(args) for args in batch] for batch in options]
+                check["bindings"][endpoint] = {
+                    "recorded_arguments": len(arguments),
+                    "candidate_bindings": len(options),
+                    "matches_recorded": any(sorted(batch) == sorted(recorded) for batch in choices),
+                    "same_order": recorded in choices,
+                }
+    return checks
 
 
 def different_fields(left, right):

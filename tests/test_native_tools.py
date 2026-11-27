@@ -8,7 +8,7 @@ from jev_harness.composition import resolve_card
 from jev_harness.formal_runtime import BudgetExhausted
 from jev_harness.native_assembly import DISCOVER, FINISH, MORE_FRAGMENTS, NativeGeneration, blank_library
 from jev_harness.native_evidence import fragment_evidence
-from jev_harness.native_replay import first_change
+from jev_harness.native_replay import first_change, recorded_card_checks
 from jev_harness.native_revision import apply_edits, trial_task
 from jev_harness.runtime import Trace, Uncovered
 from jev_harness.schema_tools import (
@@ -69,6 +69,42 @@ def choose(index, count):
         "mode": "D",
         "input_tokens": 11,
         "output_tokens": 0,
+    }
+
+
+@pytest.mark.parametrize("row, matches", [(0, True), (1, False)])
+def test_recomputed_card_compares_accepted_payloads_even_with_a_richer_output(row, matches):
+    source, endpoint = "store__show_orders", "store__request_item"
+    rows = [{"item_id": 12, "quantity": 3}, {"item_id": 19, "quantity": 1}]
+    parent = blank_library()
+    parent["fragment"]["shortlist"] = card(
+        "Selected order ID", 'return [{"item_id": 12}]', {"orders": source}, fields={"item_id": "integer"},
+    )
+    candidate = apply_edits(parent, {"objects": [
+        {"kind": "fragment", "name": "selected_orders", "value": card(
+            "Selected order records", f'return [state["inputs"]["orders"]["rows"][{row}]]',
+            {"orders": source}, subset="orders", fields={"item_id": "integer", "quantity": "integer"},
+        )},
+        {"kind": "binding", "name": endpoint,
+         "value": {"label": "Request verified items", "sources": ["selected_orders"], "covers": True,
+                   "fields": {"item_id": "item_id"}}},
+    ]}, {t["name"]: t for t in TOOLS})
+    refs = {"r2": {"fields": {"item_id": "item_id"}}}
+    events = [
+        {"event": "task", "instruction": "Request the selected order."},
+        {"event": "native_observation", "ref": "r1", "source": source, "value": rows, "scope": "orders",
+         "complete": True, "arguments": [{}]},
+        {"event": "native_observation", "ref": "r2", "source": "shortlist",
+         "value": [{"item_id": 12}], "scope": "selected ID", "complete": True},
+        {"event": "native_card", "name": "shortlist", "inputs": ["r1"], "output": "r2"},
+        {"event": "native_operation", "tool": endpoint, "arguments": [{"item_id": 12}], "sources": refs},
+        {"event": "native_effect", "tool": endpoint, "batch_index": 0, "sources": refs},
+    ]
+    (result,) = recorded_card_checks(events, parent, candidate, TOOLS)
+    assert result["status"] == "computed" and not result["same_output"]
+    assert result["output_fields"] == {"item_id": "int", "quantity": "int"}
+    assert result["bindings"][endpoint] == {
+        "recorded_arguments": 1, "candidate_bindings": 1, "matches_recorded": matches, "same_order": matches,
     }
 
 

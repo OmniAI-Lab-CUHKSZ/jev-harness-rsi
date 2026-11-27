@@ -34,7 +34,7 @@ An unresolved card can return when a complete observation matches one of its inp
 
 ## Offline optimization
 
-Sol starts each round from the current batch's parent trajectories. The next round also sees the previous round's candidate and parent comparison where available. The editor can open prior official Train traces through an index. It can inspect tool signatures, runtime events, accepted writes, fragment use and failed generation sites.
+Sol starts each round from the current batch's parent trajectories. The next round also sees the previous round's candidate and parent comparison where available. The editor can open prior official Train traces through an index. The current traces include observed field names, types and dependencies. Sol examines successful computations, including cards that already avoid generation, for input scopes and downstream uses the runtime can vary.
 
 | Component | Editable content |
 |---|---|
@@ -47,7 +47,7 @@ Sol starts each round from the current batch's parent trajectories. The next rou
 
 Each candidate changes up to three named items. Sol gets up to twelve replies for the draft, including evidence requests, followed by draft review and one optional evidence read. If the draft window ends without a valid proposal, the controller records the reason and keeps the parent for that round. The next scheduled round still runs. The validator accepts the single card declaration described above. Programs are restricted to local computation and public data.
 
-The preview identifies the first changed request on each recorded prefix. It replays previously solved Train prefixes until the first difference. A changed ballot goes to real 27B within the 24-successful-case reselection budget. If a replay can proceed, it identifies the next affected request or proposed inputs. An additional current failed case can receive a real reselection. One affected current task can receive a fresh draft episode. Sol sees the draft feedback before returning its final proposal. [Editor and prompt](../jev_harness/native_revision.py) · [Replay and reselection](../jev_harness/native_replay.py)
+The preview identifies the first changed request on each recorded prefix. It replays previously solved Train prefixes until the first difference. A changed ballot goes to real 27B within the 24-successful-case reselection budget. If a replay can proceed, it identifies the next affected request or proposed inputs. An additional current failed case can receive a real reselection. One affected current task can receive a fresh draft episode. For solved current tasks, it also recomputes changed cards on the exact complete inputs used by an executed card and compares the resulting bindings with recorded accepted payloads. This comparison can verify the computation when the menu is unchanged. Sol sees the draft feedback before returning its final proposal. [Editor and prompt](../jev_harness/native_revision.py) · [Replay and reselection](../jev_harness/native_replay.py)
 
 ## Train, Dev and Test
 
